@@ -1,0 +1,13 @@
+{
+  "runtime.version": "LuaJIT",
+  "workspace.library": [
+    "${workspaceFolder}/lua"
+  ],
+  "diagnostics.globals": [
+    "cmd",
+    "opt",
+    "g",
+    "global"
+  ],
+  "workspace.checkThirdParty": false
+}
