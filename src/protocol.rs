@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io::{self, Read, Write};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -14,6 +14,9 @@ pub struct Viewport {
 pub struct ClientHello {
     pub protocol_version: u16,
     pub session_number: Option<u64>,
+    pub create_if_missing: bool,
+    pub shell: std::path::PathBuf,
+    pub environment: Vec<(String, String)>,
     pub working_directory: std::path::PathBuf,
     pub viewport: Viewport,
 }
@@ -55,7 +58,31 @@ pub struct TerminalSnapshot {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum ClientMessage {
     Hello(ClientHello),
+    Admin(AdminRequest),
     Request { id: u64, request: ClientRequest },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub enum AdminRequest {
+    ListSessions,
+    KillSession(u64),
+    StopServer,
+    Status,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct SessionSummary {
+    pub number: u64,
+    pub clients: usize,
+    pub workspaces: usize,
+    pub tabs: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub enum AdminResponse {
+    Sessions(Vec<SessionSummary>),
+    Status { running: bool, sessions: usize },
+    Success,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -90,6 +117,9 @@ pub enum ServerMessage {
     },
     HelloRejected {
         reason: String,
+    },
+    AdminResult {
+        result: Result<AdminResponse, String>,
     },
     InitialState {
         session: SessionSnapshot,
@@ -180,6 +210,9 @@ mod tests {
         let message = ClientMessage::Hello(ClientHello {
             protocol_version: 1,
             session_number: Some(8),
+            create_if_missing: false,
+            shell: "/bin/sh".into(),
+            environment: vec![("SHELL".to_owned(), "/bin/sh".to_owned())],
             working_directory: "/work/project".into(),
             viewport: Viewport {
                 rows: 40,

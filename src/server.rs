@@ -18,8 +18,9 @@ use zmux::{
         WorkspaceId,
     },
     protocol::{
-        ClientHello, ClientMessage, ClientRequest, ServerMessage, SessionSnapshot,
-        TabSnapshot as WireTabSnapshot, TerminalSnapshot, Viewport, WorkspaceSnapshot, read_frame,
+        AdminRequest, AdminResponse, ClientHello, ClientMessage, ClientRequest, ServerMessage,
+        SessionSnapshot, SessionSummary, TabSnapshot as WireTabSnapshot, TerminalSnapshot,
+        Viewport, WorkspaceSnapshot, read_frame,
         write_frame,
     },
     transport::{self, Endpoint},
@@ -34,11 +35,18 @@ struct ServerTab {
     exit_code: Option<u32>,
 }
 
+#[derive(Clone)]
+struct ShellConfig {
+    executable: std::path::PathBuf,
+    environment: Vec<(String, String)>,
+}
+
 struct ServerSession {
     model: Session,
     tabs: HashMap<TabId, ServerTab>,
     clients: HashSet<u64>,
     last_pty_size: Viewport,
+    shell: ShellConfig,
 }
 
 struct ClientConnection {
@@ -51,6 +59,10 @@ enum ServerEvent {
     Connected {
         client_id: u64,
         hello: ClientHello,
+        sender: Sender<ServerMessage>,
+    },
+    Admin {
+        request: AdminRequest,
         sender: Sender<ServerMessage>,
     },
     Request {
@@ -136,10 +148,20 @@ fn spawn_connection(
     thread::Builder::new()
         .name(format!("zmux-ipc-reader-{client_id}"))
         .spawn(move || {
-            let hello = match read_frame::<_, ClientMessage>(&mut reader) {
-                Ok(ClientMessage::Hello(hello)) => hello,
-                Ok(_) => return,
+            let first_message = match read_frame::<_, ClientMessage>(&mut reader) {
+                Ok(message) => message,
                 Err(_) => return,
+            };
+            let hello = match first_message {
+                ClientMessage::Hello(hello) => hello,
+                ClientMessage::Admin(request) => {
+                    let _ = events.send(ServerEvent::Admin {
+                        request,
+                        sender: to_client,
+                    });
+                    return;
+                }
+                ClientMessage::Request { .. } => return,
             };
             if events
                 .send(ServerEvent::Connected {
@@ -220,6 +242,7 @@ impl ServerState {
                 hello,
                 sender,
             } => self.connect_client(client_id, hello, sender)?,
+            ServerEvent::Admin { request, sender } => self.handle_admin(request, sender)?,
             ServerEvent::Request {
                 client_id,
                 id,
@@ -231,6 +254,46 @@ impl ServerState {
         if self.has_received_client && self.sessions.is_empty() {
             self.should_stop = true;
         }
+        Ok(())
+    }
+
+    fn handle_admin(
+        &mut self,
+        request: AdminRequest,
+        sender: Sender<ServerMessage>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let result = match request {
+            AdminRequest::ListSessions => {
+                let sessions = self
+                    .sessions
+                    .iter()
+                    .map(|session| SessionSummary {
+                        number: session.model.number().get(),
+                        clients: session.clients.len(),
+                        workspaces: session.model.workspaces().len(),
+                        tabs: session.tabs.len(),
+                    })
+                    .collect();
+                Ok(AdminResponse::Sessions(sessions))
+            }
+            AdminRequest::Status => Ok(AdminResponse::Status {
+                running: true,
+                sessions: self.sessions.len(),
+            }),
+            AdminRequest::KillSession(number) => {
+                let number = SessionNumber::new(number);
+                self.close_session(number)
+                    .map(|()| AdminResponse::Success)
+                    .map_err(|error| error.to_string())
+            }
+            AdminRequest::StopServer => {
+                self.stop_server();
+                Ok(AdminResponse::Success)
+            }
+        };
+        sender.send(ServerMessage::AdminResult {
+            result: result.map_err(|error: String| error),
+        })?;
         Ok(())
     }
 
@@ -253,20 +316,41 @@ impl ServerState {
         }
 
         let session_number = if let Some(number) = hello.session_number {
-            let Some(session_number) = self
+            if let Some(session_number) = self
                 .sessions
                 .iter()
                 .find(|session| session.model.number().get() == number)
                 .map(|session| session.model.number())
-            else {
+            {
+                session_number
+            } else if hello.create_if_missing {
+                match self.create_session(
+                    &hello.working_directory,
+                    &hello.shell,
+                    &hello.environment,
+                    hello.viewport,
+                ) {
+                    Ok(session_number) => session_number,
+                    Err(error) => {
+                        let _ = sender.send(ServerMessage::HelloRejected {
+                            reason: error.to_string(),
+                        });
+                        return Ok(());
+                    }
+                }
+            } else {
                 let _ = sender.send(ServerMessage::HelloRejected {
                     reason: format!("Session {number} does not exist"),
                 });
                 return Ok(());
-            };
-            session_number
+            }
         } else {
-            match self.create_session(&hello.working_directory, hello.viewport) {
+            match self.create_session(
+                &hello.working_directory,
+                &hello.shell,
+                &hello.environment,
+                hello.viewport,
+            ) {
                 Ok(number) => number,
                 Err(error) => {
                     let _ = sender.send(ServerMessage::HelloRejected {
@@ -316,6 +400,8 @@ impl ServerState {
     fn create_session(
         &mut self,
         working_directory: &std::path::Path,
+        shell: &std::path::Path,
+        environment: &[(String, String)],
         size: Viewport,
     ) -> Result<SessionNumber, Box<dyn std::error::Error>> {
         if !working_directory.is_dir() {
@@ -333,6 +419,8 @@ impl ServerState {
             pty_size.columns,
             tab_id.get(),
             working_directory,
+            shell,
+            environment,
             self.pty_events.clone(),
             self.trace.clone(),
         )?;
@@ -340,13 +428,16 @@ impl ServerState {
         workspace.add_tab(tab_id);
         let number = self.session_numbers.allocate()?;
         let model = Session::new(number, workspace)?;
+        let title = pane
+            .foreground_process_name()
+            .unwrap_or_else(|| format!("Terminal {}", tab_id.get()));
         let mut tabs = HashMap::new();
         tabs.insert(
             tab_id,
             ServerTab {
                 id: tab_id,
                 pane,
-                title: format!("Terminal {}", tab_id.get()),
+                title,
                 exit_code: None,
             },
         );
@@ -355,6 +446,10 @@ impl ServerState {
             tabs,
             clients: HashSet::new(),
             last_pty_size: pty_size,
+            shell: ShellConfig {
+                executable: shell.to_owned(),
+                environment: environment.to_owned(),
+            },
         });
         Ok(number)
     }
@@ -445,7 +540,7 @@ impl ServerState {
     }
 
     fn create_tab(&mut self, number: SessionNumber) -> Result<(), String> {
-        let (working_directory, pty_size) = {
+        let (working_directory, pty_size, shell) = {
             let session = self
                 .session(number)
                 .ok_or_else(|| "Session no longer exists".to_owned())?;
@@ -456,6 +551,7 @@ impl ServerState {
             (
                 workspace.working_directory().to_path_buf(),
                 session.last_pty_size,
+                session.shell.clone(),
             )
         };
         let id = TabId::new(self.allocate_tab_id().map_err(|error| error.to_string())?);
@@ -464,6 +560,8 @@ impl ServerState {
             pty_size.columns,
             id.get(),
             &working_directory,
+            &shell.executable,
+            &shell.environment,
             self.pty_events.clone(),
             self.trace.clone(),
         )
@@ -474,12 +572,15 @@ impl ServerState {
         if !session.model.add_tab_to_active_workspace(id) {
             return Err("could not add Tab to active Workspace".to_owned());
         }
+        let title = pane
+            .foreground_process_name()
+            .unwrap_or_else(|| format!("Terminal {}", id.get()));
         session.tabs.insert(
             id,
             ServerTab {
                 id,
                 pane,
-                title: format!("Terminal {}", id.get()),
+                title,
                 exit_code: None,
             },
         );
@@ -567,16 +668,20 @@ impl ServerState {
                 working_directory.display()
             ));
         }
-        let size = self
-            .session(number)
-            .ok_or_else(|| "Session no longer exists".to_owned())?
-            .last_pty_size;
+        let (size, shell) = {
+            let session = self
+                .session(number)
+                .ok_or_else(|| "Session no longer exists".to_owned())?;
+            (session.last_pty_size, session.shell.clone())
+        };
         let tab_id = TabId::new(self.allocate_tab_id().map_err(|error| error.to_string())?);
         let pane = Pane::shell(
             size.rows,
             size.columns,
             tab_id.get(),
             &working_directory,
+            &shell.executable,
+            &shell.environment,
             self.pty_events.clone(),
             self.trace.clone(),
         )
@@ -594,12 +699,15 @@ impl ServerState {
             .model
             .add_workspace(workspace)
             .map_err(|error| error.to_string())?;
+        let title = pane
+            .foreground_process_name()
+            .unwrap_or_else(|| format!("Terminal {}", tab_id.get()));
         session.tabs.insert(
             tab_id,
             ServerTab {
                 id: tab_id,
                 pane,
-                title: format!("Terminal {}", tab_id.get()),
+                title,
                 exit_code: None,
             },
         );
@@ -704,21 +812,13 @@ impl ServerState {
     }
 
     fn handle_pty_output(&mut self, tab_id: u64, bytes: Vec<u8>) {
-        let Some((number, title_changed)) = self.sessions.iter_mut().find_map(|session| {
+        let Some(number) = self.sessions.iter_mut().find_map(|session| {
             let tab = session
                 .tabs
                 .values_mut()
                 .find(|tab| tab.id.get() == tab_id)?;
-            let title = tab.pane.process_output(&bytes);
-            let title_changed = title.is_some();
-            if let Some(title) = title {
-                tab.title = if title.is_empty() {
-                    format!("Terminal {tab_id}")
-                } else {
-                    title
-                };
-            }
-            Some((session.model.number(), title_changed))
+            let _ = tab.pane.process_output(&bytes);
+            Some(session.model.number())
         }) else {
             return;
         };
@@ -732,15 +832,18 @@ impl ServerState {
                 }
             }
         }
-        if title_changed {
-            let _ = self.broadcast_state(number);
-        }
     }
 
     fn poll_processes(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let mut changed_sessions = HashSet::new();
         for session in &mut self.sessions {
             for tab in session.tabs.values_mut() {
+                if let Some(process_name) = tab.pane.foreground_process_name()
+                    && tab.title != process_name
+                {
+                    tab.title = process_name;
+                    changed_sessions.insert(session.model.number());
+                }
                 if tab.exit_code.is_none()
                     && let Some(exit_code) = tab.pane.poll_exit()?
                 {
@@ -924,6 +1027,9 @@ mod tests {
             &ClientMessage::Hello(ClientHello {
                 protocol_version: zmux::protocol::PROTOCOL_VERSION,
                 session_number,
+                create_if_missing: false,
+                shell: "/bin/sh".into(),
+                environment: vec![("SHELL".to_owned(), "/bin/sh".to_owned())],
                 working_directory: std::env::current_dir().expect("current directory"),
                 viewport,
             }),
@@ -1362,6 +1468,9 @@ mod tests {
             &ClientMessage::Hello(ClientHello {
                 protocol_version: zmux::protocol::PROTOCOL_VERSION,
                 session_number: Some(42),
+                create_if_missing: false,
+                shell: "/bin/sh".into(),
+                environment: vec![("SHELL".to_owned(), "/bin/sh".to_owned())],
                 working_directory: std::env::current_dir().expect("current directory"),
                 viewport: Viewport {
                     rows: 24,
@@ -1393,6 +1502,9 @@ mod tests {
             &ClientMessage::Hello(ClientHello {
                 protocol_version: zmux::protocol::PROTOCOL_VERSION + 1,
                 session_number: None,
+                create_if_missing: false,
+                shell: "/bin/sh".into(),
+                environment: vec![("SHELL".to_owned(), "/bin/sh".to_owned())],
                 working_directory: std::env::current_dir().expect("current directory"),
                 viewport: Viewport {
                     rows: 24,
@@ -1478,6 +1590,9 @@ mod tests {
             &ClientMessage::Hello(ClientHello {
                 protocol_version: zmux::protocol::PROTOCOL_VERSION,
                 session_number: None,
+                create_if_missing: false,
+                shell: "/bin/sh".into(),
+                environment: vec![("SHELL".to_owned(), "/bin/sh".to_owned())],
                 working_directory: working_directory.clone(),
                 viewport: Viewport {
                     rows: 24,

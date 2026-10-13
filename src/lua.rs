@@ -872,7 +872,7 @@ mod tests {
             normalize_prefix_key("<C-Space>").expect("prefix")
         );
         assert_eq!(config.sequence_timeout, Duration::ZERO);
-        assert_eq!(config.keymap.binding_count(), 21);
+        assert_eq!(config.keymap.binding_count(), 22);
         let callback = config
             .keymap
             .binding_for(&parse_key_notation("x").expect("key"))

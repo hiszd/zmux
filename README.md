@@ -8,17 +8,33 @@ A local terminal multiplexer with a background Server, multiple TUI Clients, PTY
 cargo run
 ```
 
-Launching without a Session target creates a new numbered Session with one Workspace and one Tab, rooted at the launch working directory. To attach to an existing Session:
+The command is required. Create a new numbered Session with one Workspace and one Tab:
 
 ```sh
-cargo run -- --session 2
+cargo run -- new
+```
+
+Attach to an existing Session by number:
+
+```sh
+cargo run -- attach 2
+```
+
+`new --attach` uses ensure semantics: it attaches to the requested Session when it exists, or creates a new Session when it does not:
+
+```sh
+cargo run -- new --attach 2
 ```
 
 A named socket instance runs an independent Server and Session set:
 
 ```sh
-cargo run -- --socket project
-cargo run -- --socket project --session 1
+cargo run -- new --socket project
+cargo run -- attach 1 --socket project
+cargo run -- list --socket project
+cargo run -- kill 1 --socket project
+cargo run -- server status --socket project
+cargo run -- server stop --socket project
 ```
 
 The Server starts automatically in the background and remains alive while Sessions exist, including when all Clients detach. Sessions are ephemeral: stopping the Server destroys them. Unix-like systems use a socket under `$XDG_RUNTIME_DIR`, falling back to a private per-user runtime directory with a warning; Windows uses a user-scoped named pipe.

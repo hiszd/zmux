@@ -1,3 +1,37 @@
+//! Client-side session orchestration and event loop.
+//!
+//! This module owns the boundary between the server connection, terminal input,
+//! application state, Lua callbacks, and ratatui rendering. [`run`] performs
+//! startup and cleanup; [`run_event_loop`] then follows the main cycle:
+//!
+//! ```text
+//! receive input/server event
+//!     -> mutate ClientSession and produce Effects
+//!     -> dispatch Lua events and runtime commands
+//!     -> redraw when Effects::redraw is set
+//! ```
+//!
+//! In simplified form, the ownership of the loop looks like this:
+//!
+//! ```ignore
+//! loop {
+//!     if needs_draw {
+//!         build_ui_render(&session, &config);
+//!         terminal.draw(|frame| ui::draw(frame, &view))?;
+//!         needs_draw = false;
+//!     }
+//!
+//!     let event = receiver.recv_timeout(next_timeout)?;
+//!     let effects = handle_event(event, &mut context)?;
+//!     dispatch_ui_events(effects, &mut context)?;
+//! }
+//! ```
+//!
+//! Rendering is deliberately demand-driven. The loop waits on the event
+//! channel when no redraw is needed, but periodically wakes to expire key
+//! sequences and temporary warnings. Terminal output only requests a redraw
+//! when it belongs to the active tab.
+
 use crate::{
     input::{KeyDispatcher, KeyOutcome, KeyTimeout},
     lua::{self, AppEvent as UiEvent, AppSnapshot, LuaConfig, RuntimeCommand, TabSnapshot},
@@ -33,11 +67,23 @@ use zmux::{
     transport::{self, Endpoint},
 };
 
+/// Safety bound preventing Lua callbacks from creating an unbounded event loop.
 const MAX_CALLBACK_COMMANDS: usize = 128;
 
+/// Starts the interactive client for a session.
+///
+/// This function calculates the initial PTY viewport, connects to the server,
+/// starts the reader/writer/input worker threads, enters terminal mode, and
+/// hands control to [`run_event_loop`]. Terminal mode is restored on every
+/// return path through [`TerminalModeGuard`] and the final cursor cleanup.
+///
+/// `session_number` selects an existing session when present; `None` asks the
+/// server to create a new session. Errors from connection, terminal setup, or
+/// the event loop are propagated to the caller.
 pub fn run(
     endpoint: Endpoint,
     session_number: Option<u64>,
+    create_if_missing: bool,
     config: lua::AppConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let size = crossterm::terminal::size()?;
@@ -50,6 +96,7 @@ pub fn run(
     let connection = connect(
         &endpoint,
         session_number,
+        create_if_missing,
         std::env::current_dir()?,
         viewport,
     )?;
@@ -77,9 +124,15 @@ pub fn run(
     result
 }
 
+/// RAII guard for raw mode, the alternate screen, cursor shape, and enhanced
+/// keyboard reporting.
+///
+/// Keeping terminal setup and teardown together is important: dropping this
+/// guard restores the user's shell even when the event loop returns an error.
 struct TerminalModeGuard;
 
 impl TerminalModeGuard {
+    /// Enters the terminal mode required by the interactive client.
     fn enter(cursor_shape: ui::CursorShape) -> io::Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
@@ -114,16 +167,42 @@ impl Drop for TerminalModeGuard {
     }
 }
 
+/// State returned by the server handshake.
 struct InitialConnection {
+    /// Connected stream retained for splitting into reader and writer halves.
     stream: interprocess::local_socket::prelude::LocalSocketStream,
+    /// Client identity assigned by the server.
     client_id: u64,
+    /// Initial session snapshot.
     session: SessionSnapshot,
+    /// Initial terminal snapshots for the session's tabs.
     terminals: Vec<TerminalSnapshot>,
+}
+
+/// Connects to the server and completes the client handshake.
+///
+/// The client sends its protocol version, optional session target, working
+/// directory, and PTY viewport. It then waits for both acceptance and the
+/// initial session state before returning.
+fn current_shell() -> PathBuf {
+    #[cfg(windows)]
+    {
+        std::env::var_os("COMSPEC")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("cmd.exe"))
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("SHELL")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("sh"))
+    }
 }
 
 fn connect(
     endpoint: &Endpoint,
     session_number: Option<u64>,
+    create_if_missing: bool,
     working_directory: PathBuf,
     viewport: Viewport,
 ) -> Result<InitialConnection, Box<dyn std::error::Error>> {
@@ -133,6 +212,9 @@ fn connect(
         &ClientMessage::Hello(ClientHello {
             protocol_version: zmux::protocol::PROTOCOL_VERSION,
             session_number,
+            create_if_missing,
+            shell: current_shell(),
+            environment: std::env::vars().collect(),
             working_directory,
             viewport,
         }),
@@ -158,78 +240,133 @@ fn connect(
     }
 }
 
+/// Client-side terminal state for one tab.
+///
+/// The parser owns the current VT100 screen used by [`ui::draw`]. The title is
+/// copied separately because terminal output may update it incrementally.
 struct TerminalView {
+    /// VT100 parser and screen buffer.
     parser: Parser,
+    /// Most recently observed terminal title.
     title: String,
+    /// Process exit status, if the process has exited.
     exit_code: Option<u32>,
 }
 
 impl TerminalView {
+    /// Builds a parser and replays the server's terminal snapshot into it.
     fn from_snapshot(snapshot: TerminalSnapshot) -> Self {
         let mut parser = Parser::new(snapshot.rows, snapshot.columns, 10_000);
         parser.process(&snapshot.bytes);
+        let fallback_title = format!("Terminal {}", snapshot.tab_id);
+        let title = if snapshot.title.is_empty() {
+            fallback_title.clone()
+        } else {
+            snapshot.title
+        };
         Self {
             parser,
-            title: snapshot.title,
+            title,
             exit_code: snapshot.exit_code,
         }
     }
 }
 
+/// Whether a workspace dialog creates a workspace or edits an existing one.
 #[derive(Clone, Copy)]
 enum WorkspaceDialogMode {
+    /// Create a new workspace.
     Create,
+    /// Edit the workspace with this stable ID.
     Edit(u64),
 }
 
+/// Field currently focused in the workspace form.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WorkspaceField {
+    /// Working-directory field.
     Directory,
+    /// Optional workspace-name field.
     Name,
 }
 
+/// Mutable state for the create/edit workspace form.
 struct WorkspaceDialog {
+    /// Whether submission creates or edits.
     mode: WorkspaceDialogMode,
+    /// Directory selected for the workspace.
     working_directory: PathBuf,
+    /// Optional explicit workspace name.
     name: String,
+    /// Form field receiving keyboard input.
     field: WorkspaceField,
+    /// Prevents submitting the directory field before it has been confirmed.
     directory_selected: bool,
 }
 
+/// One row in the working-directory picker.
 struct DirectoryEntry {
+    /// Display text used by fuzzy filtering and the modal.
     label: String,
+    /// Directory navigated to or selected.
     path: PathBuf,
+    /// Whether Enter selects this directory instead of opening it.
     use_current: bool,
 }
 
+/// Navigable, fuzzy-filtered directory picker nested inside a workspace form.
 struct DirectoryPicker {
+    /// Form restored when the picker closes.
     form: WorkspaceDialog,
+    /// Directory whose children are currently listed.
     directory: PathBuf,
+    /// Current fuzzy-search query.
     query: String,
+    /// Entries in the unfiltered list.
     entries: Vec<DirectoryEntry>,
+    /// Index within the filtered results.
     highlighted: usize,
 }
 
+/// Active workspace-related modal.
 enum WorkspaceModal {
+    /// Create/edit form.
     Form(WorkspaceDialog),
+    /// Directory selection view opened from the form.
     Directory(DirectoryPicker),
 }
 
+/// Local state for a picker requested by a Lua callback.
 struct LuaPickerState {
+    /// Identifier used to complete the picker in Lua.
     id: u64,
+    /// Candidate labels supplied by Lua.
     labels: Vec<String>,
+    /// Current fuzzy-search query.
     query: String,
+    /// Index within the filtered results.
     highlighted: usize,
 }
 
+/// Owned, render-ready representation of any client modal.
 struct ModalDisplay {
+    /// Border title.
     title: String,
+    /// Optional filter query.
     query: Option<String>,
+    /// Rows displayed by the modal renderer.
     rows: Vec<String>,
+    /// Selected row in display coordinates.
     selected_row: Option<usize>,
+    /// Keyboard help or status footer.
     footer: String,
 }
 
+/// All client-owned state needed to process events and build a UI frame.
+///
+/// The server remains authoritative for session/workspace/tab structure;
+/// terminal parsers, modal state, warnings, and redraw flags are local client
+/// concerns.
 struct ClientSession {
     snapshot: SessionSnapshot,
     terminals: HashMap<u64, TerminalView>,
@@ -240,10 +377,10 @@ struct ClientSession {
     drawer_highlighted_workspace: Option<u64>,
     workspace_modal: Option<WorkspaceModal>,
     lua_picker: Option<LuaPickerState>,
-    force_redraw: bool,
 }
 
 impl ClientSession {
+    /// Creates client state from the server's initial snapshot.
     fn new(
         snapshot: SessionSnapshot,
         terminals: Vec<TerminalSnapshot>,
@@ -265,10 +402,10 @@ impl ClientSession {
             drawer_highlighted_workspace: None,
             workspace_modal: None,
             lua_picker: None,
-            force_redraw: false,
         }
     }
 
+    /// Returns the workspace selected by the session snapshot.
     fn active_workspace(&self) -> Option<&zmux::protocol::WorkspaceSnapshot> {
         self.snapshot
             .workspaces
@@ -276,6 +413,7 @@ impl ClientSession {
             .find(|workspace| workspace.id == self.snapshot.active_workspace_id)
     }
 
+    /// Returns the active tab within the active workspace.
     fn active_tab(&self) -> Option<&WireTab> {
         let workspace = self.active_workspace()?;
         workspace
@@ -284,6 +422,7 @@ impl ClientSession {
             .find(|tab| tab.id == workspace.active_tab_id)
     }
 
+    /// Returns the active tab's zero-based index for UI selection.
     fn active_tab_index(&self) -> usize {
         self.active_workspace()
             .and_then(|workspace| {
@@ -295,10 +434,15 @@ impl ClientSession {
             .unwrap_or_default()
     }
 
+    /// Returns the parsed terminal belonging to the active tab.
     fn active_terminal(&self) -> Option<&TerminalView> {
         self.terminals.get(&self.active_tab()?.id)
     }
 
+    /// Replaces server state and rebuilds all terminal parsers.
+    ///
+    /// A missing highlighted workspace is reset to the new active workspace so
+    /// drawer navigation cannot retain a deleted ID.
     fn set_snapshot(&mut self, snapshot: SessionSnapshot, terminals: Vec<TerminalSnapshot>) {
         self.snapshot = snapshot;
         if self.drawer_highlighted_workspace.is_none_or(|id| {
@@ -319,17 +463,18 @@ impl ClientSession {
             .collect();
     }
 
+    /// Feeds terminal output into a tab's VT100 parser and refreshes its title.
     fn process_output(&mut self, tab_id: u64, bytes: &[u8]) {
         let Some(terminal) = self.terminals.get_mut(&tab_id) else {
             return;
         };
         terminal.parser.process(bytes);
-        let title = terminal.parser.screen().title();
-        if terminal.title != title {
-            terminal.title = title.to_owned();
-        }
     }
 
+    /// Builds the public application snapshot exposed to Lua callbacks.
+    ///
+    /// Tab indices are one-based for configuration-facing APIs, while the
+    /// internal active-tab index remains zero-based.
     fn snapshot_for_lua(
         &self,
         leader_mode: bool,
@@ -370,10 +515,12 @@ impl ClientSession {
         }
     }
 
+    /// Stores the viewport most recently sent to the server.
     fn resize(&mut self, viewport: Viewport) {
         self.viewport = viewport;
     }
 
+    /// Opens a create-workspace form seeded from the active directory.
     fn open_create_workspace(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let working_directory = self
             .active_workspace()
@@ -389,6 +536,7 @@ impl ClientSession {
         Ok(())
     }
 
+    /// Opens an edit-workspace form for the active workspace.
     fn open_edit_workspace(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let workspace = self
             .active_workspace()
@@ -403,6 +551,7 @@ impl ClientSession {
         Ok(())
     }
 
+    /// Converts the active picker or workspace modal into render data.
     fn modal_display(&self) -> Option<ModalDisplay> {
         if let Some(picker) = &self.lua_picker {
             let visible = zmux::picker::fuzzy_filter(&picker.query, &picker.labels);
@@ -465,6 +614,7 @@ impl ClientSession {
 }
 
 impl DirectoryPicker {
+    /// Opens a picker for the form's current directory and loads its entries.
     fn new(form: WorkspaceDialog) -> io::Result<Self> {
         let directory = form.working_directory.clone();
         let mut picker = Self {
@@ -478,6 +628,10 @@ impl DirectoryPicker {
         Ok(picker)
     }
 
+    /// Rebuilds the current-directory, parent, and child-directory entries.
+    ///
+    /// Children are sorted case-insensitively and the highlight is reset to the
+    /// first result after navigation.
     fn reload(&mut self) -> io::Result<()> {
         let mut entries = vec![DirectoryEntry {
             label: format!("Use this directory: {}", self.directory.display()),
@@ -512,6 +666,7 @@ impl DirectoryPicker {
         Ok(())
     }
 
+    /// Returns source entry indices matching the current query.
     fn visible_indices(&self) -> Vec<usize> {
         let labels = self
             .entries
@@ -521,6 +676,7 @@ impl DirectoryPicker {
         zmux::picker::fuzzy_filter(&self.query, &labels)
     }
 
+    /// Moves the filtered-result highlight, wrapping at either end.
     fn move_highlight(&mut self, direction: i32) {
         let count = self.visible_indices().len();
         if count == 0 {
@@ -536,6 +692,10 @@ impl DirectoryPicker {
         }
     }
 
+    /// Confirms the highlighted entry.
+    ///
+    /// Selecting “use this directory” returns a path. Selecting another entry
+    /// navigates into it, reloads the picker, and returns `None`.
     fn confirm(&mut self) -> io::Result<Option<PathBuf>> {
         let visible = self.visible_indices();
         let Some(entry_index) = visible.get(self.highlighted).copied() else {
@@ -553,14 +713,23 @@ impl DirectoryPicker {
     }
 }
 
+/// Accumulated consequences of handling one input or server event.
+///
+/// Effects separate state transitions from the event loop: handlers can ask
+/// for a redraw, queue Lua events, or terminate without directly controlling
+/// the loop.
 #[derive(Default)]
 struct Effects {
+    /// Stop the client loop.
     quit: bool,
+    /// Request another ratatui frame.
     redraw: bool,
+    /// Application events to deliver to Lua handlers.
     events: Vec<UiEvent>,
 }
 
 impl Effects {
+    /// Combines flags and appends pending events in their existing order.
     fn merge(&mut self, mut other: Self) {
         self.quit |= other.quit;
         self.redraw |= other.redraw;
@@ -568,22 +737,38 @@ impl Effects {
     }
 }
 
+/// Mutable services shared by event handlers and runtime-command execution.
 struct ClientContext<'a> {
+    /// Mutable application/session state.
     session: &'a mut ClientSession,
+    /// Current outer terminal size as `(width, height)`.
     outer_size: &'a mut (u16, u16),
+    /// PTY viewport currently known by the client and server.
     viewport: &'a mut Viewport,
+    /// Prefix/sequence key state machine.
     dispatcher: &'a mut KeyDispatcher,
+    /// Outgoing server-request channel.
     sender: &'a Sender<ClientMessage>,
+    /// Next request ID to assign.
     next_request_id: &'a mut u64,
+    /// Lua configuration and callback interface.
     lua: &'a LuaConfig,
+    /// Trace sink for event and performance diagnostics.
     trace: &'a Trace,
 }
 
+/// Messages delivered to the main client loop.
 enum ClientEvent {
+    /// Keyboard, resize, or other terminal input.
     Input(Event),
+    /// Message received from the server reader thread.
     Server(ServerMessage),
 }
 
+/// Creates the synthetic lifecycle events emitted after the initial handshake.
+///
+/// A newly created session receives creation events for its workspace and tabs;
+/// every session receives selection events for the active workspace and tab.
 fn initial_session_events(session: &SessionSnapshot, created: bool) -> Vec<UiEvent> {
     let mut events = vec![UiEvent {
         name: if created {
@@ -653,6 +838,16 @@ fn initial_session_events(session: &SessionSnapshot, created: bool) -> Vec<UiEve
     events
 }
 
+/// Runs the demand-driven client event and render loop.
+///
+/// The loop renders once when `needs_draw` is set, then waits for input or
+/// server messages. Each handler returns [`Effects`], which determines whether
+/// state changed and whether another frame is needed. A bounded timeout also
+/// lets the loop expire key sequences and temporary warnings.
+///
+/// The render phase assembles a [`ui::UiRender`] from the client session and
+/// invokes `ratatui`'s `Terminal::draw`; event handling resumes only after the
+/// frame is complete.
 fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     config: lua::AppConfig,
@@ -680,7 +875,6 @@ fn run_event_loop(
     let mut next_request_id = 1;
     let mut dispatcher =
         KeyDispatcher::new(config.prefix_key, config.sequence_timeout, config.keymap);
-    let mut renderer = ui::TerminalRenderer::default();
     let initial_events = initial_session_events(&session.snapshot, created_session);
     let startup = dispatch_ui_events(
         Effects {
@@ -735,11 +929,6 @@ fn run_event_loop(
                 outer_size.1,
             ))?;
             let bars = render_bars(&config.lua)?;
-            let mut force_redraw = session.force_redraw;
-            session.force_redraw = false;
-            let Some(active_tab) = session.active_tab() else {
-                return Err("active Session has no active Tab".into());
-            };
             let active_terminal = session
                 .active_terminal()
                 .ok_or("active Tab has no terminal snapshot")?;
@@ -773,15 +962,17 @@ fn run_event_loop(
                 .as_ref()
                 .filter(|(_, deadline)| Instant::now() < *deadline)
                 .map(|(warning, _)| warning.as_str());
-            let mut ui_frame = ui::UiRender {
+            let ui_frame = ui::UiRender {
                 screen: active_terminal.parser.screen(),
-                renderer: &mut renderer,
                 leader_mode: dispatcher.is_leader(),
                 tab_count: session
                     .active_workspace()
                     .map_or(0, |workspace| workspace.tabs.len()),
                 active_tab: session.active_tab_index(),
-                active_title: session.last_error.as_deref().unwrap_or(&active_tab.title),
+                active_title: session
+                    .last_error
+                    .as_deref()
+                    .unwrap_or(active_terminal.title.as_str()),
                 active_exit_code: active_terminal.exit_code,
                 workspace_drawer: drawer,
                 modal,
@@ -798,11 +989,10 @@ fn run_event_loop(
                 bars,
                 lua: &config.lua,
                 trace: &trace,
-                force_redraw: &mut force_redraw,
             };
             let mut draw_error = None;
             terminal.draw(|frame| {
-                if let Err(error) = ui::draw(frame, &mut ui_frame) {
+                if let Err(error) = ui::draw(frame, &ui_frame) {
                     draw_error = Some(error);
                 }
             })?;
@@ -974,6 +1164,9 @@ fn run_event_loop(
     Ok(())
 }
 
+/// Starts the thread that decodes server messages and forwards them to the
+/// main event loop. A read failure is represented as `ServerStopping` so the
+/// loop can shut down through its normal event path.
 fn spawn_server_reader(
     mut reader: impl io::Read + Send + 'static,
     sender: Sender<ClientEvent>,
@@ -998,6 +1191,11 @@ fn spawn_server_reader(
     Ok(())
 }
 
+/// Starts the thread that serializes outgoing client messages.
+///
+/// The returned sender is non-blocking with respect to socket writes from the
+/// event loop; the writer thread reports a failed connection as
+/// `ServerStopping`.
 fn spawn_server_writer(
     mut writer: impl io::Write + Send + 'static,
     sender: Sender<ClientEvent>,
@@ -1016,6 +1214,7 @@ fn spawn_server_writer(
     Ok(outgoing)
 }
 
+/// Starts the thread that reads crossterm events and forwards them to the loop.
 fn spawn_input_reader(sender: Sender<ClientEvent>) -> io::Result<()> {
     thread::Builder::new()
         .name("zmux-input-reader".to_owned())
@@ -1029,6 +1228,11 @@ fn spawn_input_reader(sender: Sender<ClientEvent>) -> io::Result<()> {
     Ok(())
 }
 
+/// Applies one server message to local state and returns its UI effects.
+///
+/// Active terminal output redraws immediately; output for an inactive tab is
+/// still parsed but waits until that tab becomes visible. State changes and
+/// replies redraw, while detach/stop messages terminate the client.
 fn handle_server_message(message: ServerMessage, session: &mut ClientSession) -> Effects {
     match message {
         ServerMessage::StateChanged {
@@ -1092,10 +1296,16 @@ fn handle_server_message(message: ServerMessage, session: &mut ClientSession) ->
         },
         ServerMessage::HelloAccepted { .. }
         | ServerMessage::HelloRejected { .. }
-        | ServerMessage::InitialState { .. } => Effects::default(),
+        | ServerMessage::InitialState { .. }
+        | ServerMessage::AdminResult { .. } => Effects::default(),
     }
 }
 
+/// Computes Lua lifecycle events between two server snapshots.
+///
+/// The diff covers sessions, workspaces, tabs, titles, process exits, and
+/// active workspace/tab changes. It compares stable IDs rather than positions
+/// so reordering does not look like deletion and recreation.
 fn diff_session_state(old: &SessionSnapshot, new: &SessionSnapshot) -> Vec<UiEvent> {
     let mut events = Vec::new();
     if old.number != new.number {
@@ -1271,6 +1481,12 @@ fn diff_session_state(old: &SessionSnapshot, new: &SessionSnapshot) -> Vec<UiEve
     events
 }
 
+/// Routes one terminal event through modal, drawer, key-dispatch, and resize
+/// handling.
+///
+/// Modal and drawer controls take precedence over normal key dispatch unless
+/// the leader/prefix sequence is active. Normal keys are converted into
+/// forwarded PTY bytes, Lua callback execution, warnings, or ignored input.
 fn handle_input(
     event: Event,
     context: &mut ClientContext<'_>,
@@ -1457,6 +1673,7 @@ fn handle_input(
     }
 }
 
+/// Handles navigation, filtering, cancellation, and selection in a Lua picker.
 fn handle_lua_picker_key(
     key: crossterm::event::KeyEvent,
     context: &mut ClientContext<'_>,
@@ -1546,6 +1763,10 @@ fn handle_lua_picker_key(
     }
 }
 
+/// Handles keyboard input for workspace forms and directory selection.
+///
+/// The form delegates directory browsing to [`DirectoryPicker`], while Enter
+/// submits a create/edit request only after the directory has been confirmed.
 fn handle_workspace_modal_key(
     key: crossterm::event::KeyEvent,
     context: &mut ClientContext<'_>,
@@ -1722,6 +1943,7 @@ fn handle_workspace_modal_key(
     }
 }
 
+/// Assigns a monotonically increasing request ID and queues a server request.
 fn send_request(
     sender: &Sender<ClientMessage>,
     next_id: &mut u64,
@@ -1733,6 +1955,12 @@ fn send_request(
     Ok(())
 }
 
+/// Delivers queued application events to Lua handlers.
+///
+/// Handlers may emit more events or runtime commands. The safety limit prevents
+/// recursive callbacks from monopolizing the client forever; viewport changes
+/// caused by Lua options are sent to the server before command execution
+/// continues.
 fn dispatch_ui_events(
     effects: Effects,
     context: &mut ClientContext<'_>,
@@ -1779,6 +2007,11 @@ fn dispatch_ui_events(
     Ok(effects)
 }
 
+/// Applies commands emitted by Lua callbacks.
+///
+/// Local commands update picker/drawer/modal state. Session and tab commands
+/// become requests for the server, preserving the server as the authority for
+/// session structure.
 fn execute_runtime_commands(
     commands: Vec<RuntimeCommand>,
     context: &mut ClientContext<'_>,
@@ -1787,8 +2020,7 @@ fn execute_runtime_commands(
     for command in commands {
         match command {
             RuntimeCommand::Redraw => {
-                context.trace.mark("ui-force-redraw-requested");
-                context.session.force_redraw = true;
+                context.trace.mark("ui-redraw-requested");
                 effects.redraw = true;
             }
             RuntimeCommand::OpenPicker(id) => {
@@ -1866,6 +2098,10 @@ fn execute_runtime_commands(
     Ok(effects)
 }
 
+/// Evaluates the six configured Lua bar parts for the next frame.
+///
+/// Missing parts remain `None`, allowing [`ui::draw`] to supply its built-in
+/// defaults; an explicitly empty Lua result suppresses that group.
 fn render_bars(lua: &LuaConfig) -> mlua::Result<ui::BarContents> {
     Ok(ui::BarContents {
         top: ui::BarParts {
@@ -1900,6 +2136,20 @@ mod tests {
         });
 
         assert_eq!(view.parser.screen().size(), (40, 120));
+    }
+
+    #[test]
+    fn empty_terminal_titles_use_a_stable_fallback() {
+        let view = TerminalView::from_snapshot(TerminalSnapshot {
+            tab_id: 7,
+            rows: 2,
+            columns: 4,
+            bytes: Vec::new(),
+            title: String::new(),
+            exit_code: None,
+        });
+
+        assert_eq!(view.title, "Terminal 7");
     }
 
     #[test]

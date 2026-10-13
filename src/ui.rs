@@ -1,3 +1,42 @@
+//! Rendering primitives for zmux's terminal user interface.
+//!
+//! The UI is rendered in layers: [`layout`] reserves space for the top and
+//! bottom bars, the workspace drawer, and the PTY; [`draw`] then projects the
+//! [`vt100::Screen`] into a ratatui frame and paints overlays on top. It reads
+//! the current [`vt100::Screen`] and writes it into the ratatui frame on every requested
+//! frame. Ratatui performs the final output diff against the previous frame.
+//!
+//! A typical application-owned render loop looks like this:
+//!
+//! ```ignore
+//! let view = UiRender {
+//!     screen: terminal_screen,
+//!     leader_mode: false,
+//!     tab_count: 2,
+//!     active_tab: 0,
+//!     active_title: "shell",
+//!     active_exit_code: None,
+//!     workspace_drawer: WorkspaceDrawerRender {
+//!         expanded: false,
+//!         active_id: 1,
+//!         highlighted_id: 1,
+//!         items: &workspaces,
+//!     },
+//!     modal: None,
+//!     which_key: WhichKeyPopup::default(),
+//!     key_warning: None,
+//!     options,
+//!     bars: BarContents::default(),
+//!     lua: &lua_config,
+//!     trace: &trace,
+//! };
+//! draw(frame, &view)?;
+//! ```
+//!
+//! Text is measured with Unicode display width rather than byte length. This
+//! matters for both wide characters and combining marks in bar, modal, and
+//! drawer content.
+
 use crate::{
     lua::{BarSegment, LuaConfig, UiOptions},
     trace::Trace,
@@ -14,15 +53,30 @@ use std::time::Instant;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+/// The shape used by the terminal's cursor while a PTY is focused.
+///
+/// The value is independent of whether a terminal supports blinking; the
+/// renderer deliberately selects the steady crossterm variants.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CursorShape {
     #[default]
+    /// A solid block occupying the cursor cell.
     Block,
+    /// A horizontal underline at the bottom of the cursor cell.
     Underline,
+    /// A vertical bar at the left edge of the cursor cell.
     Bar,
 }
 
 impl CursorShape {
+    /// Converts this application setting to the crossterm cursor style.
+    ///
+    /// ```
+    /// # use zmux::ui::CursorShape;
+    /// use crossterm::cursor::SetCursorStyle;
+    ///
+    /// assert_eq!(CursorShape::Bar.terminal_style(), SetCursorStyle::SteadyBar);
+    /// ```
     pub fn terminal_style(self) -> SetCursorStyle {
         match self {
             Self::Block => SetCursorStyle::SteadyBlock,
@@ -35,6 +89,10 @@ impl CursorShape {
 impl std::str::FromStr for CursorShape {
     type Err = String;
 
+    /// Parses `block`, `underline`, or `bar` from configuration text.
+    ///
+    /// Parsing is intentionally case-sensitive so configuration mistakes are
+    /// reported instead of silently selecting a different cursor.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "block" => Ok(Self::Block),
@@ -47,150 +105,190 @@ impl std::str::FromStr for CursorShape {
     }
 }
 
-#[derive(Default)]
-pub struct TerminalRenderer {
-    size: (u16, u16),
-    previous_cells: Vec<Option<vt100::Cell>>,
-    rendered_cells: Vec<RenderedCell>,
-    cursor: Option<(bool, u16, u16)>,
-}
-
-#[derive(Clone, Default)]
-struct RenderedCell {
-    symbol: String,
-    style: Style,
-}
-
-#[derive(Default)]
-struct ProjectionStats {
-    visited: usize,
-    changed: usize,
-    nonempty: usize,
-    projection_duration: std::time::Duration,
-}
-
+/// The three horizontally aligned groups in one status bar.
+///
+/// `None` means “use the built-in group” when passed through [`draw`]. `Some`
+/// with an empty vector means “intentionally render nothing”. Each segment's
+/// text may contain newlines; the corresponding line is selected while the bar
+/// is painted.
 #[derive(Clone, Default)]
 pub struct BarParts {
+    /// Segments drawn from the left edge.
     pub left: Option<Vec<BarSegment>>,
+    /// Segments centered in the bar.
     pub center: Option<Vec<BarSegment>>,
+    /// Segments drawn from the right edge.
     pub right: Option<Vec<BarSegment>>,
 }
 
+/// Top and bottom status-bar content supplied to [`draw`].
 #[derive(Clone, Default)]
 pub struct BarContents {
+    /// Content for the top anchor.
     pub top: BarParts,
+    /// Content for the bottom anchor.
     pub bottom: BarParts,
 }
 
+/// One workspace entry shown by [`WorkspaceDrawerRender`].
 pub struct WorkspaceDrawerItem<'a> {
+    /// Stable workspace identifier used for active/highlight matching.
     pub id: u64,
+    /// User-facing workspace name.
     pub name: &'a str,
 }
 
+/// State and entries needed to paint the workspace drawer.
+///
+/// In collapsed mode only the first single-width grapheme of each name is
+/// displayed. In expanded mode the highlighted item follows keyboard
+/// navigation while `active_id` identifies the currently selected workspace.
 pub struct WorkspaceDrawerRender<'a> {
+    /// Whether to show full names instead of initials.
     pub expanded: bool,
+    /// ID of the workspace currently in use.
     pub active_id: u64,
+    /// ID selected by navigation while expanded.
     pub highlighted_id: u64,
+    /// Workspaces to display in order.
     pub items: &'a [WorkspaceDrawerItem<'a>],
 }
 
+/// A centered modal containing an optional query, selectable rows, and footer.
+///
+/// Rows are vertically scrolled so `selected_row` remains visible. The modal
+/// owns no state: callers update these references and render again after input.
 pub struct ModalOverlay<'a> {
+    /// Title displayed in the border.
     pub title: &'a str,
+    /// Optional query line rendered before the rows.
     pub query: Option<&'a str>,
+    /// Candidate rows rendered below the query.
     pub rows: &'a [String],
+    /// Row to highlight and keep visible, if any.
     pub selected_row: Option<usize>,
+    /// Help or status text pinned to the bottom.
     pub footer: &'a str,
 }
 
+/// All application state required for one [`draw`] call.
+///
+/// This is a short-lived, immutable view assembled by the application. The
+/// complete current view is rendered whenever the event loop requests a frame;
+/// ratatui handles the final terminal-buffer diff.
 pub struct UiRender<'a> {
+    /// Parsed terminal contents to project into the PTY pane.
     pub screen: &'a vt100::Screen,
-    pub renderer: &'a mut TerminalRenderer,
+    /// Whether the leader key mode indicator is active.
     pub leader_mode: bool,
+    /// Number of tabs represented by the default top bar.
     pub tab_count: usize,
+    /// Zero-based active tab index.
     pub active_tab: usize,
+    /// Title used by the default bottom bar.
     pub active_title: &'a str,
+    /// Exit code shown when the active terminal has exited.
     pub active_exit_code: Option<u32>,
+    /// Workspace drawer state.
     pub workspace_drawer: WorkspaceDrawerRender<'a>,
+    /// Optional modal drawn over the panel.
     pub modal: Option<ModalOverlay<'a>>,
+    /// Which-key popup shown while leader input is active.
     pub which_key: WhichKeyPopup,
+    /// Optional warning replacing the default right bottom-bar group.
     pub key_warning: Option<&'a str>,
+    /// Visibility and height settings for the anchors.
     pub options: UiOptions,
+    /// User-supplied top and bottom bar groups.
     pub bars: BarContents,
+    /// Lua configuration used to resolve segment styles.
     pub lua: &'a LuaConfig,
+    /// Frame timing and state trace sink.
     pub trace: &'a Trace,
-    pub force_redraw: &'a mut bool,
 }
 
+/// Rectangles produced by [`layout`] for each UI layer.
+///
+/// `pty` includes its border; `pane` is the interior where terminal cells are
+/// copied. The two anchor rectangles are the top and bottom bars.
 pub struct UiLayout {
+    /// Full rectangle reserved for the top bar.
     pub top_anchor: Rect,
+    /// Full rectangle reserved for the bottom bar.
     pub bottom_anchor: Rect,
+    /// Area between the anchors.
     pub panel: Rect,
+    /// Rectangle available to the workspace drawer.
     pub drawer: Rect,
+    /// PTY rectangle, including its border.
     pub pty: Rect,
+    /// PTY interior where terminal cells are rendered.
     pub pane: Rect,
 }
 
-impl TerminalRenderer {
-    pub fn invalidate(&mut self) {
-        self.previous_cells.fill(None);
-    }
+/// Returns cursor visibility and coordinates relative to the PTY pane.
+///
+/// The cursor is derived directly from the current VT100 screen. Coordinates
+/// outside the pane are retained with `visible == false` so the caller can
+/// decide whether to place a ratatui cursor.
+fn cursor_state(
+    screen: &vt100::Screen,
+    width: u16,
+    height: u16,
+) -> Option<(bool, u16, u16)> {
+    let (row, column) = screen.cursor_position();
+    let visible = !screen.hide_cursor() && row < height && column < width;
+    Some((visible, row, column))
+}
 
-    fn project_screen(
-        &mut self,
-        screen: &vt100::Screen,
-        width: u16,
-        height: u16,
-    ) -> ProjectionStats {
-        let count = usize::from(width) * usize::from(height);
-        if self.size != (width, height) || self.previous_cells.len() != count {
-            self.size = (width, height);
-            self.previous_cells = vec![None; count];
-            self.rendered_cells = vec![RenderedCell::default(); count];
-        }
-
-        let started = Instant::now();
-        let mut stats = ProjectionStats::default();
-        for row in 0..height {
-            for column in 0..width {
-                let index = usize::from(row) * usize::from(width) + usize::from(column);
-                let cell = screen.cell(row, column);
-                stats.visited += 1;
-                stats.nonempty += usize::from(cell.is_some_and(vt100::Cell::has_contents));
-                if cell == self.previous_cells[index].as_ref() {
-                    continue;
-                }
-
-                stats.changed += 1;
-                self.previous_cells[index] = cell.cloned();
-                self.rendered_cells[index] = cell.map_or_else(RenderedCell::default, |cell| {
+/// Renders every cell in the current VT100 screen into the PTY pane.
+///
+/// This is intentionally immediate-mode: it does not retain cell state or
+/// perform its own invalidation. The event loop decides whether a frame is
+/// needed, and ratatui compares the completed frame with its previous buffer.
+fn render_screen(
+    buffer: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    screen: &vt100::Screen,
+) {
+    for row in 0..area.height {
+        for column in 0..area.width {
+            let cell = screen.cell(row, column);
+            let (symbol, style) = cell.map_or_else(
+                || (" ".to_owned(), Style::default()),
+                |cell| {
                     let contents = if cell.has_contents() {
                         cell.contents()
                     } else {
                         String::new()
                     };
-                    RenderedCell {
-                        symbol: display_symbol(&contents).to_owned(),
-                        style: cell_style(cell),
-                    }
-                });
-            }
+                    (display_symbol(&contents).to_owned(), cell_style(cell))
+                },
+            );
+            buffer[(area.x + column, area.y + row)]
+                .set_symbol(&symbol)
+                .set_style(style);
         }
-        stats.projection_duration = started.elapsed();
-        stats
-    }
-
-    fn cursor_state(
-        &self,
-        screen: &vt100::Screen,
-        width: u16,
-        height: u16,
-    ) -> Option<(bool, u16, u16)> {
-        let (row, column) = screen.cursor_position();
-        let visible = !screen.hide_cursor() && row < height && column < width;
-        Some((visible, row, column))
     }
 }
 
+/// Computes the rectangles used by the UI.
+///
+/// Anchor heights are clamped to the available area. The collapsed drawer is
+/// one cell wide; the expanded drawer occupies the panel and leaves no PTY
+/// area, which lets it act as a full-panel workspace picker.
+///
+/// ```
+/// # use zmux::ui::layout;
+/// # use zmux::lua::{AnchorOptions, UiOptions};
+/// # use ratatui::layout::Rect;
+/// let options = UiOptions {
+///     top: AnchorOptions { height: 1, visible: true },
+///     bottom: AnchorOptions { height: 1, visible: true },
+/// };
+/// let parts = layout(Rect::new(0, 0, 80, 24), options, false);
+/// assert_eq!((parts.pane.width, parts.pane.height), (77, 21));
+/// ```
 pub fn layout(area: Rect, options: UiOptions, drawer_expanded: bool) -> UiLayout {
     let top_height = if options.top.visible {
         options.top.height.min(area.height)
@@ -237,11 +335,19 @@ pub fn layout(area: Rect, options: UiOptions, drawer_expanded: bool) -> UiLayout
     }
 }
 
+/// Returns the PTY's inner `(height, width)` for a terminal resize request.
+///
+/// The order matches the common PTY resize API rather than [`ratatui::layout::Rect`].
 pub fn pane_size(width: u16, height: u16, options: UiOptions, drawer_expanded: bool) -> (u16, u16) {
     let layout = layout(Rect::new(0, 0, width, height), options, drawer_expanded);
     (layout.pane.height, layout.pane.width)
 }
 
+/// Computes the drawer width used by [`layout`].
+///
+/// A collapsed drawer always reserves one column when possible. Expanded mode
+/// deliberately consumes the whole panel so the drawer can display a focused
+/// workspace list without a partially visible PTY behind it.
 fn drawer_width(inner_width: u16, expanded: bool) -> u16 {
     if inner_width == 0 {
         return 0;
@@ -256,13 +362,16 @@ fn drawer_width(inner_width: u16, expanded: bool) -> u16 {
     }
 }
 
-pub fn draw(frame: &mut Frame<'_>, view: &mut UiRender<'_>) -> mlua::Result<()> {
+/// Renders one complete UI frame.
+///
+/// The sequence is significant: bars and the PTY are painted first, then the
+/// drawer and modal, and finally the which-key popup and cursor. Overlays can
+/// therefore obscure terminal content without changing the terminal model.
+/// Lua-configured bar styles are applied before painting. A Lua error is
+/// returned to the caller so the event loop can decide whether it is
+/// recoverable.
+pub fn draw(frame: &mut Frame<'_>, view: &UiRender<'_>) -> mlua::Result<()> {
     let frame_started = Instant::now();
-    let force_redraw = *view.force_redraw;
-    if force_redraw {
-        view.renderer.invalidate();
-        *view.force_redraw = false;
-    }
     let area = frame.area();
     let layout = layout(area, view.options, view.workspace_drawer.expanded);
     let rect_detail = |rect: Option<Rect>| {
@@ -277,11 +386,10 @@ pub fn draw(frame: &mut Frame<'_>, view: &mut UiRender<'_>) -> mlua::Result<()> 
         )
     };
     view.trace.mark(&format!(
-        "ui-frame-layout area={}x{} drawer_expanded={} force_redraw={} pty={} pane={}",
+        "ui-frame-layout area={}x{} drawer_expanded={} pty={} pane={}",
         area.width,
         area.height,
         view.workspace_drawer.expanded,
-        force_redraw,
         rect_detail(Some(layout.pty)),
         rect_detail(Some(layout.pane)),
     ));
@@ -322,11 +430,8 @@ pub fn draw(frame: &mut Frame<'_>, view: &mut UiRender<'_>) -> mlua::Result<()> 
             ),
         }]);
     }
-    let border_started = Instant::now();
+    let screen_started = Instant::now();
     let screen = view.screen;
-    let stats = view
-        .renderer
-        .project_screen(screen, layout.pane.width, layout.pane.height);
     let buffer_started = Instant::now();
     {
         let buffer = frame.buffer_mut();
@@ -339,31 +444,19 @@ pub fn draw(frame: &mut Frame<'_>, view: &mut UiRender<'_>) -> mlua::Result<()> 
         Block::default()
             .borders(Borders::ALL)
             .render(layout.pty, buffer);
-        for row in 0..layout.pane.height {
-            for column in 0..layout.pane.width {
-                let index = usize::from(row) * usize::from(layout.pane.width) + usize::from(column);
-                let cell = &view.renderer.rendered_cells[index];
-                buffer[(layout.pane.x + column, layout.pane.y + row)]
-                    .set_symbol(&cell.symbol)
-                    .set_style(cell.style);
-            }
-        }
+        render_screen(buffer, layout.pane, screen);
         (&view.workspace_drawer).render(layout.drawer, buffer);
         if let Some(modal) = &view.modal {
             modal.render(layout.panel, buffer);
         }
     }
-    view.trace.duration(
-        "ui-pty-border-render",
-        border_started.elapsed(),
-        &format!("area={}x{}", layout.pty.width, layout.pty.height),
-    );
     let buffer_duration = buffer_started.elapsed();
-    let cursor = view
-        .renderer
-        .cursor_state(screen, layout.pane.width, layout.pane.height);
-    let cursor_changed = cursor != view.renderer.cursor;
-    view.renderer.cursor = cursor;
+    view.trace.duration(
+        "ui-terminal-screen-render",
+        screen_started.elapsed(),
+        &format!("area={}x{}", layout.pane.width, layout.pane.height),
+    );
+    let cursor = cursor_state(screen, layout.pane.width, layout.pane.height);
     if which_key_visible {
         (&view.which_key).render(area, frame.buffer_mut());
     }
@@ -375,26 +468,13 @@ pub fn draw(frame: &mut Frame<'_>, view: &mut UiRender<'_>) -> mlua::Result<()> 
     }
 
     view.trace.duration(
-        "ui-terminal-cell-project",
-        stats.projection_duration,
-        &format!(
-            "visited={} dirty={} reused={} nonempty={}",
-            stats.visited,
-            stats.changed,
-            stats.visited - stats.changed,
-            stats.nonempty
-        ),
-    );
-    view.trace.duration(
         "ui-buffer-populate",
         buffer_duration,
-        &format!("cells={}", stats.visited),
+        &format!(
+            "cells={}",
+            usize::from(layout.pane.width) * usize::from(layout.pane.height)
+        ),
     );
-    view.trace.mark(if cursor_changed {
-        "ui-cursor-changed"
-    } else {
-        "ui-cursor-unchanged"
-    });
     view.trace.duration(
         "ui-frame-closure",
         frame_started.elapsed(),
@@ -405,6 +485,8 @@ pub fn draw(frame: &mut Frame<'_>, view: &mut UiRender<'_>) -> mlua::Result<()> 
 }
 
 impl Widget for &ModalOverlay<'_> {
+    /// Sizes the modal to its content, centers it, and scrolls rows around the
+    /// selected entry when the available height is too small.
     fn render(self, area: Rect, buffer: &mut ratatui::buffer::Buffer) {
         let modal = self;
         if area.is_empty() {
@@ -518,6 +600,8 @@ impl Widget for &ModalOverlay<'_> {
 }
 
 impl Widget for &WorkspaceDrawerRender<'_> {
+    /// Paints the drawer and scrolls it so its active/highlighted entry stays
+    /// visible. Unicode grapheme boundaries are respected for collapsed initials.
     fn render(self, pane: Rect, buffer: &mut ratatui::buffer::Buffer) {
         let drawer = self;
         if pane.is_empty() || drawer.items.is_empty() {
@@ -623,6 +707,7 @@ impl Widget for &WorkspaceDrawerRender<'_> {
     }
 }
 
+/// Resolves Lua-defined default styles for every segment in a bar.
 fn apply_styles(lua: &LuaConfig, parts: &mut BarParts) -> mlua::Result<()> {
     for segment in parts
         .left
@@ -636,6 +721,7 @@ fn apply_styles(lua: &LuaConfig, parts: &mut BarParts) -> mlua::Result<()> {
     Ok(())
 }
 
+/// Fills only missing bar groups, preserving explicitly empty groups.
 fn defaulted_parts(mut configured: BarParts, defaults: BarParts) -> BarParts {
     if configured.left.is_none() {
         configured.left = defaults.left;
@@ -649,6 +735,7 @@ fn defaulted_parts(mut configured: BarParts, defaults: BarParts) -> BarParts {
     configured
 }
 
+/// Builds the built-in tab and leader indicators for the top bar.
 fn default_top_parts(tab_count: usize, active_tab: usize, leader_mode: bool) -> BarParts {
     let tabs = (1..=tab_count)
         .map(|index| BarSegment {
@@ -674,6 +761,7 @@ fn default_top_parts(tab_count: usize, active_tab: usize, leader_mode: bool) -> 
     }
 }
 
+/// Builds the built-in active-terminal and terminal-size indicators.
 fn default_bottom_parts(
     active_title: &str,
     exit_code: Option<u32>,
@@ -696,6 +784,7 @@ fn default_bottom_parts(
     }
 }
 
+/// Clears and paints all bar rows, aligning left, center, and right groups.
 fn draw_bar(buffer: &mut ratatui::buffer::Buffer, area: Rect, parts: &BarParts) {
     for row in area.y..area.y + area.height {
         for column in area.x..area.x + area.width {
@@ -720,6 +809,7 @@ fn draw_bar(buffer: &mut ratatui::buffer::Buffer, area: Rect, parts: &BarParts) 
     }
 }
 
+/// Selects one line from each possibly multiline segment.
 fn line_segments(segments: Option<&[BarSegment]>, line: u16) -> Vec<BarSegment> {
     segments
         .unwrap_or_default()
@@ -735,6 +825,7 @@ fn line_segments(segments: Option<&[BarSegment]>, line: u16) -> Vec<BarSegment> 
         .collect()
 }
 
+/// Calculates display width using terminal columns, saturating at `u16::MAX`.
 fn segments_width(segments: &[BarSegment]) -> u16 {
     segments
         .iter()
@@ -744,6 +835,10 @@ fn segments_width(segments: &[BarSegment]) -> u16 {
         .fold(0_u16, u16::saturating_add)
 }
 
+/// Draws segments left-to-right, clipping at the area's right edge.
+///
+/// Zero-width graphemes (for example combining accents) are appended to the
+/// preceding cell rather than consuming another terminal column.
 fn draw_segments(
     buffer: &mut ratatui::buffer::Buffer,
     area: Rect,
@@ -772,6 +867,7 @@ fn draw_segments(
     }
 }
 
+/// Supplies the built-in style for a segment without an explicit style.
 fn default_style(segment: &BarSegment) -> Style {
     match segment.role.as_deref() {
         Some("selected_tab") => Style::default()
@@ -785,10 +881,12 @@ fn default_style(segment: &BarSegment) -> Style {
     }
 }
 
+/// Converts an empty vt100 cell into a visible blank terminal cell.
 fn display_symbol(contents: &str) -> &str {
     if contents.is_empty() { " " } else { contents }
 }
 
+/// Converts vt100 attributes into an equivalent ratatui style.
 fn cell_style(cell: &vt100::Cell) -> Style {
     let mut modifiers = Modifier::empty();
     if cell.bold() {
@@ -809,6 +907,7 @@ fn cell_style(cell: &vt100::Cell) -> Style {
         .add_modifier(modifiers)
 }
 
+/// Converts vt100's default, indexed, and RGB colors to ratatui colors.
 fn color(color: vt100::Color) -> Color {
     match color {
         vt100::Color::Default => Color::Reset,
@@ -823,8 +922,8 @@ fn _area(_: Rect) {}
 #[cfg(test)]
 mod tests {
     use super::{
-        TerminalRenderer, UiOptions, WorkspaceDrawerItem, WorkspaceDrawerRender, display_symbol,
-        layout,
+        UiOptions, WorkspaceDrawerItem, WorkspaceDrawerRender, display_symbol, layout,
+        render_screen,
     };
     use crate::lua::AnchorOptions;
     use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
@@ -892,20 +991,17 @@ mod tests {
     }
 
     #[test]
-    fn renderer_reuses_unchanged_cells_and_detects_erasure() {
+    fn screen_render_projects_current_contents_and_erasure() {
         let mut parser = Parser::new(2, 4, 0);
-        let mut renderer = TerminalRenderer::default();
         parser.process(b"x");
+        let area = Rect::new(0, 0, 4, 2);
+        let mut buffer = Buffer::empty(area);
 
-        let first = renderer.project_screen(parser.screen(), 4, 2);
-        assert!(first.changed > 0);
-        let unchanged = renderer.project_screen(parser.screen(), 4, 2);
-        assert_eq!(unchanged.changed, 0);
-        assert_eq!(unchanged.visited, 8);
+        render_screen(&mut buffer, area, parser.screen());
+        assert_eq!(buffer[(0, 0)].symbol(), "x");
 
         parser.process(b"\x1b[1;1H\x1b[K");
-        let erased = renderer.project_screen(parser.screen(), 4, 2);
-        assert!(erased.changed > 0);
-        assert_eq!(renderer.rendered_cells[0].symbol, " ");
+        render_screen(&mut buffer, area, parser.screen());
+        assert_eq!(buffer[(0, 0)].symbol(), " ");
     }
 }
