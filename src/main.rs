@@ -1,16 +1,13 @@
-mod binding_trie;
 mod client;
 mod clipboard;
 mod events;
 mod input;
-mod key_notation;
 mod lua;
 mod pane;
 mod server;
 mod terminal_emulator;
 mod trace;
 mod ui;
-mod which_key;
 
 use std::{
   io,

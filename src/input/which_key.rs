@@ -19,14 +19,12 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::{
-  key_notation::{
-    self,
-    KeySeq,
-    KeyStroke,
-  },
-  lua::WhichKeyOptions,
+use super::key_notation::{
+  self,
+  KeySeq,
+  KeyStroke,
 };
+use crate::lua::WhichKeyOptions;
 const HEADER_ROWS: u16 = 1;
 const FOOTER_ROWS: u16 = 1;
 const BORDER_ROWS: u16 = 2;

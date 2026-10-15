@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use mlua::Function;
 
-use crate::key_notation::KeyStroke;
+use super::key_notation::KeyStroke;
 
 #[derive(Clone)]
 pub struct Binding {
