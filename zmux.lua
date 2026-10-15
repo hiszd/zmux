@@ -69,6 +69,9 @@ end, { desc = "Detach from the current session" })
 cmd.key.bind("ss", function()
 	cmd.server.stop()
 end, { desc = "Stop the background server" })
+cmd.key.bind("sw", function()
+	cmd.session.switch()
+end, { desc = "Switch active session" })
 for index = 1, 9 do
 	local tab_index = index
 	cmd.key.bind(tostring(index), function()

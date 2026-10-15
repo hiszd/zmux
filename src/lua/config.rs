@@ -93,6 +93,7 @@ pub struct AppEvent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeCommand {
   OpenPicker(u64),
+  OpenSessionPicker,
   Redraw,
   Detach,
   KillSession,
@@ -782,6 +783,14 @@ pub fn load_config(source: &str) -> LuaResult<AppConfig> {
   )?;
   register_command(
     &lua,
+    &session,
+    &commands,
+    &in_event_callback,
+    "switch",
+    RuntimeCommand::OpenSessionPicker,
+  )?;
+  register_command(
+    &lua,
     &workspace,
     &commands,
     &in_event_callback,
@@ -1038,7 +1047,7 @@ mod tests {
     let config = load_config(include_str!("../../zmux.lua")).expect("sample Lua config");
     assert_eq!(config.prefix_key, normalize_prefix_key("<C-Space>").expect("prefix"));
     assert_eq!(config.sequence_timeout, Duration::from_secs(8));
-    assert_eq!(config.keymap.binding_count(), 23);
+    assert_eq!(config.keymap.binding_count(), 24);
     let callback = config
       .keymap
       .binding_for(&parse_key_notation("tw").expect("key"))

@@ -92,11 +92,14 @@ use ratatui::{
 };
 use zmux::{
   protocol::{
+    AdminRequest,
+    AdminResponse,
     ClientHello,
     ClientMessage,
     ClientRequest,
     ServerMessage,
     SessionSnapshot,
+    SessionSummary,
     TabSnapshot as WireTab,
     TerminalSnapshot,
     Viewport,
@@ -151,6 +154,7 @@ pub fn run(
   endpoint: Endpoint,
   session_name: Option<String>,
   create_if_missing: bool,
+  fail_if_exists: bool,
   working_directory: PathBuf,
   config: lua::AppConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -165,6 +169,7 @@ pub fn run(
     &endpoint,
     session_name.clone(),
     create_if_missing,
+    fail_if_exists,
     working_directory,
     viewport,
     config.default_shell.as_deref(),
@@ -203,6 +208,100 @@ pub fn run(
   drop(terminal);
   drop(terminal_mode);
   result
+}
+
+/// Opens the pre-connection session picker and returns the selected session.
+///
+/// The picker uses an administrative connection, so the client is not attached
+/// to a session until the user makes a selection. A missing server and an empty
+/// session set are both reported as the same user-facing condition.
+pub fn choose_session(
+  endpoint: &Endpoint,
+  cursor_shape: ui::CursorShape,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+  let mut stream = match transport::connect(endpoint) {
+    Ok(stream) => stream,
+    Err(_) => {
+      println!("no active sessions");
+      return Ok(None);
+    }
+  };
+  write_frame(&mut stream, &ClientMessage::Admin(AdminRequest::ListSessions))?;
+  let ServerMessage::AdminResult { result } = read_frame(&mut stream)? else {
+    return Err("server returned an unexpected session-list response".into());
+  };
+  let AdminResponse::Sessions(sessions) = result? else {
+    return Err("server returned an unexpected administrative response".into());
+  };
+  if sessions.is_empty() {
+    println!("no active sessions");
+    return Ok(None);
+  }
+
+  let _terminal_mode = TerminalModeGuard::enter(cursor_shape)?;
+  let backend = CrosstermBackend::new(io::stdout());
+  let mut terminal = Terminal::new(backend)?;
+  let mut query = String::new();
+  let mut highlighted = 0;
+  loop {
+    let visible = session_picker_visible_indices(&query, &sessions);
+    highlighted = highlighted.min(visible.len().saturating_sub(1));
+    let labels: Vec<String> = sessions
+      .iter()
+      .map(|session| {
+        format!(
+          "{}  ({} clients, {} workspaces, {} tabs)",
+          session.number, session.clients, session.workspaces, session.tabs
+        )
+      })
+      .collect();
+    let rows: Vec<String> = visible.iter().map(|index| labels[*index].clone()).collect();
+    let modal = ui::ModalOverlay {
+      title: "Attach to Session",
+      query: Some(&query),
+      rows: &rows,
+      selected_row: (!rows.is_empty()).then_some(highlighted),
+      footer: "Arrows: move  Enter: attach  Esc: cancel",
+    };
+    terminal.draw(|frame| frame.render_widget(&modal, frame.area()))?;
+
+    match event::read()? {
+      Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+        match key.code {
+          KeyCode::Esc => return Ok(None),
+          KeyCode::Enter => {
+            if let Some(index) = visible.get(highlighted) {
+              return Ok(Some(sessions[*index].number.clone()));
+            }
+          }
+          KeyCode::Up if !visible.is_empty() => {
+            highlighted = if highlighted == 0 {
+              visible.len() - 1
+            } else {
+              highlighted - 1
+            };
+          }
+          KeyCode::Down if !visible.is_empty() => {
+            highlighted = (highlighted + 1) % visible.len();
+          }
+          KeyCode::Backspace => {
+            query.pop();
+            highlighted = 0;
+          }
+          KeyCode::Char(character)
+            if !key.modifiers.intersects(
+              crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::ALT,
+            ) =>
+          {
+            query.push(character);
+            highlighted = 0;
+          }
+          _ => {}
+        }
+      }
+      _ => {}
+    }
+  }
 }
 
 /// RAII guard for raw mode, the alternate screen, cursor shape, and enhanced
@@ -287,6 +386,7 @@ fn connect(
   endpoint: &Endpoint,
   session_name: Option<String>,
   create_if_missing: bool,
+  fail_if_exists: bool,
   working_directory: PathBuf,
   viewport: Viewport,
   configured_shell: Option<&Path>,
@@ -298,6 +398,7 @@ fn connect(
       protocol_version: zmux::protocol::PROTOCOL_VERSION,
       session_name,
       create_if_missing,
+      fail_if_exists,
       shell: current_shell(configured_shell),
       environment: std::env::vars().collect(),
       working_directory,
@@ -433,6 +534,24 @@ struct LuaPickerState {
   highlighted: usize,
 }
 
+/// Local state for the active-session switcher.
+struct SessionPickerState {
+  /// Sessions currently known to the server.
+  sessions: Vec<SessionSummary>,
+  /// Current fuzzy-search query.
+  query: String,
+  /// Index within the filtered results.
+  highlighted: usize,
+}
+
+fn session_picker_visible_indices(query: &str, sessions: &[SessionSummary]) -> Vec<usize> {
+  let labels: Vec<String> = sessions
+    .iter()
+    .map(|session| session.number.clone())
+    .collect();
+  zmux::picker::fuzzy_filter(query, &labels)
+}
+
 /// Owned, render-ready representation of any client modal.
 struct ModalDisplay {
   /// Border title.
@@ -462,6 +581,7 @@ struct ClientSession {
   drawer_highlighted_workspace: Option<u64>,
   workspace_modal: Option<WorkspaceModal>,
   lua_picker: Option<LuaPickerState>,
+  session_picker: Option<SessionPickerState>,
   which_key_scroll: usize,
   which_key_options: crate::lua::WhichKeyOptions,
   pending_shutdown: Option<(KeyCode, Vec<RuntimeCommand>)>,
@@ -486,6 +606,7 @@ impl ClientSession {
       drawer_highlighted_workspace: None,
       workspace_modal: None,
       lua_picker: None,
+      session_picker: None,
       which_key_scroll: 0,
       which_key_options: crate::lua::WhichKeyOptions::default(),
       pending_shutdown: None,
@@ -647,6 +768,26 @@ impl ClientSession {
 
   /// Converts the active picker or workspace modal into render data.
   fn modal_display(&self) -> Option<ModalDisplay> {
+    if let Some(picker) = &self.session_picker {
+      let labels: Vec<String> = picker
+        .sessions
+        .iter()
+        .map(|session| {
+          format!(
+            "{}  ({} clients, {} workspaces, {} tabs)",
+            session.number, session.clients, session.workspaces, session.tabs
+          )
+        })
+        .collect();
+      let visible = session_picker_visible_indices(&picker.query, &picker.sessions);
+      return Some(ModalDisplay {
+        title: "Switch Session".to_owned(),
+        query: Some(picker.query.clone()),
+        rows: visible.iter().map(|index| labels[*index].clone()).collect(),
+        selected_row: (!visible.is_empty()).then_some(picker.highlighted),
+        footer: "Arrows: move  Enter: switch  Esc: cancel".to_owned(),
+      });
+    }
     if let Some(picker) = &self.lua_picker {
       let visible = zmux::picker::fuzzy_filter(&picker.query, &picker.labels);
       return Some(ModalDisplay {
@@ -1355,6 +1496,9 @@ fn handle_server_message(message: ServerMessage, session: &mut ClientSession) ->
       terminals,
     } => {
       let events = diff_session_state(&session.snapshot, &snapshot);
+      if session.session_picker.is_some() && session.snapshot.number != snapshot.number {
+        session.session_picker = None;
+      }
       session.set_snapshot(snapshot, terminals);
       session.last_error = None;
       Effects {
@@ -1401,6 +1545,16 @@ fn handle_server_message(message: ServerMessage, session: &mut ClientSession) ->
     }
     ServerMessage::Reply { result: Ok(()), .. } => {
       session.last_error = None;
+      Effects {
+        redraw: true,
+        ..Effects::default()
+      }
+    }
+    ServerMessage::SessionList { sessions } => {
+      if let Some(picker) = &mut session.session_picker {
+        picker.sessions = sessions;
+        picker.highlighted = 0;
+      }
       Effects {
         redraw: true,
         ..Effects::default()
@@ -1640,6 +1794,12 @@ fn handle_input(
 
   let leader_input = matches!(&event, Event::Key(key) if context.dispatcher.is_leader()
         || context.dispatcher.is_prefix_key(*key));
+  if context.session.session_picker.is_some()
+    && !leader_input
+    && let Event::Key(key) = &event
+  {
+    return handle_session_picker_key(*key, context);
+  }
   if context.session.lua_picker.is_some()
     && !leader_input
     && let Event::Key(key) = &event
@@ -1856,6 +2016,94 @@ fn handle_input(
       })
     }
     _ => Ok(Effects::default()),
+  }
+}
+
+/// Handles navigation, filtering, cancellation, and selection in the session picker.
+fn handle_session_picker_key(
+  key: crossterm::event::KeyEvent,
+  context: &mut ClientContext<'_>,
+) -> Result<Effects, Box<dyn std::error::Error>> {
+  if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+    return Ok(Effects::default());
+  }
+  let Some(mut picker) = context.session.session_picker.take() else {
+    return Ok(Effects::default());
+  };
+  let visible = session_picker_visible_indices(&picker.query, &picker.sessions);
+  match key.code {
+    crossterm::event::KeyCode::Esc => Ok(Effects {
+      redraw: true,
+      ..Effects::default()
+    }),
+    crossterm::event::KeyCode::Enter => {
+      let Some(selected_index) = visible.get(picker.highlighted).copied() else {
+        context.session.session_picker = Some(picker);
+        return Ok(Effects::default());
+      };
+      let selected_session = picker.sessions[selected_index].number.clone();
+      if selected_session != context.session.snapshot.number {
+        send_request(
+          context.sender,
+          context.next_request_id,
+          ClientRequest::SwitchSession(selected_session),
+        )?;
+      }
+      Ok(Effects {
+        redraw: true,
+        ..Effects::default()
+      })
+    }
+    crossterm::event::KeyCode::Up => {
+      if !visible.is_empty() {
+        picker.highlighted = if picker.highlighted == 0 {
+          visible.len() - 1
+        } else {
+          picker.highlighted - 1
+        };
+      }
+      context.session.session_picker = Some(picker);
+      Ok(Effects {
+        redraw: true,
+        ..Effects::default()
+      })
+    }
+    crossterm::event::KeyCode::Down => {
+      if !visible.is_empty() {
+        picker.highlighted = (picker.highlighted + 1) % visible.len();
+      }
+      context.session.session_picker = Some(picker);
+      Ok(Effects {
+        redraw: true,
+        ..Effects::default()
+      })
+    }
+    crossterm::event::KeyCode::Backspace => {
+      picker.query.pop();
+      picker.highlighted = 0;
+      context.session.session_picker = Some(picker);
+      Ok(Effects {
+        redraw: true,
+        ..Effects::default()
+      })
+    }
+    crossterm::event::KeyCode::Char(character)
+      if !key.modifiers.intersects(
+        crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::ALT,
+      ) =>
+    {
+      picker.query.push(character);
+      picker.highlighted = 0;
+      context.session.session_picker = Some(picker);
+      Ok(Effects {
+        redraw: true,
+        ..Effects::default()
+      })
+    }
+    _ => {
+      context.session.session_picker = Some(picker);
+      Ok(Effects::default())
+    }
   }
 }
 
@@ -2236,6 +2484,15 @@ fn execute_runtime_commands(
         });
         effects.redraw = true;
       }
+      RuntimeCommand::OpenSessionPicker => {
+        context.session.session_picker = Some(SessionPickerState {
+          sessions: Vec::new(),
+          query: String::new(),
+          highlighted: 0,
+        });
+        send_request(context.sender, context.next_request_id, ClientRequest::ListSessions)?;
+        effects.redraw = true;
+      }
       RuntimeCommand::ToggleWorkspaceDrawer => {
         context.session.drawer_expanded = !context.session.drawer_expanded;
         context.session.drawer_highlighted_workspace = context
@@ -2329,7 +2586,10 @@ fn render_bars(lua: &LuaConfig) -> mlua::Result<ui::BarContents> {
 
 #[cfg(test)]
 mod tests {
-  use zmux::protocol::TerminalSnapshot;
+  use zmux::protocol::{
+    SessionSummary,
+    TerminalSnapshot,
+  };
 
   use super::{
     DirectoryPicker,
@@ -2337,7 +2597,29 @@ mod tests {
     WorkspaceDialog,
     WorkspaceDialogMode,
     WorkspaceField,
+    session_picker_visible_indices,
   };
+
+  #[test]
+  fn session_picker_filters_by_session_name_not_metadata() {
+    let sessions = vec![
+      SessionSummary {
+        number: "alpha".to_owned(),
+        clients: 1,
+        workspaces: 2,
+        tabs: 3,
+      },
+      SessionSummary {
+        number: "beta".to_owned(),
+        clients: 1,
+        workspaces: 2,
+        tabs: 3,
+      },
+    ];
+
+    assert_eq!(session_picker_visible_indices("z", &sessions), Vec::<usize>::new());
+    assert_eq!(session_picker_visible_indices("bt", &sessions), vec![1]);
+  }
 
   #[test]
   fn terminal_parser_uses_shared_pty_geometry_not_client_viewport() {

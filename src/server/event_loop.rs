@@ -352,6 +352,12 @@ impl ServerState {
         .find(|session| session.model.name().get() == name)
         .map(|session| session.model.name().get().to_owned())
       {
+        if hello.fail_if_exists {
+          let _ = sender.send(ServerMessage::HelloRejected {
+            reason: format!("Session {name} already exists"),
+          });
+          return Ok(());
+        }
         session_name
       } else if hello.create_if_missing {
         match self.create_session(
@@ -504,6 +510,17 @@ impl ServerState {
     let mut detach = false;
     let result = match request {
       ClientRequest::Input(bytes) => self.send_input(&session_name, &bytes),
+      ClientRequest::ListSessions => {
+        let sessions = self.session_summaries();
+        if let Some(connection) = self.clients.get(&client_id) {
+          connection
+            .sender
+            .send(ServerMessage::SessionList { sessions })
+            .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+      }
+      ClientRequest::SwitchSession(name) => self.switch_client_session(client_id, &name),
       ClientRequest::Resize(viewport) => {
         if let Some(connection) = self.clients.get_mut(&client_id) {
           connection.viewport = sanitize_viewport(viewport);
@@ -802,6 +819,69 @@ impl ServerState {
         .map_err(|error| error.to_string());
     }
     self.broadcast_state(number)
+  }
+
+  fn session_summaries(&self) -> Vec<SessionSummary> {
+    self
+      .sessions
+      .iter()
+      .map(|session| SessionSummary {
+        number: session.model.name().get().to_owned(),
+        clients: session.clients.len(),
+        workspaces: session.model.workspaces().len(),
+        tabs: session.tabs.len(),
+      })
+      .collect()
+  }
+
+  fn switch_client_session(&mut self, client_id: u64, target: &str) -> Result<(), String> {
+    let current = self
+      .clients
+      .get(&client_id)
+      .ok_or_else(|| "Client is no longer connected".to_owned())?
+      .session_name
+      .clone();
+    if current == target {
+      return Ok(());
+    }
+    if self.session(target).is_none() {
+      return Err(format!("Session {target} does not exist"));
+    }
+
+    if let Some(session) = self.session_mut(&current) {
+      session.clients.remove(&client_id);
+    }
+    if let Some(connection) = self.clients.get_mut(&client_id) {
+      connection.session_name = target.to_owned();
+    }
+    if let Some(session) = self.session_mut(target) {
+      session.clients.insert(client_id);
+    }
+
+    self
+      .resize_session(&current)
+      .map_err(|error| error.to_string())?;
+    self
+      .resize_session(target)
+      .map_err(|error| error.to_string())?;
+    if let Some(connection) = self.clients.get(&client_id)
+      && let Some(session) = self.session(target)
+    {
+      connection
+        .sender
+        .send(ServerMessage::StateChanged {
+          session: session.snapshot(),
+          terminals: session.terminal_snapshots(),
+        })
+        .map_err(|error| error.to_string())?;
+    }
+    self
+      .broadcast_state(&current)
+      .map_err(|error| error.to_string())?;
+    self
+      .broadcast_state(target)
+      .map_err(|error| error.to_string())?;
+    Ok(())
   }
 
   fn close_session(&mut self, number: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -1135,6 +1215,7 @@ mod tests {
         protocol_version: zmux::protocol::PROTOCOL_VERSION,
         session_name,
         create_if_missing: false,
+        fail_if_exists: false,
         shell: "/bin/sh".into(),
         environment: vec![("SHELL".to_owned(), "/bin/sh".to_owned())],
         working_directory: std::env::current_dir().expect("current directory"),
@@ -1506,6 +1587,7 @@ mod tests {
         protocol_version: zmux::protocol::PROTOCOL_VERSION,
         session_name: Some("42".to_owned()),
         create_if_missing: false,
+        fail_if_exists: false,
         shell: "/bin/sh".into(),
         environment: vec![("SHELL".to_owned(), "/bin/sh".to_owned())],
         working_directory: std::env::current_dir().expect("current directory"),
@@ -1540,6 +1622,7 @@ mod tests {
         protocol_version: zmux::protocol::PROTOCOL_VERSION + 1,
         session_name: None,
         create_if_missing: false,
+        fail_if_exists: false,
         shell: "/bin/sh".into(),
         environment: vec![("SHELL".to_owned(), "/bin/sh".to_owned())],
         working_directory: std::env::current_dir().expect("current directory"),
@@ -1621,6 +1704,7 @@ mod tests {
         protocol_version: zmux::protocol::PROTOCOL_VERSION,
         session_name: None,
         create_if_missing: false,
+        fail_if_exists: false,
         shell: "/bin/sh".into(),
         environment: vec![("SHELL".to_owned(), "/bin/sh".to_owned())],
         working_directory: working_directory.clone(),

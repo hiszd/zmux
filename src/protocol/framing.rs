@@ -10,7 +10,7 @@ use serde::{
   de::DeserializeOwned,
 };
 
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -24,6 +24,7 @@ pub struct ClientHello {
   pub protocol_version: u16,
   pub session_name: Option<String>,
   pub create_if_missing: bool,
+  pub fail_if_exists: bool,
   pub shell: std::path::PathBuf,
   pub environment: Vec<(String, String)>,
   pub working_directory: std::path::PathBuf,
@@ -97,6 +98,8 @@ pub enum AdminResponse {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum ClientRequest {
   Input(Vec<u8>),
+  ListSessions,
+  SwitchSession(String),
   Resize(Viewport),
   NewTab,
   CloseTab,
@@ -138,6 +141,9 @@ pub enum ServerMessage {
   Reply {
     id: u64,
     result: Result<(), String>,
+  },
+  SessionList {
+    sessions: Vec<SessionSummary>,
   },
   StateChanged {
     session: SessionSnapshot,
@@ -232,6 +238,7 @@ mod tests {
       protocol_version: 1,
       session_name: Some("8".to_owned()),
       create_if_missing: false,
+      fail_if_exists: false,
       shell: "/bin/sh".into(),
       environment: vec![("SHELL".to_owned(), "/bin/sh".to_owned())],
       working_directory: "/work/project".into(),

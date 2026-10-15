@@ -14,16 +14,22 @@ The command is required. Create a new Session with an automatically generated nu
 cargo run -- new --path /path/to/project
 ```
 
-Attach to an existing Session by name:
+Create or attach to a named Session:
+
+```sh
+cargo run -- new project
+```
+
+`new` uses ensure semantics: it attaches to the requested Session when it exists, or creates a new Session when it does not. Add `--strict` to fail when the named Session already exists:
+
+```sh
+cargo run -- new project --strict
+```
+
+Attach to an existing Session by name with the explicit attach command:
 
 ```sh
 cargo run -- attach project
-```
-
-`new --attach` uses ensure semantics: it attaches to the requested Session when it exists, or creates a new Session when it does not:
-
-```sh
-cargo run -- new --attach project
 ```
 
 A named socket instance runs an independent Server and Session set:

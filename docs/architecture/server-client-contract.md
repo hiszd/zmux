@@ -13,7 +13,7 @@ Status: The domain and lifecycle behavior is agreed. The wire protocol is implem
 ## Connection and lifecycle
 
 - A Client launch without a Session name creates a new Session containing one Workspace at the launch working directory and one initial Tab. The Workspace defaults to the directory basename. Its name is the first unused numeric identifier represented as a string.
-- `new --attach NAME` attaches to an existing Session or creates the named Session when it does not exist. `attach NAME` requires the Session to exist; `--socket NAME` selects an independent Server instance.
+- `new NAME` attaches to an existing Session or creates the named Session when it does not exist. `new NAME --strict` fails if the Session already exists. `attach NAME` requires the Session to exist; `--socket NAME` selects an independent Server instance.
 - The Client auto-starts the Server in the background. Detach closes only the Client; Sessions remain alive. Stop-server closes all Clients, destroys every Session, and ends the Server. Sessions do not survive restart.
 - Closing a Workspace's last Tab closes the Workspace; closing a Session's last Workspace closes the Session. Attached Clients move to the next Session in creation order (wrapping to the oldest remaining Session) or close when no Session remains. The Server exits when its final Session closes.
 

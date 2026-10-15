@@ -37,11 +37,14 @@ use zmux::{
 
 enum Command {
   New {
-    attach: Option<String>,
+    session_name: Option<String>,
+    strict: bool,
     path: Option<PathBuf>,
   },
   Attach(String),
-  List,
+  List {
+    attach: bool,
+  },
   Kill(String),
   ServerStop,
   ServerStatus,
@@ -61,19 +64,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   }
 
   match options.command {
-    Command::New { attach, path } => {
+    Command::New {
+      session_name,
+      strict,
+      path,
+    } => {
       ensure_server(&endpoint)?;
       client::run(
         endpoint,
-        attach.clone(),
-        attach.is_some(),
+        session_name,
+        true,
+        strict,
         path.unwrap_or(std::env::current_dir()?),
         configuration(),
       )
     }
     Command::Attach(session_name) => {
       ensure_server(&endpoint)?;
-      client::run(endpoint, Some(session_name), false, std::env::current_dir()?, configuration())
+      client::run(
+        endpoint,
+        Some(session_name),
+        false,
+        false,
+        std::env::current_dir()?,
+        configuration(),
+      )
+    }
+    Command::List { attach: true } => {
+      let cursor_shape = configuration().cursor_shape;
+      let Some(session_name) = client::choose_session(&endpoint, cursor_shape)? else {
+        return Ok(());
+      };
+      ensure_server(&endpoint)?;
+      client::run(
+        endpoint,
+        Some(session_name),
+        false,
+        false,
+        std::env::current_dir()?,
+        configuration(),
+      )
     }
     command => run_admin_command(endpoint, command),
   }
@@ -92,7 +122,8 @@ fn parse_args(mut arguments: impl Iterator<Item = String>) -> Result<CliOptions,
       .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "server instance is required"))?;
     return Ok(CliOptions {
       command: Command::New {
-        attach: None,
+        session_name: None,
+        strict: false,
         path: None,
       },
       socket_instance,
@@ -107,16 +138,12 @@ fn parse_args(mut arguments: impl Iterator<Item = String>) -> Result<CliOptions,
   let mut socket_instance = "default".to_owned();
   let command = match command.as_str() {
     "new" => {
-      let mut attach = None;
+      let mut session_name = None;
+      let mut strict = false;
       let mut path = None;
       while let Some(argument) = arguments.next() {
         match argument.as_str() {
-          "--attach" => {
-            let value = arguments.next().ok_or_else(|| {
-              io::Error::new(io::ErrorKind::InvalidInput, "--attach requires a session name")
-            })?;
-            attach = Some(parse_session_name(&value)?);
-          }
+          "--strict" => strict = true,
           "--path" => {
             path = Some(
               arguments
@@ -136,10 +163,17 @@ fn parse_args(mut arguments: impl Iterator<Item = String>) -> Result<CliOptions,
             print_help();
             std::process::exit(0);
           }
+          other if !other.starts_with('-') && session_name.is_none() => {
+            session_name = Some(parse_session_name(other)?);
+          }
           other => return Err(invalid_argument(other)),
         }
       }
-      Command::New { attach, path }
+      Command::New {
+        session_name,
+        strict,
+        path,
+      }
     }
     "attach" => {
       let value = arguments.next().ok_or_else(|| {
@@ -163,8 +197,23 @@ fn parse_args(mut arguments: impl Iterator<Item = String>) -> Result<CliOptions,
       Command::Attach(session_name)
     }
     "list" => {
-      reject_command_arguments(&mut arguments, "list", &mut socket_instance)?;
-      Command::List
+      let mut attach = false;
+      while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+          "--attach" | "-a" => attach = true,
+          "--socket" => {
+            socket_instance = arguments.next().ok_or_else(|| {
+              io::Error::new(io::ErrorKind::InvalidInput, "--socket requires a name")
+            })?;
+          }
+          "--help" | "-h" => {
+            print_help();
+            std::process::exit(0);
+          }
+          other => return Err(invalid_argument(other)),
+        }
+      }
+      Command::List { attach }
     }
     "kill" => {
       let value = arguments.next().ok_or_else(|| {
@@ -229,14 +278,14 @@ fn invalid_argument(argument: &str) -> io::Error {
 
 fn print_help() {
   println!("Usage:");
-  println!("  zmux new [--attach SESSION] [--path PATH] [--socket NAME]");
+  println!("  zmux new [SESSION] [--strict] [--path PATH] [--socket NAME]");
   println!("  zmux attach SESSION [--socket NAME]");
-  println!("  zmux list [--socket NAME]");
+  println!("  zmux list [--attach | -a] [--socket NAME]");
   println!("  zmux kill SESSION [--socket NAME]");
   println!("  zmux server stop [--socket NAME]");
   println!("  zmux server status [--socket NAME]");
   println!();
-  println!("new creates a session; --attach attaches to SESSION or creates it if missing.");
+  println!("new attaches to SESSION or creates it if missing; --strict fails if SESSION exists.");
   println!("attach requires SESSION to already exist.");
 }
 
@@ -246,7 +295,7 @@ fn run_admin_command(
 ) -> Result<(), Box<dyn std::error::Error>> {
   let is_status = matches!(&command, Command::ServerStatus);
   let request = match command {
-    Command::List => AdminRequest::ListSessions,
+    Command::List { .. } => AdminRequest::ListSessions,
     Command::Kill(name) => AdminRequest::KillSession(name),
     Command::ServerStop => AdminRequest::StopServer,
     Command::ServerStatus => AdminRequest::Status,
@@ -368,17 +417,30 @@ mod tests {
   #[test]
   fn new_can_create_or_attach_a_named_session() {
     let options = parse_args(
-      ["new", "--attach", "12", "--path", "/work/project", "--socket", "project"]
+      ["new", "12", "--strict", "--path", "/work/project", "--socket", "project"]
         .map(str::to_owned)
         .into_iter(),
     )
     .expect("valid new command");
 
-    assert!(matches!(&options.command, Command::New { attach: Some(name), .. } if name == "12"));
+    assert!(
+      matches!(&options.command, Command::New { session_name: Some(name), strict: true, .. } if name == "12")
+    );
     assert_eq!(options.socket_instance, "project");
     assert!(
       matches!(&options.command, Command::New { path: Some(path), .. } if path == "/work/project")
     );
+  }
+
+  #[test]
+  fn list_accepts_attach_long_and_short_flags() {
+    let long = parse_args(["list", "--attach"].map(str::to_owned).into_iter())
+      .expect("valid list attach command");
+    let short =
+      parse_args(["list", "-a"].map(str::to_owned).into_iter()).expect("valid list attach command");
+
+    assert!(matches!(long.command, Command::List { attach: true }));
+    assert!(matches!(short.command, Command::List { attach: true }));
   }
 
   #[test]
@@ -396,7 +458,15 @@ mod tests {
 
   #[test]
   fn cli_rejects_invalid_session_names_and_arguments() {
-    assert!(parse_args(["new", "--attach", ""].map(str::to_owned).into_iter()).is_err());
+    assert!(parse_args(["new", ""].map(str::to_owned).into_iter()).is_err());
+    assert!(
+      parse_args(
+        ["new", "--attach", "project"]
+          .map(str::to_owned)
+          .into_iter()
+      )
+      .is_err()
+    );
     assert!(parse_args(["attach", "project"].map(str::to_owned).into_iter()).is_ok());
     assert!(parse_args(["new", "--socket"].map(str::to_owned).into_iter()).is_err());
   }

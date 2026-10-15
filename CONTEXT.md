@@ -17,7 +17,7 @@ A server-owned collection of one or more Workspaces, identified by a unique stri
 _Avoid_: Application process (a Server may own multiple Sessions)
 
 **Session Name**:
-The string used to identify a Session to users. Specifying an existing name attaches a Client to that Session; `new --attach NAME` creates the named Session when it does not exist. Launching without a target creates a Session with the first unused numeric name represented as a string.
+The string used to identify a Session to users. `new NAME` attaches a Client to an existing Session or creates the named Session when it does not exist; `new NAME --strict` fails if it already exists. Launching without a target creates a Session with the first unused numeric name represented as a string.
 _Avoid_: Session Number (numeric names are still strings)
 
 **Workspace**:
