@@ -524,10 +524,10 @@ impl Widget for &ModalOverlay<'_> {
           .query
           .map_or(0, |query| UnicodeWidthStr::width(query) + 2),
       )
-      .saturating_add(4)
+      .saturating_add(8)
       .min(usize::from(area.width)) as u16;
     let desired_height = modal.rows.len() + usize::from(modal.query.is_some()) + 3;
-    let height = desired_height.max(3).min(usize::from(area.height)) as u16;
+    let height = desired_height.max(7).min(usize::from(area.height)) as u16;
     if width == 0 || height == 0 {
       return;
     }

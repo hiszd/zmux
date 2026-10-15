@@ -60,7 +60,7 @@ impl KeyMap {
     self.bindings.node_for(sequence)
   }
 
-  fn completions(&self, sequence: &[KeyStroke]) -> Vec<(KeyStroke, Option<String>)> {
+  fn completions(&self, sequence: &[KeyStroke]) -> Vec<(KeyStroke, Option<String>, bool)> {
     self.bindings.completions(sequence)
   }
 }
@@ -110,7 +110,7 @@ impl KeyDispatcher {
 
   pub fn sequence(&self) -> &[KeyStroke] { &self.sequence }
 
-  pub fn completions(&self) -> Vec<(KeyStroke, Option<String>)> {
+  pub fn completions(&self) -> Vec<(KeyStroke, Option<String>, bool)> {
     if self.is_leader() {
       self.keymap.completions(&self.sequence)
     } else {
@@ -318,6 +318,7 @@ mod tests {
     assert!(dispatcher.completions().is_empty(), "popup is hidden before prefix");
     press_prefix(&mut dispatcher, now);
     assert_eq!(dispatcher.completions().len(), 1, "popup opens after prefix");
+    assert!(dispatcher.completions()[0].2, "a prefix should be marked as nested");
     assert!(matches!(
       dispatcher.handle_event(key(KeyCode::Char('a'), KeyModifiers::NONE), now),
       KeyOutcome::Ignored

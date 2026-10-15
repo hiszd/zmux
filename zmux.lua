@@ -9,7 +9,7 @@ opt.default_shell = "/usr/bin/fish"
 opt.prefix_key = "<C-Space>"
 -- Time in milliseconds to wait for the next key in a sequence. Set to zero to
 -- keep waiting indefinitely.
-opt.sequence_timeout_ms = 0
+opt.sequence_timeout_ms = 8000
 
 -- UI anchors reserve rows at the top and bottom of the terminal. Each anchor
 -- accepts `height` (rows) and `visible` (boolean).

@@ -56,7 +56,7 @@ impl BindingTrie {
     Some(node)
   }
 
-  pub fn completions(&self, prefix: &[KeyStroke]) -> Vec<(KeyStroke, Option<String>)> {
+  pub fn completions(&self, prefix: &[KeyStroke]) -> Vec<(KeyStroke, Option<String>, bool)> {
     let Some(node) = self.node_for(prefix) else {
       return Vec::new();
     };
@@ -70,10 +70,11 @@ impl BindingTrie {
             .binding
             .as_ref()
             .and_then(|binding| binding.desc.clone()),
+          !child.children.is_empty(),
         )
       })
       .collect();
-    completions.sort_by_key(|(key, _)| *key);
+    completions.sort_by_key(|(key, _, _)| *key);
     completions
   }
 

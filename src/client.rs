@@ -383,10 +383,10 @@ struct WorkspaceDialog {
   working_directory: PathBuf,
   /// Optional explicit workspace name.
   name: String,
-  /// Form field receiving keyboard input.
+  /// Form field currently selected for editing.
   field: WorkspaceField,
-  /// Prevents submitting the directory field before it has been confirmed.
-  directory_selected: bool,
+  /// Whether the selected field is accepting text input.
+  editing: bool,
 }
 
 /// One row in the working-directory picker.
@@ -625,7 +625,7 @@ impl ClientSession {
       working_directory,
       name: String::new(),
       field: WorkspaceField::Directory,
-      directory_selected: false,
+      editing: false,
     }));
     Ok(())
   }
@@ -640,7 +640,7 @@ impl ClientSession {
       working_directory: workspace.working_directory.clone(),
       name: workspace.explicit_name.clone().unwrap_or_default(),
       field: WorkspaceField::Directory,
-      directory_selected: false,
+      editing: false,
     }));
     Ok(())
   }
@@ -687,7 +687,7 @@ impl ClientSession {
             WorkspaceField::Directory => 0,
             WorkspaceField::Name => 1,
           }),
-          footer: "Tab: name  Enter: choose/save  Esc: cancel".to_owned(),
+          footer: "↑/↓: field  e: edit  Enter: submit  Esc: cancel".to_owned(),
         })
       }
       WorkspaceModal::Directory(picker) => {
@@ -1952,7 +1952,7 @@ fn handle_lua_picker_key(
 /// Handles keyboard input for workspace forms and directory selection.
 ///
 /// The form delegates directory browsing to [`DirectoryPicker`], while Enter
-/// submits a create/edit request only after the directory has been confirmed.
+/// always submits the current create/edit values.
 fn handle_workspace_modal_key(
   key: crossterm::event::KeyEvent,
   context: &mut ClientContext<'_>,
@@ -1969,30 +1969,36 @@ fn handle_workspace_modal_key(
         redraw: true,
         ..Effects::default()
       }),
-      crossterm::event::KeyCode::Tab => {
+      crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Down => {
         form.field = match form.field {
           WorkspaceField::Directory => WorkspaceField::Name,
           WorkspaceField::Name => WorkspaceField::Directory,
         };
-        if form.field == WorkspaceField::Directory {
-          form.directory_selected = false;
-        }
+        form.editing = false;
         context.session.workspace_modal = Some(WorkspaceModal::Form(form));
         Ok(Effects {
           redraw: true,
           ..Effects::default()
         })
       }
-      crossterm::event::KeyCode::Enter
-        if form.field == WorkspaceField::Directory && !form.directory_selected =>
+      crossterm::event::KeyCode::Char('e')
+        if !key.modifiers.intersects(
+          crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::ALT,
+        ) =>
       {
-        match DirectoryPicker::new(form) {
-          Ok(picker) => {
-            context.session.workspace_modal = Some(WorkspaceModal::Directory(picker));
-          }
-          Err(error) => {
-            context.session.last_error = Some(error.to_string());
-            context.session.workspace_modal = None;
+        match form.field {
+          WorkspaceField::Directory => match DirectoryPicker::new(form) {
+            Ok(picker) => {
+              context.session.workspace_modal = Some(WorkspaceModal::Directory(picker));
+            }
+            Err(error) => {
+              context.session.last_error = Some(error.to_string());
+              context.session.workspace_modal = None;
+            }
+          },
+          WorkspaceField::Name => {
+            form.editing = true;
+            context.session.workspace_modal = Some(WorkspaceModal::Form(form));
           }
         }
         Ok(Effects {
@@ -2021,7 +2027,9 @@ fn handle_workspace_modal_key(
           ..Effects::default()
         })
       }
-      crossterm::event::KeyCode::Backspace if form.field == WorkspaceField::Name => {
+      crossterm::event::KeyCode::Backspace
+        if form.field == WorkspaceField::Name && form.editing =>
+      {
         form.name.pop();
         context.session.workspace_modal = Some(WorkspaceModal::Form(form));
         Ok(Effects {
@@ -2031,6 +2039,7 @@ fn handle_workspace_modal_key(
       }
       crossterm::event::KeyCode::Char(character)
         if form.field == WorkspaceField::Name
+          && form.editing
           && !key.modifiers.intersects(
             crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::ALT,
           ) =>
@@ -2075,7 +2084,7 @@ fn handle_workspace_modal_key(
         Ok(Some(directory)) => {
           let mut form = picker.form;
           form.working_directory = directory;
-          form.directory_selected = true;
+          form.editing = false;
           context.session.workspace_modal = Some(WorkspaceModal::Form(form));
           Ok(Effects {
             redraw: true,
@@ -2363,7 +2372,7 @@ mod tests {
       working_directory: root.clone(),
       name: String::new(),
       field: WorkspaceField::Directory,
-      directory_selected: false,
+      editing: false,
     };
     let mut picker = DirectoryPicker::new(form).expect("open directory picker");
     picker.query = "bt".to_owned();

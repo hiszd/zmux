@@ -35,7 +35,7 @@ const KEY_COLUMN_WIDTH: u16 = 14;
 #[derive(Clone, Default)]
 pub struct WhichKeyPopup {
   pub prefix: KeySeq,
-  pub completions: Vec<(KeyStroke, Option<String>)>,
+  pub completions: Vec<(KeyStroke, Option<String>, bool)>,
   pub scroll_offset: usize,
   pub options: WhichKeyOptions,
 }
@@ -161,7 +161,7 @@ fn completion_row_count(item_count: usize, columns: usize) -> usize { item_count
 
 fn completion_lines(
   width: u16,
-  completions: &[(KeyStroke, Option<String>)],
+  completions: &[(KeyStroke, Option<String>, bool)],
   columns: usize,
 ) -> Vec<Line<'static>> {
   let columns = columns.max(1).min(completions.len().max(1));
@@ -178,8 +178,8 @@ fn completion_lines(
       if column > 0 {
         spans.push(Span::raw(" ".repeat(spacing)));
       }
-      if let Some((key, description)) = completions.get(index) {
-        spans.extend(completion_spans(key, description.as_deref(), column_width));
+      if let Some((key, description, has_children)) = completions.get(index) {
+        spans.extend(completion_spans(key, description.as_deref(), *has_children, column_width));
       } else {
         spans.push(Span::raw(" ".repeat(column_width)));
       }
@@ -192,6 +192,7 @@ fn completion_lines(
 fn completion_spans(
   key: &KeyStroke,
   description: Option<&str>,
+  has_children: bool,
   column_width: usize,
 ) -> Vec<Span<'static>> {
   let key_column_width = column_width.min(usize::from(KEY_COLUMN_WIDTH));
@@ -204,8 +205,13 @@ fn completion_spans(
   };
   let key_width = UnicodeWidthStr::width(key_text.as_str());
   let description_width = column_width.saturating_sub(key_column_width);
-  let description = description.unwrap_or("");
-  let description = truncate_with_ellipsis(description, description_width);
+  let description = match (description, has_children) {
+    (Some(description), true) => format!("{description} …"),
+    (Some(description), false) => description.to_owned(),
+    (None, true) => "…".to_owned(),
+    (None, false) => String::new(),
+  };
+  let description = truncate_with_ellipsis(&description, description_width);
   let description_width_used = UnicodeWidthStr::width(description.as_str());
   let padding = column_width.saturating_sub(key_column_width + description_width_used);
 
@@ -305,7 +311,30 @@ mod tests {
     assert_eq!(truncate_with_ellipsis("abc", 3), "abc");
   }
 
-  fn completion(key: &str) -> (KeyStroke, Option<String>) {
-    (key_notation::parse_key_notation(key).expect("valid key")[0], Some("Description".to_owned()))
+  #[test]
+  fn nested_completion_shows_ellipsis_after_description() {
+    let lines = completion_lines(
+      40,
+      &[(
+        key_notation::parse_key_notation("a").expect("valid key")[0],
+        Some("Nested".to_owned()),
+        true,
+      )],
+      1,
+    );
+    let text: String = lines[0]
+      .spans
+      .iter()
+      .map(|span| span.content.as_ref())
+      .collect();
+    assert!(text.contains("Nested …"));
+  }
+
+  fn completion(key: &str) -> (KeyStroke, Option<String>, bool) {
+    (
+      key_notation::parse_key_notation(key).expect("valid key")[0],
+      Some("Description".to_owned()),
+      false,
+    )
   }
 }
