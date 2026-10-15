@@ -8,31 +8,31 @@ A local terminal multiplexer with a background Server, multiple TUI Clients, PTY
 cargo run
 ```
 
-The command is required. Create a new numbered Session with one Workspace and one Tab:
+The command is required. Create a new Session with an automatically generated numeric name, one Workspace, and one Tab. `--path` sets the initial Workspace directory; without it, zmux uses the current directory:
 
 ```sh
-cargo run -- new
+cargo run -- new --path /path/to/project
 ```
 
-Attach to an existing Session by number:
+Attach to an existing Session by name:
 
 ```sh
-cargo run -- attach 2
+cargo run -- attach project
 ```
 
 `new --attach` uses ensure semantics: it attaches to the requested Session when it exists, or creates a new Session when it does not:
 
 ```sh
-cargo run -- new --attach 2
+cargo run -- new --attach project
 ```
 
 A named socket instance runs an independent Server and Session set:
 
 ```sh
 cargo run -- new --socket project
-cargo run -- attach 1 --socket project
+cargo run -- attach project --socket project
 cargo run -- list --socket project
-cargo run -- kill 1 --socket project
+cargo run -- kill project --socket project
 cargo run -- server status --socket project
 cargo run -- server stop --socket project
 ```
@@ -41,7 +41,7 @@ The Server starts automatically in the background and remains alive while Sessio
 
 ## Session model
 
-- **Session**: sequentially numbered collection of Workspaces. Active Workspace and Tab state is shared across attached Clients and resumes after detach or switching away.
+- **Session**: named collection of Workspaces. Sessions created without a name receive the first unused numeric name represented as a string. Active Workspace and Tab state is shared across attached Clients and resumes after detach or switching away.
 - **Workspace**: collection of Tabs with a working directory. Its display name defaults to the directory basename, unless explicitly named. New Tabs start there; changing a shell's current directory does not change the Workspace directory.
 - **Tab**: exactly one PTY-backed terminal.
 
@@ -53,9 +53,9 @@ Workspace creation and editing use a directory selector and optional name field.
 
 The default configuration is `./zmux.lua`; set `ZMUX_CONFIG` to load another file. LuaLS support is configured in [`.luarc.json`](.luarc.json), with definitions in [`lua/zmux.lua`](lua/zmux.lua).
 
-Commands are registered under `cmd`, options under `opt`, and Rust supplies the server-authoritative `g`/`global` snapshot. Register event handlers with `cmd.on`; commands requested by key and event callbacks are applied after the callback returns. The generic fuzzy picker is `cmd.pick(items, callback)`: it calls back with the selected item on Enter or `nil` on Escape.
+Commands are registered under `cmd`, options under `opt`, and Rust supplies the server-authoritative `g`/`global` snapshot. Register event handlers with `cmd.event.on`; commands requested by key and event callbacks are applied after the callback returns. The generic fuzzy picker is `cmd.ui.pick(items, callback)`: it calls back with the selected item on Enter or `nil` on Escape.
 
-Key bindings use neovim-style notation and Lua callbacks: `cmd.bind('tw', function() cmd.close_tab() end, { desc = 'Close the focused tab' })`. Pass `nil` as the callback to unbind a sequence. Bindings are entered after the required prefix (`opt.prefix_key`, default `<C-Space>`); multi-key sequences are supported and `opt.sequence_timeout_ms` defaults to 700 ms; set it to `0` to disable leader/sequence timeouts. Completing a binding exits leader mode, including when timeouts are disabled; an unbound key also exits leader mode and shows a yellow warning. `<Esc>` cannot be bound because it is reserved for cancellation. When a sequence has continuations, zmux displays a bottom-anchored, full-width which-key popup. Unknown keys and callback errors appear briefly in yellow at the bottom right.
+Key bindings use neovim-style notation and Lua callbacks: `cmd.key.bind('tw', function() cmd.tab.close() end, { desc = 'Close the focused tab' })`. Pass `nil` as the callback to unbind a sequence. Bindings are entered after the required prefix (`opt.prefix_key`, default `<C-Space>`); multi-key sequences are supported and `opt.sequence_timeout_ms` defaults to 700 ms; set it to `0` to disable leader/sequence timeouts. Completing a binding exits leader mode, including when timeouts are disabled; an unbound key also exits leader mode and shows a yellow warning. `<Esc>` cannot be bound because it is reserved for cancellation. When a sequence has continuations, zmux displays a bottom-anchored, full-width which-key popup. Unknown keys and callback errors appear briefly in yellow at the bottom right.
 
 ## Tracing
 

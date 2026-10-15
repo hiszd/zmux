@@ -1,230 +1,251 @@
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::io::{self, Read, Write};
+use std::io::{
+  self,
+  Read,
+  Write,
+};
 
-pub const PROTOCOL_VERSION: u16 = 3;
+use serde::{
+  Deserialize,
+  Serialize,
+  de::DeserializeOwned,
+};
+
+pub const PROTOCOL_VERSION: u16 = 5;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub struct Viewport {
-    pub rows: u16,
-    pub columns: u16,
+  pub rows: u16,
+  pub columns: u16,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ClientHello {
-    pub protocol_version: u16,
-    pub session_number: Option<u64>,
-    pub create_if_missing: bool,
-    pub shell: std::path::PathBuf,
-    pub environment: Vec<(String, String)>,
-    pub working_directory: std::path::PathBuf,
-    pub viewport: Viewport,
+  pub protocol_version: u16,
+  pub session_name: Option<String>,
+  pub create_if_missing: bool,
+  pub shell: std::path::PathBuf,
+  pub environment: Vec<(String, String)>,
+  pub working_directory: std::path::PathBuf,
+  pub viewport: Viewport,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct WorkspaceSnapshot {
-    pub id: u64,
-    pub name: String,
-    pub explicit_name: Option<String>,
-    pub working_directory: std::path::PathBuf,
-    pub tabs: Vec<TabSnapshot>,
-    pub active_tab_id: u64,
+  pub id: u64,
+  pub name: String,
+  pub explicit_name: Option<String>,
+  pub working_directory: std::path::PathBuf,
+  pub tabs: Vec<TabSnapshot>,
+  pub active_tab_id: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct TabSnapshot {
-    pub id: u64,
-    pub title: String,
-    pub exit_code: Option<u32>,
+  pub id: u64,
+  pub title: String,
+  pub exit_code: Option<u32>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct SessionSnapshot {
-    pub number: u64,
-    pub workspaces: Vec<WorkspaceSnapshot>,
-    pub active_workspace_id: u64,
+  pub number: String,
+  pub workspaces: Vec<WorkspaceSnapshot>,
+  pub active_workspace_id: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct TerminalSnapshot {
-    pub tab_id: u64,
-    pub rows: u16,
-    pub columns: u16,
-    pub bytes: Vec<u8>,
-    pub title: String,
-    pub exit_code: Option<u32>,
+  pub tab_id: u64,
+  pub rows: u16,
+  pub columns: u16,
+  pub bytes: Vec<u8>,
+  pub title: String,
+  pub exit_code: Option<u32>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum ClientMessage {
-    Hello(ClientHello),
-    Admin(AdminRequest),
-    Request { id: u64, request: ClientRequest },
+  Hello(ClientHello),
+  Admin(AdminRequest),
+  Request { id: u64, request: ClientRequest },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum AdminRequest {
-    ListSessions,
-    KillSession(u64),
-    StopServer,
-    Status,
+  ListSessions,
+  KillSession(String),
+  StopServer,
+  Status,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct SessionSummary {
-    pub number: u64,
-    pub clients: usize,
-    pub workspaces: usize,
-    pub tabs: usize,
+  pub number: String,
+  pub clients: usize,
+  pub workspaces: usize,
+  pub tabs: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum AdminResponse {
-    Sessions(Vec<SessionSummary>),
-    Status { running: bool, sessions: usize },
-    Success,
+  Sessions(Vec<SessionSummary>),
+  Status { running: bool, sessions: usize },
+  Success,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum ClientRequest {
-    Input(Vec<u8>),
-    Resize(Viewport),
-    NewTab,
-    CloseTab,
-    NextTab,
-    PreviousTab,
-    SelectTab(usize),
-    CreateWorkspace {
-        working_directory: std::path::PathBuf,
-        name: Option<String>,
-    },
-    EditWorkspace {
-        id: u64,
-        working_directory: std::path::PathBuf,
-        name: Option<String>,
-    },
-    SelectWorkspace(u64),
-    Detach,
-    KillSession,
-    StopServer,
+  Input(Vec<u8>),
+  Resize(Viewport),
+  NewTab,
+  CloseTab,
+  NextTab,
+  PreviousTab,
+  SelectTab(usize),
+  CreateWorkspace {
+    working_directory: std::path::PathBuf,
+    name: Option<String>,
+  },
+  EditWorkspace {
+    id: u64,
+    working_directory: std::path::PathBuf,
+    name: Option<String>,
+  },
+  SelectWorkspace(u64),
+  CloseWorkspace,
+  Detach,
+  KillSession,
+  StopServer,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum ServerMessage {
-    HelloAccepted {
-        client_id: u64,
-        session_number: u64,
-    },
-    HelloRejected {
-        reason: String,
-    },
-    AdminResult {
-        result: Result<AdminResponse, String>,
-    },
-    InitialState {
-        session: SessionSnapshot,
-        terminals: Vec<TerminalSnapshot>,
-    },
-    Reply {
-        id: u64,
-        result: Result<(), String>,
-    },
-    StateChanged {
-        session: SessionSnapshot,
-        terminals: Vec<TerminalSnapshot>,
-    },
-    TerminalOutput {
-        tab_id: u64,
-        bytes: Vec<u8>,
-    },
-    TerminalChanged(TerminalSnapshot),
-    Detached,
-    SessionClosed,
-    ServerStopping,
+  HelloAccepted {
+    client_id: u64,
+    session_name: String,
+  },
+  HelloRejected {
+    reason: String,
+  },
+  AdminResult {
+    result: Result<AdminResponse, String>,
+  },
+  InitialState {
+    session: SessionSnapshot,
+    terminals: Vec<TerminalSnapshot>,
+  },
+  Reply {
+    id: u64,
+    result: Result<(), String>,
+  },
+  StateChanged {
+    session: SessionSnapshot,
+    terminals: Vec<TerminalSnapshot>,
+  },
+  TerminalOutput {
+    tab_id: u64,
+    bytes: Vec<u8>,
+  },
+  ClipboardStore {
+    tab_id: u64,
+    text: String,
+  },
+  TerminalChanged(TerminalSnapshot),
+  Detached,
+  SessionClosed,
+  ServerStopping,
 }
 
 pub fn write_frame<W, T>(writer: &mut W, message: &T) -> io::Result<()>
 where
-    W: Write,
-    T: Serialize,
+  W: Write,
+  T: Serialize,
 {
-    let payload = bincode::serialize(message).map_err(invalid_data)?;
-    if payload.len() > MAX_FRAME_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("IPC frame exceeds {MAX_FRAME_BYTES} bytes"),
-        ));
-    }
-    let length = u32::try_from(payload.len()).map_err(invalid_data)?;
-    writer.write_all(&length.to_be_bytes())?;
-    writer.write_all(&payload)?;
-    writer.flush()
+  let payload = bincode::serialize(message).map_err(invalid_data)?;
+  if payload.len() > MAX_FRAME_BYTES {
+    return Err(io::Error::new(
+      io::ErrorKind::InvalidData,
+      format!("IPC frame exceeds {MAX_FRAME_BYTES} bytes"),
+    ));
+  }
+  let length = u32::try_from(payload.len()).map_err(invalid_data)?;
+  writer.write_all(&length.to_be_bytes())?;
+  writer.write_all(&payload)?;
+  writer.flush()
 }
 
 pub fn read_frame<R, T>(reader: &mut R) -> io::Result<T>
 where
-    R: Read,
-    T: DeserializeOwned,
+  R: Read,
+  T: DeserializeOwned,
 {
-    let mut length_bytes = [0_u8; 4];
-    reader.read_exact(&mut length_bytes)?;
-    let length = u32::from_be_bytes(length_bytes) as usize;
-    if length > MAX_FRAME_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("IPC frame exceeds {MAX_FRAME_BYTES} bytes"),
-        ));
-    }
-    let mut payload = vec![0; length];
-    reader.read_exact(&mut payload)?;
-    bincode::deserialize(&payload).map_err(invalid_data)
+  let mut length_bytes = [0_u8; 4];
+  reader.read_exact(&mut length_bytes)?;
+  let length = u32::from_be_bytes(length_bytes) as usize;
+  if length > MAX_FRAME_BYTES {
+    return Err(io::Error::new(
+      io::ErrorKind::InvalidData,
+      format!("IPC frame exceeds {MAX_FRAME_BYTES} bytes"),
+    ));
+  }
+  let mut payload = vec![0; length];
+  reader.read_exact(&mut payload)?;
+  bincode::deserialize(&payload).map_err(invalid_data)
 }
 
 fn invalid_data(error: impl std::fmt::Display) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+  io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
+  use std::io::Cursor;
 
-    use super::{ClientHello, ClientMessage, ClientRequest, Viewport, read_frame, write_frame};
+  use super::{
+    ClientHello,
+    ClientMessage,
+    ClientRequest,
+    Viewport,
+    read_frame,
+    write_frame,
+  };
 
-    #[test]
-    fn framed_messages_round_trip_with_binary_terminal_input() {
-        let message = ClientMessage::Request {
-            id: 19,
-            request: ClientRequest::Input(vec![0, 0xff, b'\n']),
-        };
-        let mut frame = Cursor::new(Vec::new());
+  #[test]
+  fn framed_messages_round_trip_with_binary_terminal_input() {
+    let message = ClientMessage::Request {
+      id: 19,
+      request: ClientRequest::Input(vec![0, 0xff, b'\n']),
+    };
+    let mut frame = Cursor::new(Vec::new());
 
-        write_frame(&mut frame, &message).expect("write message frame");
-        frame.set_position(0);
-        let decoded: ClientMessage = read_frame(&mut frame).expect("read message frame");
+    write_frame(&mut frame, &message).expect("write message frame");
+    frame.set_position(0);
+    let decoded: ClientMessage = read_frame(&mut frame).expect("read message frame");
 
-        assert_eq!(decoded, message);
-    }
+    assert_eq!(decoded, message);
+  }
 
-    #[test]
-    fn hello_frame_preserves_target_and_client_viewport() {
-        let message = ClientMessage::Hello(ClientHello {
-            protocol_version: 1,
-            session_number: Some(8),
-            create_if_missing: false,
-            shell: "/bin/sh".into(),
-            environment: vec![("SHELL".to_owned(), "/bin/sh".to_owned())],
-            working_directory: "/work/project".into(),
-            viewport: Viewport {
-                rows: 40,
-                columns: 120,
-            },
-        });
-        let mut frame = Cursor::new(Vec::new());
+  #[test]
+  fn hello_frame_preserves_target_and_client_viewport() {
+    let message = ClientMessage::Hello(ClientHello {
+      protocol_version: 1,
+      session_name: Some("8".to_owned()),
+      create_if_missing: false,
+      shell: "/bin/sh".into(),
+      environment: vec![("SHELL".to_owned(), "/bin/sh".to_owned())],
+      working_directory: "/work/project".into(),
+      viewport: Viewport {
+        rows: 40,
+        columns: 120,
+      },
+    });
+    let mut frame = Cursor::new(Vec::new());
 
-        write_frame(&mut frame, &message).expect("write hello frame");
-        frame.set_position(0);
-        let decoded: ClientMessage = read_frame(&mut frame).expect("read hello frame");
+    write_frame(&mut frame, &message).expect("write hello frame");
+    frame.set_position(0);
+    let decoded: ClientMessage = read_frame(&mut frame).expect("read hello frame");
 
-        assert_eq!(decoded, message);
-    }
+    assert_eq!(decoded, message);
+  }
 }

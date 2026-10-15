@@ -33,7 +33,7 @@
 ---@field active_tab ZmuxTab|nil Last active Tab in this Workspace.
 
 ---@class ZmuxSession
----@field number integer Automatically assigned Session Number.
+---@field number string Session name; automatically created sessions use numeric names represented as strings.
 ---@field active_workspace_id integer Identifier of the active Workspace.
 ---@field workspaces ZmuxWorkspace[] Workspaces in creation order.
 ---@field active_workspace ZmuxWorkspace|nil Currently active Workspace.
@@ -65,7 +65,7 @@
 
 ---@class ZmuxEvent
 ---@field name ZmuxEventName Event name.
----@field session_number? integer Affected Session Number, when applicable.
+---@field session_number? string Affected Session name, when applicable.
 ---@field workspace_id? integer Affected Workspace identifier, when applicable.
 ---@field workspace_index? integer Current one-based Workspace position, when applicable.
 ---@field previous_workspace_id? integer Previously active Workspace identifier.
@@ -86,21 +86,50 @@
 
 ---@alias ZmuxPickerItem string|{label?: string, text?: string, value?: any}
 
----@class ZmuxCommandApi: ZmuxEventApi
+---@class ZmuxKeyApi
 ---@field bind fun(keys: string, callback: fun()|nil, opts?: ZmuxKeymapOptions) Bind a neovim-notation key sequence after the configured prefix; pass nil to unbind.
+
+---@class ZmuxUiApi
 ---@field pick fun(items: ZmuxPickerItem[], callback: fun(item: any|nil)) Open a generic fuzzy picker from a key or event callback and later call back with the chosen item or nil on Escape.
----@field quit fun() Detach the Client while preserving its Session. Available from key and event callbacks.
+---@field redraw fun() Request a client redraw.
+---@field workspace_drawer ZmuxWorkspaceDrawerApi
+
+---@class ZmuxWorkspaceDrawerApi
+---@field toggle fun() Expand or collapse the local Workspace Drawer.
+
+---@class ZmuxClientApi
 ---@field detach fun() Detach the Client while preserving its Session.
----@field kill_session fun() Kill the current Session from a key or event callback.
----@field stop_server fun() Stop the Server and all Sessions from a key or event callback.
----@field toggle_workspace_drawer fun() Expand or collapse the local Workspace Drawer from a key or event callback.
----@field create_workspace fun() Open the Workspace creation dialog from a key or event callback.
----@field edit_workspace fun() Open the active Workspace editor from a key or event callback.
----@field new_tab fun() Request creation of a terminal tab from a key or event callback.
----@field close_tab fun() Request closure of the active tab from a key or event callback.
----@field next_tab fun() Request selection of the next tab from a key or event callback.
----@field previous_tab fun() Request selection of the previous tab from a key or event callback.
----@field select_tab fun(index: integer) Request selection of a one-based tab index from a key or event callback.
+
+---@class ZmuxServerApi
+---@field stop fun() Stop the Server and all Sessions.
+
+---@class ZmuxSessionApi
+---@field kill fun() Kill the current Session.
+
+---@class ZmuxWorkspaceApi
+---@field create fun() Open the Workspace creation dialog.
+---@field edit fun() Open the active Workspace editor.
+---@field close fun() Close the active Workspace and all of its Tabs.
+---@field next fun() Select the next Workspace.
+---@field previous fun() Select the previous Workspace.
+---@field select fun(id: integer) Select a Workspace by stable identifier.
+
+---@class ZmuxTabApi
+---@field create fun() Request creation of a terminal Tab.
+---@field close fun() Request closure of the active Tab.
+---@field next fun() Request selection of the next Tab.
+---@field previous fun() Request selection of the previous Tab.
+---@field select fun(index: integer) Request selection of a one-based Tab index.
+
+---@class ZmuxCommandApi
+---@field key ZmuxKeyApi
+---@field event ZmuxEventApi
+---@field ui ZmuxUiApi
+---@field client ZmuxClientApi
+---@field server ZmuxServerApi
+---@field session ZmuxSessionApi
+---@field workspace ZmuxWorkspaceApi
+---@field tab ZmuxTabApi
 
 ---@class ZmuxBarSegment
 ---@field text string Text displayed by this segment.
@@ -129,9 +158,14 @@
 ---@field top? ZmuxBarOptions
 ---@field bottom? ZmuxBarOptions
 
+---@class ZmuxWhichOptions
+---@field maxcolumns? integer Maximum number of which-key columns. Defaults to 7.
+---@field maxheight? integer|string Maximum dialog height in rows or as a percentage string, clamped to 60% of the screen. Defaults to "55%".
+
 ---@class ZmuxUIOptions
 ---@field anchors? ZmuxAnchors
 ---@field bars? ZmuxBars
+---@field which? ZmuxWhichOptions
 ---@field style? ZmuxDefaultStyleProvider Default style function, overridden by a segment's explicit style.
 
 ---@class ZmuxTerminalSizeOptions
@@ -140,6 +174,7 @@
 
 ---@class ZmuxOptions
 ---@field cursor_shape? "block"|"underline"|"bar"
+---@field default_shell? string Shell executable for newly created sessions. Defaults to $SHELL.
 ---@field ignore_size? boolean Whether this Client's terminal dimensions are excluded from shared PTY sizing; defaults to false.
 ---@field terminal_size? ZmuxTerminalSizeOptions Server-wide shared PTY sizing policy and manual dimensions.
 ---@field prefix_key? string Prefix key in neovim notation. Defaults to <C-Space>.

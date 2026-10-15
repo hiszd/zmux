@@ -13,12 +13,12 @@ A TUI connected to the Server that sends commands and displays current applicati
 _Avoid_: Server (the process owning sessions)
 
 **Session**:
-A server-owned collection of one or more Workspaces, assigned a sequential Session Number, that retains its active Workspace while Clients detach or switch away. A Session remains alive when its Clients detach and ends when it is killed, its last Workspace closes, or its Server stops.
+A server-owned collection of one or more Workspaces, identified by a unique string name, that retains its active Workspace while Clients detach or switch away. A Session remains alive when its Clients detach and ends when it is killed, its last Workspace closes, or its Server stops.
 _Avoid_: Application process (a Server may own multiple Sessions)
 
-**Session Number**:
-The automatically assigned sequential number used to identify a Session to users. Specifying an existing number attaches a Client to that Session; launching without a number creates a new Session.
-_Avoid_: Session Name (Sessions are numbered rather than named)
+**Session Name**:
+The string used to identify a Session to users. Specifying an existing name attaches a Client to that Session; `new --attach NAME` creates the named Session when it does not exist. Launching without a target creates a Session with the first unused numeric name represented as a string.
+_Avoid_: Session Number (numeric names are still strings)
 
 **Workspace**:
 A grouping of Tabs within a Session with a working directory used as the starting directory for new Tabs; it retains its last active Tab while another Workspace is selected. A Workspace closes when its last Tab closes. Its directory changes only through Workspace UI; a Tab shell changing its own current directory does not change it. An automatically derived Workspace name tracks the directory basename, while an explicit name is user-controlled.
