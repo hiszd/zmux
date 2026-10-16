@@ -43,7 +43,7 @@ cargo run -- server status --socket project
 cargo run -- server stop --socket project
 ```
 
-Run Lua against the Server without opening a TUI Client. Choose either a file (positionally or with `--file`) or inline source with `--string`. Options precede the source; arguments after it are available in Lua as `args[1]`, `args[2]`, and so on. `--path` supplies the launch directory used when a script creates a Session:
+Run Lua against the Server without opening a TUI Client. Choose either a positional file path or inline source with `--string`. Options precede the source; arguments after it are available in Lua as `args[1]`, `args[2]`, and so on. `--path` supplies the launch directory used when a script creates a Session:
 
 ```sh
 cargo run -- run --socket project --path /path/to/project script.lua first-arg second-arg

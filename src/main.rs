@@ -180,12 +180,6 @@ fn parse_args(mut arguments: impl Iterator<Item = String>) -> Result<CliOptions,
             })?;
             source = Some(headless::ScriptInput::Source(value));
           }
-          "--file" => {
-            let value = arguments.next().ok_or_else(|| {
-              io::Error::new(io::ErrorKind::InvalidInput, "--file requires a path")
-            })?;
-            source = Some(headless::ScriptInput::File(value.into()));
-          }
           value if !value.starts_with('-') => {
             source = Some(headless::ScriptInput::File(value.into()))
           }
@@ -348,12 +342,12 @@ fn print_help() {
   println!("  zmux server stop [--socket NAME]");
   println!("  zmux server status [--socket NAME]");
   println!(
-    "  zmux run [--socket NAME] [--path DIRECTORY] [--file FILE | --string SOURCE] [SCRIPT_ARGS...]"
+    "  zmux run [--socket NAME] [--path DIRECTORY] [SCRIPT.lua | --string SOURCE] [SCRIPT_ARGS...]"
   );
   println!();
   println!("new attaches to SESSION or creates it if missing; --strict fails if SESSION exists.");
   println!("attach requires SESSION to already exist.");
-  println!("run accepts a Lua file (positionally or with --file) or inline source with --string.");
+  println!("run accepts a positional Lua file or inline source with --string.");
 }
 
 fn run_admin_command(
@@ -567,18 +561,16 @@ mod tests {
   }
 
   #[test]
-  fn run_requires_exactly_one_source_and_accepts_explicit_file_flag() {
-    let explicit_file = parse_args(
-      ["run", "--file", "script.lua"]
-        .map(str::to_owned)
-        .into_iter(),
-    )
-    .expect("valid explicit file command");
-    assert!(
-      matches!(explicit_file.command, Command::Run { source: ScriptInput::File(ref path), .. } if path == "script.lua")
-    );
+  fn run_requires_a_source_and_rejects_removed_file_flag() {
     assert!(parse_args(["run"].map(str::to_owned).into_iter()).is_err());
-    assert!(parse_args(["run", "--file"].map(str::to_owned).into_iter()).is_err());
+    assert!(
+      parse_args(
+        ["run", "--file", "script.lua"]
+          .map(str::to_owned)
+          .into_iter()
+      )
+      .is_err()
+    );
   }
 
   #[test]
