@@ -50,7 +50,7 @@ enum Command {
   ServerStop,
   ServerStatus,
   Run {
-    script: PathBuf,
+    source: headless::ScriptInput,
     path: Option<PathBuf>,
     arguments: Vec<String>,
   },
@@ -100,7 +100,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
       working_directory: std::env::current_dir()?,
     }),
     Command::Run {
-      script,
+      source,
       path,
       arguments: script_arguments,
     } => {
@@ -111,7 +111,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
       } else {
         std::env::current_dir()?.join(path)
       };
-      headless::run(endpoint, &script, &script_arguments, path)
+      headless::run(endpoint, source, &script_arguments, path)
     }
     command => run_admin_command(endpoint, command),
   }
@@ -147,11 +147,18 @@ fn parse_args(mut arguments: impl Iterator<Item = String>) -> Result<CliOptions,
   let command = match command.as_str() {
     "run" => {
       let mut path = None;
-      let mut script = None;
+      let mut source = None;
       let mut script_arguments = Vec::new();
       while let Some(argument) = arguments.next() {
+        if source.is_some() {
+          script_arguments.push(argument);
+          continue;
+        }
         match argument.as_str() {
-          value if script.is_some() => script_arguments.push(value.to_owned()),
+          "--help" | "-h" => {
+            print_help();
+            std::process::exit(0);
+          }
           "--path" => {
             path = Some(
               arguments
@@ -167,15 +174,27 @@ fn parse_args(mut arguments: impl Iterator<Item = String>) -> Result<CliOptions,
               io::Error::new(io::ErrorKind::InvalidInput, "--socket requires a name")
             })?
           }
-          value if script.is_none() && !value.starts_with('-') => {
-            script = Some(PathBuf::from(value))
+          "--string" => {
+            let value = arguments.next().ok_or_else(|| {
+              io::Error::new(io::ErrorKind::InvalidInput, "--string requires Lua source")
+            })?;
+            source = Some(headless::ScriptInput::Source(value));
+          }
+          "--file" => {
+            let value = arguments.next().ok_or_else(|| {
+              io::Error::new(io::ErrorKind::InvalidInput, "--file requires a path")
+            })?;
+            source = Some(headless::ScriptInput::File(value.into()));
+          }
+          value if !value.starts_with('-') => {
+            source = Some(headless::ScriptInput::File(value.into()))
           }
           other => return Err(invalid_argument(other)),
         }
       }
       Command::Run {
-        script: script.ok_or_else(|| {
-          io::Error::new(io::ErrorKind::InvalidInput, "run requires a Lua script")
+        source: source.ok_or_else(|| {
+          io::Error::new(io::ErrorKind::InvalidInput, "run requires --string SOURCE or a Lua file")
         })?,
         path,
         arguments: script_arguments,
@@ -328,10 +347,13 @@ fn print_help() {
   println!("  zmux kill SESSION [--socket NAME]");
   println!("  zmux server stop [--socket NAME]");
   println!("  zmux server status [--socket NAME]");
-  println!("  zmux run [--socket NAME] [--path DIRECTORY] SCRIPT.lua [SCRIPT_ARGS...]");
+  println!(
+    "  zmux run [--socket NAME] [--path DIRECTORY] [--file FILE | --string SOURCE] [SCRIPT_ARGS...]"
+  );
   println!();
   println!("new attaches to SESSION or creates it if missing; --strict fails if SESSION exists.");
   println!("attach requires SESSION to already exist.");
+  println!("run accepts a Lua file (positionally or with --file) or inline source with --string.");
 }
 
 fn run_admin_command(
@@ -465,6 +487,7 @@ fn configuration(arguments: &[String], launch: lua::LaunchState) -> lua::AppConf
 mod tests {
   use super::{
     Command,
+    headless::ScriptInput,
     parse_args,
   };
 
@@ -524,9 +547,38 @@ mod tests {
     )
     .expect("valid run command");
     assert!(
-      matches!(options.command, Command::Run { ref script, ref arguments, ref path } if script == "script.lua" && path.as_deref() == Some(std::path::Path::new("/work")) && arguments == &["one", "two"])
+      matches!(options.command, Command::Run { ref source, ref arguments, ref path } if source == &ScriptInput::File("script.lua".into()) && path.as_deref() == Some(std::path::Path::new("/work")) && arguments == &["one", "two"])
     );
     assert_eq!(options.socket_instance, "named");
+  }
+
+  #[test]
+  fn run_accepts_inline_source_and_preserves_following_arguments() {
+    let options = parse_args(
+      ["run", "--socket", "script-socket", "--string", "print(args[1])", "first", "--flag"]
+        .map(str::to_owned)
+        .into_iter(),
+    )
+    .expect("valid inline script command");
+    assert!(
+      matches!(options.command, Command::Run { ref source, ref arguments, .. } if source == &ScriptInput::Source("print(args[1])".to_owned()) && arguments == &["first", "--flag"])
+    );
+    assert_eq!(options.socket_instance, "script-socket");
+  }
+
+  #[test]
+  fn run_requires_exactly_one_source_and_accepts_explicit_file_flag() {
+    let explicit_file = parse_args(
+      ["run", "--file", "script.lua"]
+        .map(str::to_owned)
+        .into_iter(),
+    )
+    .expect("valid explicit file command");
+    assert!(
+      matches!(explicit_file.command, Command::Run { source: ScriptInput::File(ref path), .. } if path == "script.lua")
+    );
+    assert!(parse_args(["run"].map(str::to_owned).into_iter()).is_err());
+    assert!(parse_args(["run", "--file"].map(str::to_owned).into_iter()).is_err());
   }
 
   #[test]

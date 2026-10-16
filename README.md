@@ -43,10 +43,11 @@ cargo run -- server status --socket project
 cargo run -- server stop --socket project
 ```
 
-Run a Lua script against the Server without opening a TUI Client. Options precede the script; arguments after the script are available in Lua as `args[1]`, `args[2]`, and so on. `--path` supplies the launch directory used when a script creates a Session:
+Run Lua against the Server without opening a TUI Client. Choose either a file (positionally or with `--file`) or inline source with `--string`. Options precede the source; arguments after it are available in Lua as `args[1]`, `args[2]`, and so on. `--path` supplies the launch directory used when a script creates a Session:
 
 ```sh
 cargo run -- run --socket project --path /path/to/project script.lua first-arg second-arg
+cargo run -- run --socket project --path /path/to/project --string 'cmd.session.list(function(s) print(#s) end)' first-arg
 ```
 
 The script runs in a clean Lua environment and does not load `zmux.lua`. Its Server-owned operations use `cmd.session`, `cmd.workspace`, `cmd.tab`, and `cmd.server`; list calls accept callbacks. Selectors use qualified IDs (`session`, `session:workspace`, `session:workspace:tab`). Names cannot contain `:`. Workspace and Tab names omitted at creation use the first unused numeric sibling name; the initial Workspace defaults to the launch directory basename. For example:

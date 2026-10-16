@@ -2,10 +2,7 @@ use std::{
   cell::RefCell,
   collections::VecDeque,
   io,
-  path::{
-    Path,
-    PathBuf,
-  },
+  path::PathBuf,
   rc::Rc,
 };
 
@@ -36,6 +33,12 @@ use zmux::{
   },
 };
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScriptInput {
+  File(PathBuf),
+  Source(String),
+}
+
 struct Pending {
   request: HeadlessRequest,
   callback: Option<Function>,
@@ -45,11 +48,16 @@ type CommandParser = fn(Variadic<Value>) -> mlua::Result<(HeadlessRequest, Optio
 
 pub fn run(
   endpoint: Endpoint,
-  script: &Path,
+  script: ScriptInput,
   arguments: &[String],
   working_directory: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
-  let source = std::fs::read_to_string(script)?;
+  let (source, chunk_name) = match script {
+    ScriptInput::File(path) => {
+      (std::fs::read_to_string(&path)?, path.to_string_lossy().into_owned())
+    }
+    ScriptInput::Source(source) => (source, "=(command line)".to_owned()),
+  };
   let lua = Lua::new();
   let queue = Rc::new(RefCell::new(VecDeque::<Pending>::new()));
   let cmd = lua.create_table()?;
@@ -78,7 +86,7 @@ pub fn run(
 
   register_commands(&lua, &session, &workspace, &tab, &server, &queue)?;
   let mut failed = false;
-  if let Err(error) = lua.load(source).set_name(script.to_string_lossy()).exec() {
+  if let Err(error) = lua.load(source).set_name(chunk_name).exec() {
     eprintln!("zmux run: {error}");
     g.set("last_error", error.to_string())?;
     failed = true;
