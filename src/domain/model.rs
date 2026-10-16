@@ -87,7 +87,11 @@ impl Session {
 
   pub fn name(&self) -> &SessionName { &self.name }
 
+  pub fn set_name(&mut self, name: SessionName) { self.name = name; }
+
   pub fn workspaces(&self) -> &[Workspace] { &self.workspaces }
+
+  pub fn workspaces_mut(&mut self) -> &mut [Workspace] { &mut self.workspaces }
 
   pub const fn active_workspace_id(&self) -> Option<WorkspaceId> { self.active_workspace }
 

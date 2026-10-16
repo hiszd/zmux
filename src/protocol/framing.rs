@@ -10,7 +10,7 @@ use serde::{
   de::DeserializeOwned,
 };
 
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 7;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -68,8 +68,108 @@ pub struct TerminalSnapshot {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum ClientMessage {
   Hello(ClientHello),
+  HeadlessHello(HeadlessHello),
   Admin(AdminRequest),
   Request { id: u64, request: ClientRequest },
+  HeadlessRequest { id: u64, request: HeadlessRequest },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct HeadlessHello {
+  pub protocol_version: u16,
+  pub working_directory: std::path::PathBuf,
+  pub shell: std::path::PathBuf,
+  pub environment: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub enum HeadlessRequest {
+  SessionCreate {
+    name: Option<String>,
+    workspace_name: Option<String>,
+  },
+  SessionList,
+  SessionRename {
+    id: Option<String>,
+    name: String,
+  },
+  SessionRemove {
+    id: Option<String>,
+  },
+  SessionFocus {
+    id: Option<String>,
+  },
+  WorkspaceCreate {
+    session_id: Option<String>,
+    name: Option<String>,
+    working_directory: std::path::PathBuf,
+  },
+  WorkspaceList {
+    session_id: Option<String>,
+  },
+  WorkspaceRename {
+    id: Option<String>,
+    name: String,
+  },
+  WorkspaceSetCwd {
+    id: Option<String>,
+    working_directory: std::path::PathBuf,
+  },
+  WorkspaceFocus {
+    id: Option<String>,
+  },
+  WorkspaceRemove {
+    id: Option<String>,
+  },
+  TabCreate {
+    workspace_id: Option<String>,
+    name: Option<String>,
+  },
+  TabList {
+    workspace_id: Option<String>,
+  },
+  TabRename {
+    id: Option<String>,
+    name: String,
+  },
+  TabFocus {
+    id: Option<String>,
+  },
+  TabRemove {
+    id: Option<String>,
+  },
+  StopServer,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub enum HeadlessResult {
+  Accepted,
+  Sessions(Vec<HeadlessSession>),
+  Workspaces(Vec<HeadlessWorkspace>),
+  Tabs(Vec<HeadlessTab>),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct HeadlessSession {
+  pub id: String,
+  pub name: String,
+  pub workspaces: usize,
+  pub tabs: usize,
+}
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct HeadlessWorkspace {
+  pub id: String,
+  pub name: String,
+  pub working_directory: std::path::PathBuf,
+  pub active: bool,
+}
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct HeadlessTab {
+  pub id: String,
+  pub name: String,
+  pub title: String,
+  pub exit_code: Option<u32>,
+  pub active: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -133,6 +233,10 @@ pub enum ServerMessage {
   },
   AdminResult {
     result: Result<AdminResponse, String>,
+  },
+  HeadlessReply {
+    id: u64,
+    result: Result<HeadlessResult, String>,
   },
   InitialState {
     session: SessionSnapshot,

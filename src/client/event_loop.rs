@@ -1733,7 +1733,8 @@ fn handle_server_message(message: ServerMessage, session: &mut ClientSession) ->
     ServerMessage::HelloAccepted { .. }
     | ServerMessage::HelloRejected { .. }
     | ServerMessage::InitialState { .. }
-    | ServerMessage::AdminResult { .. } => Effects::default(),
+    | ServerMessage::AdminResult { .. }
+    | ServerMessage::HeadlessReply { .. } => Effects::default(),
   }
 }
 

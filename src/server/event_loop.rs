@@ -37,6 +37,12 @@ use zmux::{
     ClientHello,
     ClientMessage,
     ClientRequest,
+    HeadlessHello,
+    HeadlessRequest,
+    HeadlessResult,
+    HeadlessSession,
+    HeadlessTab,
+    HeadlessWorkspace,
     ServerMessage,
     SessionSnapshot,
     SessionSummary,
@@ -63,6 +69,7 @@ const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 struct ServerTab {
   id: TabId,
+  name: String,
   pane: Pane,
   title: String,
   explicit_title: bool,
@@ -89,6 +96,12 @@ struct ClientConnection {
   sender: Sender<ServerMessage>,
 }
 
+struct HeadlessConnection {
+  working_directory: PathBuf,
+  shell: ShellConfig,
+  sender: Sender<ServerMessage>,
+}
+
 enum ServerEvent {
   Connected {
     client_id: u64,
@@ -98,6 +111,16 @@ enum ServerEvent {
   Admin {
     request: AdminRequest,
     sender: Sender<ServerMessage>,
+  },
+  HeadlessConnected {
+    connection_id: u64,
+    hello: HeadlessHello,
+    sender: Sender<ServerMessage>,
+  },
+  HeadlessRequest {
+    connection_id: u64,
+    id: u64,
+    request: HeadlessRequest,
   },
   Request {
     client_id: u64,
@@ -195,7 +218,29 @@ fn spawn_connection(
           });
           return;
         }
-        ClientMessage::Request { .. } => return,
+        ClientMessage::HeadlessHello(hello) => {
+          let _ = events.send(ServerEvent::HeadlessConnected {
+            connection_id: client_id,
+            hello,
+            sender: to_client.clone(),
+          });
+          while let Ok(ClientMessage::HeadlessRequest { id, request }) =
+            read_frame::<_, ClientMessage>(&mut reader)
+          {
+            if events
+              .send(ServerEvent::HeadlessRequest {
+                connection_id: client_id,
+                id,
+                request,
+              })
+              .is_err()
+            {
+              break;
+            }
+          }
+          return;
+        }
+        ClientMessage::Request { .. } | ClientMessage::HeadlessRequest { .. } => return,
       };
       if events
         .send(ServerEvent::Connected {
@@ -245,6 +290,7 @@ fn forward_pty_events(receiver: Receiver<AppEvent>, events: Sender<ServerEvent>)
 struct ServerState {
   sessions: Vec<ServerSession>,
   clients: HashMap<u64, ClientConnection>,
+  headless: HashMap<u64, HeadlessConnection>,
   next_workspace_id: u64,
   next_tab_id: u64,
   pty_events: Sender<AppEvent>,
@@ -258,6 +304,7 @@ impl ServerState {
     Self {
       sessions: Vec::new(),
       clients: HashMap::new(),
+      headless: HashMap::new(),
       next_workspace_id: 1,
       next_tab_id: 1,
       pty_events,
@@ -275,6 +322,27 @@ impl ServerState {
         sender,
       } => self.connect_client(client_id, hello, sender)?,
       ServerEvent::Admin { request, sender } => self.handle_admin(request, sender)?,
+      ServerEvent::HeadlessConnected {
+        connection_id,
+        hello,
+        sender,
+      } => {
+        self.headless.insert(connection_id, HeadlessConnection {
+          working_directory: hello.working_directory,
+          shell: ShellConfig {
+            executable: hello.shell,
+            environment: hello.environment,
+          },
+          sender,
+        });
+      }
+      ServerEvent::HeadlessRequest {
+        connection_id,
+        id,
+        request,
+      } => {
+        self.handle_headless_request(connection_id, id, request)?;
+      }
       ServerEvent::Request {
         client_id,
         id,
@@ -440,6 +508,9 @@ impl ServerState {
     environment: &[(String, String)],
     size: Viewport,
   ) -> Result<String, Box<dyn std::error::Error>> {
+    if name.contains(':') {
+      return Err("names must not contain ':'".into());
+    }
     if !working_directory.is_dir() {
       return Err(
         format!("working directory does not exist: {}", working_directory.display()).into(),
@@ -479,6 +550,7 @@ impl ServerState {
     let mut tabs = HashMap::new();
     tabs.insert(tab_id, ServerTab {
       id: tab_id,
+      name: "1".to_owned(),
       pane,
       title,
       explicit_title: false,
@@ -495,6 +567,509 @@ impl ServerState {
       },
     });
     Ok(name)
+  }
+
+  fn handle_headless_request(
+    &mut self,
+    connection_id: u64,
+    request_id: u64,
+    request: HeadlessRequest,
+  ) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(connection) = self.headless.get(&connection_id) else {
+      return Ok(());
+    };
+    let sender = connection.sender.clone();
+    let result: Result<HeadlessResult, String> = match request {
+      HeadlessRequest::SessionList => Ok(HeadlessResult::Sessions(self.headless_sessions())),
+      HeadlessRequest::StopServer => {
+        self.stop_server();
+        Ok(HeadlessResult::Accepted)
+      }
+      HeadlessRequest::SessionCreate {
+        name,
+        workspace_name,
+      } => {
+        if let Some(name) = &name {
+          Self::validate_name(name)?;
+        }
+        if let Some(name) = &workspace_name {
+          Self::validate_name(name)?;
+        }
+        let (working_directory, shell, environment) = {
+          let connection = self
+            .headless
+            .get(&connection_id)
+            .ok_or("headless connection closed")?;
+          (
+            connection.working_directory.clone(),
+            connection.shell.executable.clone(),
+            connection.shell.environment.clone(),
+          )
+        };
+        self
+          .create_session(
+            name.unwrap_or_default(),
+            &working_directory,
+            &shell,
+            &environment,
+            Viewport {
+              rows: 24,
+              columns: 80,
+            },
+          )
+          .map(|session| {
+            if let Some(workspace_name) = workspace_name
+              && let Some(workspace) = self
+                .session_mut(&session)
+                .and_then(|value| value.model.active_workspace_mut())
+            {
+              workspace.set_name(Some(workspace_name));
+            }
+            HeadlessResult::Accepted
+          })
+          .map_err(|error| error.to_string())
+      }
+      HeadlessRequest::SessionRename { id, name } => self.headless_rename_session(id, name),
+      HeadlessRequest::SessionRemove { id } => self.headless_remove_session(id),
+      HeadlessRequest::SessionFocus { .. } => {
+        Err("cmd.session.focus is a TUI Client operation and is unavailable headlessly".to_owned())
+      }
+      HeadlessRequest::WorkspaceCreate {
+        session_id,
+        name,
+        working_directory,
+      } => self.headless_create_workspace(session_id, name, working_directory),
+      HeadlessRequest::WorkspaceList { session_id } => self.headless_workspace_list(session_id),
+      HeadlessRequest::WorkspaceRename { id, name } => self.headless_workspace_rename(id, name),
+      HeadlessRequest::WorkspaceSetCwd {
+        id,
+        working_directory,
+      } => self.headless_workspace_setcwd(id, working_directory),
+      HeadlessRequest::WorkspaceFocus { id } => self.headless_workspace_focus(id),
+      HeadlessRequest::WorkspaceRemove { id } => self.headless_workspace_remove(id),
+      HeadlessRequest::TabCreate { workspace_id, name } => {
+        self.headless_create_tab(workspace_id, name)
+      }
+      HeadlessRequest::TabList { workspace_id } => self.headless_tab_list(workspace_id),
+      HeadlessRequest::TabRename { id, name } => self.headless_tab_rename(id, name),
+      HeadlessRequest::TabFocus { id } => self.headless_tab_focus(id),
+      HeadlessRequest::TabRemove { id } => self.headless_tab_remove(id),
+    };
+    sender.send(ServerMessage::HeadlessReply {
+      id: request_id,
+      result,
+    })?;
+    Ok(())
+  }
+
+  fn headless_sessions(&self) -> Vec<HeadlessSession> {
+    self
+      .sessions
+      .iter()
+      .map(|session| HeadlessSession {
+        id: session.model.name().get().to_owned(),
+        name: session.model.name().get().to_owned(),
+        workspaces: session.model.workspaces().len(),
+        tabs: session.tabs.len(),
+      })
+      .collect()
+  }
+
+  fn validate_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.contains(':') {
+      return Err("names must be non-empty and must not contain ':'".to_owned());
+    }
+    Ok(())
+  }
+
+  fn headless_rename_session(
+    &mut self,
+    id: Option<String>,
+    name: String,
+  ) -> Result<HeadlessResult, String> {
+    let old = id.ok_or("Session target is required in headless mode")?;
+    Self::validate_name(&name)?;
+    if self
+      .sessions
+      .iter()
+      .any(|session| session.model.name().get() == name)
+    {
+      return Err(format!("Session {name} already exists"));
+    }
+    let session = self
+      .session_mut(&old)
+      .ok_or_else(|| format!("Session {old} does not exist"))?;
+    session.model.set_name(SessionName::new(name));
+    Ok(HeadlessResult::Accepted)
+  }
+
+  fn headless_remove_session(&mut self, id: Option<String>) -> Result<HeadlessResult, String> {
+    self
+      .close_session(&id.ok_or("Session target is required in headless mode")?)
+      .map_err(|error| error.to_string())?;
+    Ok(HeadlessResult::Accepted)
+  }
+
+  fn headless_create_workspace(
+    &mut self,
+    session_id: Option<String>,
+    name: Option<String>,
+    directory: PathBuf,
+  ) -> Result<HeadlessResult, String> {
+    let session = session_id.ok_or("Session target is required in headless mode")?;
+    if let Some(name) = &name {
+      Self::validate_name(name)?;
+    }
+    self.create_workspace(&session, directory, name)?;
+    Ok(HeadlessResult::Accepted)
+  }
+
+  fn split_workspace_id(id: Option<String>) -> Result<(String, String), String> {
+    let value = id.ok_or("Workspace target is required in headless mode")?;
+    let mut parts = value.splitn(2, ':');
+    Ok((
+      parts.next().unwrap_or_default().to_owned(),
+      parts
+        .next()
+        .ok_or("Workspace ID must be qualified")?
+        .to_owned(),
+    ))
+  }
+
+  fn split_tab_id(id: Option<String>) -> Result<(String, String, String), String> {
+    let value = id.ok_or("Tab target is required in headless mode")?;
+    let mut parts = value.splitn(3, ':');
+    Ok((
+      parts.next().unwrap_or_default().to_owned(),
+      parts.next().ok_or("Tab ID must be qualified")?.to_owned(),
+      parts.next().ok_or("Tab ID must be qualified")?.to_owned(),
+    ))
+  }
+
+  fn headless_workspace_list(&self, session_id: Option<String>) -> Result<HeadlessResult, String> {
+    let session_id = session_id.ok_or("Session target is required in headless mode")?;
+    let session = self
+      .session(&session_id)
+      .ok_or_else(|| format!("Session {session_id} does not exist"))?;
+    Ok(HeadlessResult::Workspaces(
+      session
+        .model
+        .workspaces()
+        .iter()
+        .map(|workspace| HeadlessWorkspace {
+          id: format!("{}:{}", session_id, workspace.name()),
+          name: workspace.name().into_owned(),
+          working_directory: workspace.working_directory().to_path_buf(),
+          active: session.model.active_workspace_id() == Some(workspace.id()),
+        })
+        .collect(),
+    ))
+  }
+
+  fn headless_workspace_rename(
+    &mut self,
+    id: Option<String>,
+    name: String,
+  ) -> Result<HeadlessResult, String> {
+    Self::validate_name(&name)?;
+    let (session_id, old_name) = Self::split_workspace_id(id)?;
+    if self.session(&session_id).is_some_and(|session| {
+      session
+        .model
+        .workspaces()
+        .iter()
+        .any(|workspace| workspace.name() == old_name)
+    }) {
+      if self.session(&session_id).is_some_and(|session| {
+        session
+          .model
+          .workspaces()
+          .iter()
+          .any(|workspace| workspace.name() == name)
+      }) {
+        return Err(format!("Workspace {name} already exists"));
+      }
+    } else {
+      return Err(format!("Workspace {session_id}:{old_name} does not exist"));
+    }
+    let session = self
+      .session_mut(&session_id)
+      .ok_or("Session no longer exists")?;
+    let workspace_id = session
+      .model
+      .workspaces()
+      .iter()
+      .find(|workspace| workspace.name() == old_name)
+      .map(|workspace| workspace.id())
+      .ok_or("Workspace does not exist")?;
+    session
+      .model
+      .workspace_mut(workspace_id)
+      .ok_or("Workspace does not exist")?
+      .set_name(Some(name));
+    Ok(HeadlessResult::Accepted)
+  }
+
+  fn headless_workspace_setcwd(
+    &mut self,
+    id: Option<String>,
+    directory: PathBuf,
+  ) -> Result<HeadlessResult, String> {
+    if !directory.is_dir() {
+      return Err(format!("working directory does not exist: {}", directory.display()));
+    }
+    let (session_id, name) = Self::split_workspace_id(id)?;
+    let session = self
+      .session_mut(&session_id)
+      .ok_or("Session does not exist")?;
+    let workspace_id = session
+      .model
+      .workspaces()
+      .iter()
+      .find(|workspace| workspace.name() == name)
+      .map(|workspace| workspace.id())
+      .ok_or("Workspace does not exist")?;
+    session
+      .model
+      .workspace_mut(workspace_id)
+      .ok_or("Workspace does not exist")?
+      .set_working_directory(directory);
+    self.broadcast_state(&session_id)?;
+    Ok(HeadlessResult::Accepted)
+  }
+
+  fn headless_workspace_focus(&mut self, id: Option<String>) -> Result<HeadlessResult, String> {
+    let (session_id, name) = Self::split_workspace_id(id)?;
+    let workspace_id = self
+      .session(&session_id)
+      .and_then(|session| {
+        session
+          .model
+          .workspaces()
+          .iter()
+          .find(|workspace| workspace.name() == name)
+          .map(|workspace| workspace.id())
+      })
+      .ok_or("Workspace does not exist")?;
+    self
+      .session_mut(&session_id)
+      .ok_or("Session does not exist")?
+      .model
+      .select_workspace(workspace_id);
+    self.broadcast_state(&session_id)?;
+    Ok(HeadlessResult::Accepted)
+  }
+
+  fn headless_workspace_remove(&mut self, id: Option<String>) -> Result<HeadlessResult, String> {
+    let (session_id, name) = Self::split_workspace_id(id)?;
+    let (workspace_id, tabs) = self
+      .session(&session_id)
+      .and_then(|session| {
+        session
+          .model
+          .workspaces()
+          .iter()
+          .find(|workspace| workspace.name() == name)
+          .map(|workspace| (workspace.id(), workspace.tabs().to_vec()))
+      })
+      .ok_or("Workspace does not exist")?;
+    let outcome = self
+      .session_mut(&session_id)
+      .ok_or("Session does not exist")?
+      .model
+      .close_workspace(workspace_id);
+    if let Some(session) = self.session_mut(&session_id) {
+      for tab in tabs {
+        session.tabs.remove(&tab);
+      }
+    }
+    if outcome == SessionTabCloseOutcome::SessionClosed {
+      self
+        .close_session(&session_id)
+        .map_err(|error| error.to_string())?;
+    } else {
+      self.broadcast_state(&session_id)?;
+    }
+    Ok(HeadlessResult::Accepted)
+  }
+
+  fn headless_create_tab(
+    &mut self,
+    workspace_id: Option<String>,
+    name: Option<String>,
+  ) -> Result<HeadlessResult, String> {
+    let (session_id, workspace_name) = Self::split_workspace_id(workspace_id)?;
+    let id = self
+      .session(&session_id)
+      .and_then(|session| {
+        session
+          .model
+          .workspaces()
+          .iter()
+          .find(|workspace| workspace.name() == workspace_name)
+          .map(|workspace| workspace.id())
+      })
+      .ok_or("Workspace does not exist")?;
+    if let Some(name) = &name {
+      Self::validate_name(name)?;
+      if self
+        .session(&session_id)
+        .is_some_and(|session| session.tabs.values().any(|tab| tab.name == *name))
+      {
+        return Err(format!("Tab {name} already exists"));
+      }
+    }
+    self
+      .session_mut(&session_id)
+      .ok_or("Session does not exist")?
+      .model
+      .select_workspace(id);
+    self.create_tab(&session_id)?;
+    if let Some(name) = name {
+      let tab_id = self
+        .session(&session_id)
+        .and_then(|session| session.model.active_tab());
+      if let Some(tab_id) = tab_id
+        && let Some(session) = self.session_mut(&session_id)
+        && let Some(tab) = session.tabs.get_mut(&tab_id)
+      {
+        tab.name = name;
+      }
+    }
+    Ok(HeadlessResult::Accepted)
+  }
+
+  fn headless_tab_list(&self, workspace_id: Option<String>) -> Result<HeadlessResult, String> {
+    let (session_id, workspace_name) = Self::split_workspace_id(workspace_id)?;
+    let session = self.session(&session_id).ok_or("Session does not exist")?;
+    let workspace = session
+      .model
+      .workspaces()
+      .iter()
+      .find(|workspace| workspace.name() == workspace_name)
+      .ok_or("Workspace does not exist")?;
+    Ok(HeadlessResult::Tabs(
+      workspace
+        .tabs()
+        .iter()
+        .filter_map(|id| session.tabs.get(id))
+        .map(|tab| HeadlessTab {
+          id: format!("{}:{}:{}", session_id, workspace_name, tab.name),
+          name: tab.name.clone(),
+          title: tab.title.clone(),
+          exit_code: tab.exit_code,
+          active: workspace.active_tab() == Some(tab.id),
+        })
+        .collect(),
+    ))
+  }
+
+  fn headless_tab_rename(
+    &mut self,
+    id: Option<String>,
+    name: String,
+  ) -> Result<HeadlessResult, String> {
+    let (session_id, workspace_name, old_name) = Self::split_tab_id(id)?;
+    Self::validate_name(&name)?;
+    let session = self
+      .session_mut(&session_id)
+      .ok_or("Session does not exist")?;
+    let workspace = session
+      .model
+      .workspaces()
+      .iter()
+      .find(|workspace| workspace.name() == workspace_name)
+      .ok_or("Workspace does not exist")?;
+    let tab_id = workspace
+      .tabs()
+      .iter()
+      .find(|id| session.tabs.get(id).is_some_and(|tab| tab.name == old_name))
+      .copied()
+      .ok_or("Tab does not exist")?;
+    if workspace
+      .tabs()
+      .iter()
+      .any(|id| session.tabs.get(id).is_some_and(|tab| tab.name == name))
+    {
+      return Err(format!("Tab {name} already exists"));
+    }
+    session
+      .tabs
+      .get_mut(&tab_id)
+      .ok_or("Tab does not exist")?
+      .name = name;
+    Ok(HeadlessResult::Accepted)
+  }
+
+  fn headless_tab_focus(&mut self, id: Option<String>) -> Result<HeadlessResult, String> {
+    let (session_id, workspace_name, tab_name) = Self::split_tab_id(id)?;
+    let session = self
+      .session_mut(&session_id)
+      .ok_or("Session does not exist")?;
+    let workspace_id = session
+      .model
+      .workspaces()
+      .iter()
+      .find(|workspace| workspace.name() == workspace_name)
+      .map(|workspace| workspace.id())
+      .ok_or("Workspace does not exist")?;
+    session.model.select_workspace(workspace_id);
+    let tab_id = session
+      .model
+      .active_workspace()
+      .and_then(|workspace| {
+        workspace
+          .tabs()
+          .iter()
+          .find(|id| session.tabs.get(id).is_some_and(|tab| tab.name == tab_name))
+          .copied()
+      })
+      .ok_or("Tab does not exist")?;
+    session.model.select_tab(tab_id);
+    self.broadcast_state(&session_id)?;
+    Ok(HeadlessResult::Accepted)
+  }
+
+  fn headless_tab_remove(&mut self, id: Option<String>) -> Result<HeadlessResult, String> {
+    let (session_id, workspace_name, tab_name) = Self::split_tab_id(id)?;
+    let tab_id = self
+      .session(&session_id)
+      .and_then(|session| {
+        session
+          .model
+          .workspaces()
+          .iter()
+          .find(|workspace| workspace.name() == workspace_name)
+      })
+      .and_then(|workspace| {
+        workspace
+          .tabs()
+          .iter()
+          .find(|id| {
+            self
+              .session(&session_id)
+              .and_then(|session| session.tabs.get(id))
+              .is_some_and(|tab| tab.name == tab_name)
+          })
+          .copied()
+      })
+      .ok_or("Tab does not exist")?;
+    let outcome = self
+      .session_mut(&session_id)
+      .ok_or("Session does not exist")?
+      .model
+      .close_tab(tab_id);
+    if let Some(session) = self.session_mut(&session_id) {
+      session.tabs.remove(&tab_id);
+    }
+    if outcome == SessionTabCloseOutcome::SessionClosed {
+      self
+        .close_session(&session_id)
+        .map_err(|error| error.to_string())?;
+    } else {
+      self.broadcast_state(&session_id)?;
+    }
+    Ok(HeadlessResult::Accepted)
   }
 
   fn handle_request(
@@ -629,6 +1204,7 @@ impl ServerState {
       .unwrap_or_else(|| format!("Terminal {}", id.get()));
     session.tabs.insert(id, ServerTab {
       id,
+      name: next_tab_name(session),
       pane,
       title,
       explicit_title: false,
@@ -713,6 +1289,18 @@ impl ServerState {
     working_directory: PathBuf,
     name: Option<String>,
   ) -> Result<(), String> {
+    if let Some(name) = &name {
+      Self::validate_name(name)?;
+      if self.session(number).is_some_and(|session| {
+        session
+          .model
+          .workspaces()
+          .iter()
+          .any(|workspace| workspace.name() == name.as_str())
+      }) {
+        return Err(format!("Workspace {name} already exists"));
+      }
+    }
     if !working_directory.is_dir() {
       return Err(format!("working directory does not exist: {}", working_directory.display()));
     }
@@ -753,6 +1341,7 @@ impl ServerState {
       .unwrap_or_else(|| format!("Terminal {}", tab_id.get()));
     session.tabs.insert(tab_id, ServerTab {
       id: tab_id,
+      name: "1".to_owned(),
       pane,
       title,
       explicit_title: false,
@@ -1151,6 +1740,28 @@ fn sanitize_viewport(viewport: Viewport) -> Viewport {
   Viewport {
     rows: viewport.rows.max(1),
     columns: viewport.columns.max(1),
+  }
+}
+
+fn next_tab_name(session: &ServerSession) -> String {
+  let used: HashSet<&str> = session
+    .model
+    .active_workspace()
+    .into_iter()
+    .flat_map(|workspace| {
+      workspace
+        .tabs()
+        .iter()
+        .filter_map(|id| session.tabs.get(id).map(|tab| tab.name.as_str()))
+    })
+    .collect();
+  let mut number = 1_u64;
+  loop {
+    let candidate = number.to_string();
+    if !used.contains(candidate.as_str()) {
+      return candidate;
+    }
+    number = number.saturating_add(1);
   }
 }
 

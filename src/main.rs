@@ -1,6 +1,7 @@
 mod client;
 mod clipboard;
 mod events;
+mod headless;
 mod input;
 mod lua;
 mod pane;
@@ -48,6 +49,11 @@ enum Command {
   Kill(String),
   ServerStop,
   ServerStatus,
+  Run {
+    script: PathBuf,
+    path: Option<PathBuf>,
+    arguments: Vec<String>,
+  },
 }
 
 struct CliOptions {
@@ -93,6 +99,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
       require_session: true,
       working_directory: std::env::current_dir()?,
     }),
+    Command::Run {
+      script,
+      path,
+      arguments: script_arguments,
+    } => {
+      ensure_server(&endpoint)?;
+      headless::run(endpoint, &script, &script_arguments, path.unwrap_or(std::env::current_dir()?))
+    }
     command => run_admin_command(endpoint, command),
   }
 }
@@ -125,6 +139,42 @@ fn parse_args(mut arguments: impl Iterator<Item = String>) -> Result<CliOptions,
 
   let mut socket_instance = "default".to_owned();
   let command = match command.as_str() {
+    "run" => {
+      let mut path = None;
+      let mut script = None;
+      let mut script_arguments = Vec::new();
+      while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+          value if script.is_some() => script_arguments.push(value.to_owned()),
+          "--path" => {
+            path = Some(
+              arguments
+                .next()
+                .ok_or_else(|| {
+                  io::Error::new(io::ErrorKind::InvalidInput, "--path requires a path")
+                })?
+                .into(),
+            )
+          }
+          "--socket" => {
+            socket_instance = arguments.next().ok_or_else(|| {
+              io::Error::new(io::ErrorKind::InvalidInput, "--socket requires a name")
+            })?
+          }
+          value if script.is_none() && !value.starts_with('-') => {
+            script = Some(PathBuf::from(value))
+          }
+          other => return Err(invalid_argument(other)),
+        }
+      }
+      Command::Run {
+        script: script.ok_or_else(|| {
+          io::Error::new(io::ErrorKind::InvalidInput, "run requires a Lua script")
+        })?,
+        path,
+        arguments: script_arguments,
+      }
+    }
     "new" => {
       let mut session_name = None;
       let mut strict = false;
@@ -272,6 +322,7 @@ fn print_help() {
   println!("  zmux kill SESSION [--socket NAME]");
   println!("  zmux server stop [--socket NAME]");
   println!("  zmux server status [--socket NAME]");
+  println!("  zmux run [--socket NAME] [--path DIRECTORY] SCRIPT.lua [SCRIPT_ARGS...]");
   println!();
   println!("new attaches to SESSION or creates it if missing; --strict fails if SESSION exists.");
   println!("attach requires SESSION to already exist.");
@@ -287,7 +338,7 @@ fn run_admin_command(
     Command::Kill(name) => AdminRequest::KillSession(name),
     Command::ServerStop => AdminRequest::StopServer,
     Command::ServerStatus => AdminRequest::Status,
-    Command::New { .. } | Command::Attach(_) => unreachable!(),
+    Command::New { .. } | Command::Attach(_) | Command::Run { .. } => unreachable!(),
   };
   let mut stream = match transport::connect(&endpoint) {
     Ok(stream) => stream,
@@ -456,6 +507,20 @@ mod tests {
 
     assert!(matches!(options.command, Command::Attach(ref name) if name == "12"));
     assert_eq!(options.socket_instance, "project");
+  }
+
+  #[test]
+  fn run_accepts_script_arguments_and_launch_options() {
+    let options = parse_args(
+      ["run", "--path", "/work", "script.lua", "one", "two", "--socket", "named"]
+        .map(str::to_owned)
+        .into_iter(),
+    )
+    .expect("valid run command");
+    assert!(
+      matches!(options.command, Command::Run { ref script, ref arguments, ref path } if script == "script.lua" && path.as_deref() == Some(std::path::Path::new("/work")) && arguments == &["one", "two", "--socket", "named"])
+    );
+    assert_eq!(options.socket_instance, "default");
   }
 
   #[test]
