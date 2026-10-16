@@ -44,6 +44,7 @@ pub struct WorkspaceSnapshot {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct TabSnapshot {
   pub id: u64,
+  pub name: String,
   pub title: String,
   pub exit_code: Option<u32>,
 }

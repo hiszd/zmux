@@ -245,13 +245,15 @@ impl ServerState {
         .iter()
         .any(|workspace| workspace.name() == old_name)
     }) {
-      if self.session(&session_id).is_some_and(|session| {
-        session
-          .model
-          .workspaces()
-          .iter()
-          .any(|workspace| workspace.name() == name)
-      }) {
+      if old_name != name
+        && self.session(&session_id).is_some_and(|session| {
+          session
+            .model
+            .workspaces()
+            .iter()
+            .any(|workspace| workspace.name() == name)
+        })
+      {
         return Err(format!("Workspace {name} already exists"));
       }
     } else {
@@ -272,6 +274,7 @@ impl ServerState {
       .workspace_mut(workspace_id)
       .ok_or("Workspace does not exist")?
       .set_name(Some(name));
+    self.broadcast_state(&session_id)?;
     Ok(HeadlessResult::Accepted)
   }
 
@@ -471,10 +474,11 @@ impl ServerState {
       .find(|id| session.tabs.get(id).is_some_and(|tab| tab.name == old_name))
       .copied()
       .ok_or("Tab does not exist")?;
-    if workspace
-      .tabs()
-      .iter()
-      .any(|id| session.tabs.get(id).is_some_and(|tab| tab.name == name))
+    if old_name != name
+      && workspace
+        .tabs()
+        .iter()
+        .any(|id| session.tabs.get(id).is_some_and(|tab| tab.name == name))
     {
       return Err(format!("Tab {name} already exists"));
     }
@@ -483,6 +487,7 @@ impl ServerState {
       .get_mut(&tab_id)
       .ok_or("Tab does not exist")?
       .name = name;
+    self.broadcast_state(&session_id)?;
     Ok(HeadlessResult::Accepted)
   }
 
@@ -494,25 +499,19 @@ impl ServerState {
     let session = self
       .session_mut(&session_id)
       .ok_or("Session does not exist")?;
-    let workspace_id = session
+    let (workspace_id, workspace_tabs) = session
       .model
       .workspaces()
       .iter()
       .find(|workspace| workspace.name() == workspace_name)
-      .map(|workspace| workspace.id())
+      .map(|workspace| (workspace.id(), workspace.tabs().to_vec()))
       .ok_or("Workspace does not exist")?;
-    session.model.select_workspace(workspace_id);
-    let tab_id = session
-      .model
-      .active_workspace()
-      .and_then(|workspace| {
-        workspace
-          .tabs()
-          .iter()
-          .find(|id| session.tabs.get(id).is_some_and(|tab| tab.name == tab_name))
-          .copied()
-      })
+    let tab_id = workspace_tabs
+      .iter()
+      .find(|id| session.tabs.get(id).is_some_and(|tab| tab.name == tab_name))
+      .copied()
       .ok_or("Tab does not exist")?;
+    session.model.select_workspace(workspace_id);
     session.model.select_tab(tab_id);
     self.broadcast_state(&session_id)?;
     Ok(HeadlessResult::Accepted)

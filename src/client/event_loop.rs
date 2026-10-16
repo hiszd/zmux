@@ -787,6 +787,7 @@ impl ClientSession {
         let exit_code = self.terminals.get(&tab.id).and_then(|view| view.exit_code);
         TabSnapshot {
           id: tab.id,
+          name: tab.name.clone(),
           index: index + 1,
           title: self
             .terminals

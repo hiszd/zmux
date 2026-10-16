@@ -1214,6 +1214,7 @@ impl ServerSession {
           .filter_map(|id| self.tabs.get(id))
           .map(|tab| WireTabSnapshot {
             id: tab.id.get(),
+            name: tab.name.clone(),
             title: tab.title.clone(),
             exit_code: tab.exit_code,
           })
@@ -1973,19 +1974,54 @@ mod tests {
       ["headless:project", "headless:1"]
     );
 
+    assert_eq!(
+      request(&mut client, 5, HeadlessRequest::TabCreate {
+        workspace_id: Some("headless:project".to_owned()),
+        name: Some("extra".to_owned()),
+      }),
+      Ok(HeadlessResult::Accepted)
+    );
+    let tabs = request(&mut client, 6, HeadlessRequest::TabList {
+      workspace_id: Some("headless:project".to_owned()),
+    })
+    .expect("list Tabs");
+    let HeadlessResult::Tabs(tabs) = tabs else {
+      panic!("tab list should return tab data");
+    };
+    assert!(tabs.iter().any(|tab| tab.id == "headless:project:extra"));
+    assert_eq!(
+      request(&mut client, 7, HeadlessRequest::TabRename {
+        id: Some("headless:project:extra".to_owned()),
+        name: "renamed-tab".to_owned(),
+      }),
+      Ok(HeadlessResult::Accepted)
+    );
+    assert_eq!(
+      request(&mut client, 8, HeadlessRequest::TabFocus {
+        id: Some("headless:project:renamed-tab".to_owned()),
+      }),
+      Ok(HeadlessResult::Accepted)
+    );
+    assert_eq!(
+      request(&mut client, 9, HeadlessRequest::TabRemove {
+        id: Some("headless:project:renamed-tab".to_owned()),
+      }),
+      Ok(HeadlessResult::Accepted)
+    );
+
     let (mut attached, _, _) =
       connect_test_client(&endpoint, Some("headless".to_owned()), Viewport {
         rows: 24,
         columns: 80,
       });
     assert_eq!(
-      request(&mut client, 5, HeadlessRequest::SessionRename {
+      request(&mut client, 10, HeadlessRequest::SessionRename {
         id: Some("headless".to_owned()),
         name: "renamed".to_owned(),
       },),
       Ok(HeadlessResult::Accepted)
     );
-    let workspaces = request(&mut client, 6, HeadlessRequest::WorkspaceList {
+    let workspaces = request(&mut client, 11, HeadlessRequest::WorkspaceList {
       session_id: Some("renamed".to_owned()),
     })
     .expect("list Workspaces after Session rename");
@@ -1995,7 +2031,7 @@ mod tests {
     assert_eq!(workspaces[0].id, "renamed:project");
     assert_eq!(read_state_with_session_name(&mut attached, "renamed").number, "renamed");
 
-    assert_eq!(request(&mut client, 7, HeadlessRequest::StopServer), Ok(HeadlessResult::Accepted));
+    assert_eq!(request(&mut client, 12, HeadlessRequest::StopServer), Ok(HeadlessResult::Accepted));
     drop(attached);
     drop(client);
     server

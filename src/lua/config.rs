@@ -66,6 +66,7 @@ impl Default for AppConfig {
 #[derive(Clone, Debug)]
 pub struct TabSnapshot {
   pub id: u64,
+  pub name: String,
   pub index: usize,
   pub title: String,
   pub selected: bool,
@@ -215,6 +216,7 @@ impl LuaConfig {
     for tab in &snapshot.tabs {
       let value = self.lua.create_table()?;
       value.set("id", tab.id)?;
+      value.set("name", tab.name.as_str())?;
       value.set("index", tab.index)?;
       value.set("title", tab.title.as_str())?;
       value.set("selected", tab.selected)?;
@@ -251,6 +253,7 @@ impl LuaConfig {
         for (tab_index, tab) in workspace.tabs.iter().enumerate() {
           let tab_value = self.lua.create_table()?;
           tab_value.set("id", tab.id)?;
+          tab_value.set("name", tab.name.as_str())?;
           tab_value.set("index", tab_index + 1)?;
           tab_value.set("title", tab.title.as_str())?;
           tab_value.set("selected", tab.id == workspace.active_tab_id)?;
@@ -1100,6 +1103,7 @@ mod tests {
       tabs: vec![
         TabSnapshot {
           id: 10,
+          name: "1".to_owned(),
           index: 1,
           title: "shell-one".to_owned(),
           selected: false,
@@ -1107,6 +1111,7 @@ mod tests {
         },
         TabSnapshot {
           id: 20,
+          name: "2".to_owned(),
           index: 2,
           title: "shell-two".to_owned(),
           selected: true,
@@ -1284,7 +1289,7 @@ mod tests {
   #[test]
   fn lua_receives_server_authoritative_session_and_workspace_state() {
     let config = load_config(
-            "cmd.event.on('tab_selected', function()\n  assert(g.session.number == '9')\n  assert(g.active_workspace.name == 'project')\n  assert(g.active_workspace.tabs[1].selected)\n  cmd.tab.next()\nend)",
+            "cmd.event.on('tab_selected', function()\n  assert(g.session.number == '9')\n  assert(g.active_workspace.name == 'project')\n  assert(g.active_workspace.tabs[1].selected)\n  assert(g.active_workspace.tabs[1].name == '2')\n  cmd.tab.next()\nend)",
         )
         .expect("session-aware callback config");
     let mut state = snapshot();
@@ -1298,6 +1303,7 @@ mod tests {
         working_directory: "/work/project".into(),
         tabs: vec![zmux::protocol::TabSnapshot {
           id: 20,
+          name: "2".to_owned(),
           title: "shell-two".to_owned(),
           exit_code: None,
         }],

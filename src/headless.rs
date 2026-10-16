@@ -118,7 +118,10 @@ pub fn run(
             id: reply_id,
             result,
           }) if reply_id == id => result,
-          Ok(other) => Err(format!("unexpected server response: {other:?}")),
+          Ok(other) => {
+            connection_open = false;
+            Err(format!("unexpected server response: {other:?}"))
+          }
           Err(error) => {
             connection_open = false;
             Err(format!("server connection failed before accepting command: {error}"))
