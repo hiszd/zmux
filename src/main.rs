@@ -105,7 +105,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
       arguments: script_arguments,
     } => {
       ensure_server(&endpoint)?;
-      headless::run(endpoint, &script, &script_arguments, path.unwrap_or(std::env::current_dir()?))
+      let path = path.unwrap_or(std::env::current_dir()?);
+      let path = if path.is_absolute() {
+        path
+      } else {
+        std::env::current_dir()?.join(path)
+      };
+      headless::run(endpoint, &script, &script_arguments, path)
     }
     command => run_admin_command(endpoint, command),
   }
@@ -512,15 +518,15 @@ mod tests {
   #[test]
   fn run_accepts_script_arguments_and_launch_options() {
     let options = parse_args(
-      ["run", "--path", "/work", "script.lua", "one", "two", "--socket", "named"]
+      ["run", "--path", "/work", "--socket", "named", "script.lua", "one", "two"]
         .map(str::to_owned)
         .into_iter(),
     )
     .expect("valid run command");
     assert!(
-      matches!(options.command, Command::Run { ref script, ref arguments, ref path } if script == "script.lua" && path.as_deref() == Some(std::path::Path::new("/work")) && arguments == &["one", "two", "--socket", "named"])
+      matches!(options.command, Command::Run { ref script, ref arguments, ref path } if script == "script.lua" && path.as_deref() == Some(std::path::Path::new("/work")) && arguments == &["one", "two"])
     );
-    assert_eq!(options.socket_instance, "default");
+    assert_eq!(options.socket_instance, "named");
   }
 
   #[test]

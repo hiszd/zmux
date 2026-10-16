@@ -43,6 +43,22 @@ cargo run -- server status --socket project
 cargo run -- server stop --socket project
 ```
 
+Run a Lua script against the Server without opening a TUI Client. Options precede the script; arguments after the script are available in Lua as `args[1]`, `args[2]`, and so on. `--path` supplies the launch directory used when a script creates a Session:
+
+```sh
+cargo run -- run --socket project --path /path/to/project script.lua first-arg second-arg
+```
+
+The script runs in a clean Lua environment and does not load `zmux.lua`. Its Server-owned operations use `cmd.session`, `cmd.workspace`, `cmd.tab`, and `cmd.server`; list calls accept callbacks. Selectors use qualified IDs (`session`, `session:workspace`, `session:workspace:tab`). Names cannot contain `:`. Workspace and Tab names omitted at creation use the first unused numeric sibling name; the initial Workspace defaults to the launch directory basename. For example:
+
+```lua
+cmd.session.create("project", { workspace_name = "main" })
+cmd.workspace.list("project", function(workspaces)
+    print(workspaces[1].id, workspaces[1].working_directory)
+end)
+cmd.server.stop()
+```
+
 The Server starts automatically in the background and remains alive while Sessions exist, including when all Clients detach. Sessions are ephemeral: stopping the Server destroys them. Unix-like systems use a socket under `$XDG_RUNTIME_DIR`, falling back to a private per-user runtime directory with a warning; Windows uses a user-scoped named pipe.
 
 ## Session model
@@ -53,7 +69,7 @@ The Server starts automatically in the background and remains alive while Sessio
 
 The left Workspace Drawer is always visible as a one-character rail. A configured binding expands it to show full names and take focus; arrows move the temporary highlight, Enter switches the shared active Workspace and collapses the Drawer, and Escape collapses without switching. The Drawer overlays the terminal view and does not resize PTYs. Shared PTYs use the largest attached Client pane dimensions; each Client renders the shared screen in its own viewport.
 
-Workspace creation and editing use a directory selector and optional name field. Tab moves to the name field; leaving it blank derives the name from the selected directory. Creating a Workspace starts a Tab there and activates the Workspace. The sample config binds Drawer toggle, Workspace creation/editing, and tab navigation; additional commands can be bound in `zmux.lua`.
+Workspace creation and editing use a directory selector and optional name field. Tab moves to the name field; an omitted name receives the first unused numeric sibling name. The initial Workspace of a Session defaults to the launch directory basename. Creating a Workspace starts a Tab there and activates the Workspace. The sample config binds Drawer toggle, Workspace creation/editing, and tab navigation; additional commands can be bound in `zmux.lua`.
 
 ## Lua configuration
 

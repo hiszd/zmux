@@ -91,8 +91,6 @@ impl Session {
 
   pub fn workspaces(&self) -> &[Workspace] { &self.workspaces }
 
-  pub fn workspaces_mut(&mut self) -> &mut [Workspace] { &mut self.workspaces }
-
   pub const fn active_workspace_id(&self) -> Option<WorkspaceId> { self.active_workspace }
 
   pub fn active_workspace(&self) -> Option<&Workspace> {

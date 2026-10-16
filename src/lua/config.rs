@@ -287,6 +287,7 @@ impl LuaConfig {
       self.globals.set("active_workspace", mlua::Value::Nil)?;
       mlua::Value::Nil
     };
+    self.globals.set("mode", "tui")?;
     self.globals.set("session", session_value)?;
     self
       .globals

@@ -72,11 +72,17 @@ pub fn run(
   g.set("active_workspace", Value::Nil)?;
   g.set("active_tab", Value::Nil)?;
   g.set("last_error", Value::Nil)?;
+  g.set("mode", "headless")?;
   lua.globals().set("g", g.clone())?;
-  lua.globals().set("global", g)?;
+  lua.globals().set("global", g.clone())?;
 
   register_commands(&lua, &session, &workspace, &tab, &server, &queue)?;
-  lua.load(source).set_name(script.to_string_lossy()).exec()?;
+  let mut failed = false;
+  if let Err(error) = lua.load(source).set_name(script.to_string_lossy()).exec() {
+    eprintln!("zmux run: {error}");
+    g.set("last_error", error.to_string())?;
+    failed = true;
+  }
 
   let mut stream = transport::connect(&endpoint)?;
   write_frame(
@@ -92,37 +98,56 @@ pub fn run(
   )?;
 
   let mut next_id = 1_u64;
-  let mut failed = false;
-  while let Some(mut pending) = queue.borrow_mut().pop_front() {
-    let id = next_id;
-    next_id = next_id
-      .checked_add(1)
-      .ok_or("headless request identifier exhausted")?;
-    write_frame(&mut stream, &ClientMessage::HeadlessRequest {
-      id,
-      request: pending.request,
-    })?;
-    let message: ServerMessage = read_frame(&mut stream)?;
-    let result = match message {
-      ServerMessage::HeadlessReply {
-        id: reply_id,
-        result,
-      } if reply_id == id => result,
-      ServerMessage::ServerStopping => Ok(HeadlessResult::Accepted),
-      other => Err(format!("unexpected server response: {other:?}")),
+  let mut connection_open = true;
+  loop {
+    let pending = queue.borrow_mut().pop_front();
+    let Some(mut pending) = pending else {
+      break;
+    };
+    let result = if connection_open {
+      let id = next_id;
+      next_id = next_id
+        .checked_add(1)
+        .ok_or("headless request identifier exhausted")?;
+      match write_frame(&mut stream, &ClientMessage::HeadlessRequest {
+        id,
+        request: pending.request,
+      }) {
+        Ok(()) => match read_frame::<_, ServerMessage>(&mut stream) {
+          Ok(ServerMessage::HeadlessReply {
+            id: reply_id,
+            result,
+          }) if reply_id == id => result,
+          Ok(other) => Err(format!("unexpected server response: {other:?}")),
+          Err(error) => {
+            connection_open = false;
+            Err(format!("server connection failed before accepting command: {error}"))
+          }
+        },
+        Err(error) => {
+          connection_open = false;
+          Err(format!("server connection failed before accepting command: {error}"))
+        }
+      }
+    } else {
+      Err("server connection closed before command was accepted".to_owned())
     };
     match result {
       Ok(value) => {
+        g.set("last_error", Value::Nil)?;
         if let Some(callback) = pending.callback.take() {
           let lua_value = result_to_lua(&lua, value)?;
           if let Err(error) = callback.call::<()>(lua_value) {
-            eprintln!("zmux run: {error}");
+            let message = error.to_string();
+            eprintln!("zmux run: {message}");
+            g.set("last_error", message)?;
             failed = true;
           }
         }
       }
       Err(error) => {
         eprintln!("zmux run: {error}");
+        g.set("last_error", error)?;
         failed = true;
       }
     }
