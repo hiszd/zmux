@@ -49,6 +49,8 @@
 ---@field terminal ZmuxTerminalState Current outer terminal dimensions.
 
 ---@alias ZmuxEventName
+---| "PreClient"
+---| "ClientLoaded"
 ---| "session_created"
 ---| "session_selected"
 ---| "session_closed"
@@ -81,8 +83,11 @@
 ---@class ZmuxKeymapOptions
 ---@field desc? string Short description shown in the key-sequence popup.
 
+---@class ZmuxEventOptions
+---@field interrupt? boolean For PreClient, wait for built-in interactive work requested by this handler before continuing startup.
+
 ---@class ZmuxEventApi
----@field on fun(name: ZmuxEventName, callback: fun(event: ZmuxEvent)) Register a callback for an application event.
+---@field on fun(name: ZmuxEventName, callback: fun(event: ZmuxEvent), opts?: ZmuxEventOptions) Register a callback for an application event.
 
 ---@alias ZmuxPickerItem string|{label?: string, text?: string, value?: any}
 
@@ -105,6 +110,7 @@
 
 ---@class ZmuxSessionApi
 ---@field kill fun() Kill the current Session.
+---@field switch fun() Open the Session picker.
 
 ---@class ZmuxWorkspaceApi
 ---@field create fun() Open the Workspace creation dialog.
@@ -120,6 +126,14 @@
 ---@field next fun() Request selection of the next Tab.
 ---@field previous fun() Request selection of the previous Tab.
 ---@field select fun(index: integer) Request selection of a one-based Tab index.
+
+---@class ZmuxLaunchState
+---@field command string Original CLI subcommand (informational; changing it does not change dispatch).
+---@field session? string Session selected for the Client; set this during PreClient to change the target.
+---@field create_if_missing boolean Whether a missing named Session should be created.
+---@field fail_if_exists boolean Whether startup should fail when the named Session already exists.
+---@field require_session boolean Whether startup requires an existing selected Session.
+---@field working_directory string Working directory used when creating a Session.
 
 ---@class ZmuxCommandApi
 ---@field key ZmuxKeyApi
@@ -192,6 +206,12 @@ g = {}
 
 ---@type ZmuxGlobalState
 global = g
+
+---@type string[] Raw command-line arguments passed to zmux, excluding the executable name.
+args = {}
+
+---@type ZmuxLaunchState
+launch = {}
 
 ---@class ZmuxInfoApi
 ---@type ZmuxInfoApi

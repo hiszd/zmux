@@ -35,6 +35,7 @@
 use std::{
   collections::{
     HashMap,
+    HashSet,
     VecDeque,
   },
   io,
@@ -152,10 +153,8 @@ const SHUTDOWN_DELAY: Duration = Duration::from_millis(200);
 /// the event loop are propagated to the caller.
 pub fn run(
   endpoint: Endpoint,
-  session_name: Option<String>,
-  create_if_missing: bool,
-  fail_if_exists: bool,
-  working_directory: PathBuf,
+  launch: lua::LaunchState,
+  startup_commands: Vec<RuntimeCommand>,
   config: lua::AppConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
   let size = crossterm::terminal::size()?;
@@ -167,10 +166,10 @@ pub fn run(
   };
   let connection = connect(
     &endpoint,
-    session_name.clone(),
-    create_if_missing,
-    fail_if_exists,
-    working_directory,
+    launch.session_name.clone(),
+    launch.create_if_missing,
+    launch.fail_if_exists,
+    launch.working_directory.clone(),
     viewport,
     config.default_shell.as_deref(),
   )?;
@@ -192,7 +191,10 @@ pub fn run(
     request_sender,
     ClientSession::new(connection.session, connection.terminals, viewport),
     connection.client_id,
-    session_name.is_none(),
+    ClientStartup {
+      created_session: launch.session_name.is_none(),
+      commands: startup_commands,
+    },
   );
 
   trace.mark("shutdown-event-loop-returned");
@@ -210,21 +212,102 @@ pub fn run(
   result
 }
 
-/// Opens the pre-connection session picker and returns the selected session.
+/// Runs startup handlers before connecting the interactive client.
 ///
-/// The picker uses an administrative connection, so the client is not attached
-/// to a session until the user makes a selection. A missing server and an empty
-/// session set are both reported as the same user-facing condition.
-pub fn choose_session(
+/// Interrupt handlers may use built-in pickers, which are completed before the
+/// next handler runs. Other runtime commands are returned for execution against
+/// the initialized client before its first frame is rendered.
+pub fn run_pre_client(
   endpoint: &Endpoint,
-  cursor_shape: ui::CursorShape,
-) -> Result<Option<String>, Box<dyn std::error::Error>> {
-  let mut stream = match transport::connect(endpoint) {
-    Ok(stream) => stream,
-    Err(_) => {
-      println!("no active sessions");
-      return Ok(None);
+  config: &lua::AppConfig,
+) -> Result<(lua::LaunchState, Vec<RuntimeCommand>), Box<dyn std::error::Error>> {
+  run_pre_client_with_picker(endpoint, config, run_builtin_picker)
+}
+
+fn run_pre_client_with_picker(
+  endpoint: &Endpoint,
+  config: &lua::AppConfig,
+  mut pick: impl FnMut(
+    &str,
+    &[String],
+    &str,
+    ui::CursorShape,
+  ) -> Result<Option<usize>, Box<dyn std::error::Error>>,
+) -> Result<(lua::LaunchState, Vec<RuntimeCommand>), Box<dyn std::error::Error>> {
+  let mut deferred = Vec::new();
+  let mut session_picker_used = false;
+  for handler in config.lua.event_handlers("PreClient") {
+    let commands = config.lua.invoke_event_handler(&handler, &UiEvent {
+      name: "PreClient".to_owned(),
+      ..UiEvent::default()
+    })?;
+    let mut pending: VecDeque<_> = commands.into();
+    while let Some(command) = pending.pop_front() {
+      match command {
+        RuntimeCommand::OpenPicker(id) if handler.interrupt => {
+          let labels = config.lua.picker_labels(id).unwrap_or_default();
+          let selected = pick(
+            "Choose",
+            &labels,
+            "Arrows: move  Enter: select  Esc: cancel",
+            config.cursor_shape,
+          )?;
+          let completion = config.lua.complete_picker(id, selected)?;
+          for command in completion.into_iter().rev() {
+            pending.push_front(command);
+          }
+        }
+        RuntimeCommand::OpenSessionPicker => {
+          let launch = config.lua.launch_state()?;
+          if handler.interrupt || (launch.require_session && launch.session_name.is_none()) {
+            session_picker_used = true;
+            let sessions = list_sessions(endpoint)?;
+            let names: Vec<_> = sessions
+              .iter()
+              .map(|session| session.number.clone())
+              .collect();
+            let selected = pick(
+              "Switch Session",
+              &names,
+              "Arrows: move  Enter: select  Esc: cancel",
+              config.cursor_shape,
+            )?;
+            if let Some(session) = selected.and_then(|index| names.get(index)) {
+              config.lua.set_launch_session(Some(session))?;
+            }
+          } else {
+            deferred.push(RuntimeCommand::OpenSessionPicker);
+          }
+        }
+        command => deferred.push(command),
+      }
     }
+  }
+
+  let mut launch = config.lua.launch_state()?;
+  if launch.require_session && launch.session_name.is_none() && !session_picker_used {
+    let sessions = list_sessions(endpoint)?;
+    let names: Vec<_> = sessions
+      .iter()
+      .map(|session| session.number.clone())
+      .collect();
+    let selected = pick(
+      "Attach to Session",
+      &names,
+      "Arrows: move  Enter: attach  Esc: cancel",
+      config.cursor_shape,
+    )?;
+    if let Some(session) = selected.and_then(|index| names.get(index)) {
+      config.lua.set_launch_session(Some(session))?;
+      launch = config.lua.launch_state()?;
+    }
+  }
+  Ok((launch, deferred))
+}
+
+fn list_sessions(endpoint: &Endpoint) -> Result<Vec<SessionSummary>, Box<dyn std::error::Error>> {
+  let Ok(mut stream) = transport::connect(endpoint) else {
+    return Ok(Vec::new());
   };
   write_frame(&mut stream, &ClientMessage::Admin(AdminRequest::ListSessions))?;
   let ServerMessage::AdminResult { result } = read_frame(&mut stream)? else {
@@ -233,35 +316,33 @@ pub fn choose_session(
   let AdminResponse::Sessions(sessions) = result? else {
     return Err("server returned an unexpected administrative response".into());
   };
-  if sessions.is_empty() {
-    println!("no active sessions");
+  Ok(sessions)
+}
+
+fn run_builtin_picker(
+  title: &str,
+  labels: &[String],
+  footer: &str,
+  cursor_shape: ui::CursorShape,
+) -> Result<Option<usize>, Box<dyn std::error::Error>> {
+  if labels.is_empty() {
     return Ok(None);
   }
-
   let _terminal_mode = TerminalModeGuard::enter(cursor_shape)?;
   let backend = CrosstermBackend::new(io::stdout());
   let mut terminal = Terminal::new(backend)?;
   let mut query = String::new();
   let mut highlighted = 0;
   loop {
-    let visible = session_picker_visible_indices(&query, &sessions);
+    let visible = zmux::picker::fuzzy_filter(&query, labels);
     highlighted = highlighted.min(visible.len().saturating_sub(1));
-    let labels: Vec<String> = sessions
-      .iter()
-      .map(|session| {
-        format!(
-          "{}  ({} clients, {} workspaces, {} tabs)",
-          session.number, session.clients, session.workspaces, session.tabs
-        )
-      })
-      .collect();
     let rows: Vec<String> = visible.iter().map(|index| labels[*index].clone()).collect();
     let modal = ui::ModalOverlay {
-      title: "Attach to Session",
+      title,
       query: Some(&query),
       rows: &rows,
       selected_row: (!rows.is_empty()).then_some(highlighted),
-      footer: "Arrows: move  Enter: attach  Esc: cancel",
+      footer,
     };
     terminal.draw(|frame| frame.render_widget(&modal, frame.area()))?;
 
@@ -271,7 +352,7 @@ pub fn choose_session(
           KeyCode::Esc => return Ok(None),
           KeyCode::Enter => {
             if let Some(index) = visible.get(highlighted) {
-              return Ok(Some(sessions[*index].number.clone()));
+              return Ok(Some(*index));
             }
           }
           KeyCode::Up if !visible.is_empty() => {
@@ -961,6 +1042,10 @@ struct Effects {
   redraw: bool,
   /// Application events to deliver to Lua handlers.
   events: Vec<UiEvent>,
+  /// Runtime commands waiting to be applied.
+  commands: Vec<RuntimeCommand>,
+  /// Server request IDs that must complete before the startup screen is shown.
+  awaited_requests: Vec<u64>,
   /// Terminal responses that must be forwarded to the server PTY.
   inputs: Vec<(u64, Vec<u8>)>,
 }
@@ -971,6 +1056,8 @@ impl Effects {
     self.quit |= other.quit;
     self.redraw |= other.redraw;
     self.events.append(&mut other.events);
+    self.commands.append(&mut other.commands);
+    self.awaited_requests.append(&mut other.awaited_requests);
     self.inputs.append(&mut other.inputs);
   }
 }
@@ -1076,6 +1163,11 @@ fn initial_session_events(session: &SessionSnapshot, created: bool) -> Vec<UiEve
   events
 }
 
+struct ClientStartup {
+  created_session: bool,
+  commands: Vec<RuntimeCommand>,
+}
+
 /// Runs the demand-driven client event and render loop.
 ///
 /// The loop renders once when `needs_draw` is set, then waits for input or
@@ -1093,7 +1185,7 @@ fn run_event_loop(
   sender: Sender<ClientMessage>,
   mut session: ClientSession,
   client_id: u64,
-  created_session: bool,
+  startup: ClientStartup,
 ) -> Result<(), Box<dyn std::error::Error>> {
   let trace = Trace::from_environment();
   trace.mark("client-attached");
@@ -1108,10 +1200,11 @@ fn run_event_loop(
   let mut next_request_id = 1;
   let mut dispatcher =
     KeyDispatcher::new(config.prefix_key, config.sequence_timeout, config.keymap);
-  let initial_events = initial_session_events(&session.snapshot, created_session);
-  let startup = dispatch_ui_events(
+  let initial_events = initial_session_events(&session.snapshot, startup.created_session);
+  let mut startup_effects = dispatch_ui_events(
     Effects {
       events: initial_events,
+      commands: startup.commands,
       ..Effects::default()
     },
     &mut ClientContext {
@@ -1125,14 +1218,44 @@ fn run_event_loop(
       trace: &trace,
     },
   )?;
-  if startup.quit {
+  if startup_effects.quit {
     trace.flush();
     return Ok(());
   }
-  let mut needs_draw = true;
+  let mut startup_requests: HashSet<u64> =
+    startup_effects.awaited_requests.iter().copied().collect();
+  let mut client_loaded = false;
+  if startup_requests.is_empty() {
+    let loaded = dispatch_ui_events(
+      Effects {
+        events: vec![UiEvent {
+          name: "ClientLoaded".to_owned(),
+          ..UiEvent::default()
+        }],
+        ..Effects::default()
+      },
+      &mut ClientContext {
+        session: &mut session,
+        outer_size: &mut outer_size,
+        viewport: &mut viewport,
+        dispatcher: &mut dispatcher,
+        sender: &sender,
+        next_request_id: &mut next_request_id,
+        lua: &config.lua,
+        trace: &trace,
+      },
+    )?;
+    startup_requests.extend(loaded.awaited_requests.iter().copied());
+    startup_effects.merge(loaded);
+    client_loaded = true;
+  }
+  let mut needs_draw = client_loaded && startup_requests.is_empty();
   let mut last_draw = Instant::now();
 
   'event_loop: loop {
+    if !client_loaded || !startup_requests.is_empty() {
+      needs_draw = false;
+    }
     if needs_draw {
       let size = terminal.size()?;
       outer_size = (size.width, size.height);
@@ -1264,18 +1387,24 @@ fn run_event_loop(
           lua: &config.lua,
           trace: &trace,
         })?;
-        needs_draw |= effects.redraw;
+        if !client_loaded || !startup_requests.is_empty() {
+          startup_requests.extend(effects.awaited_requests.iter().copied());
+        }
+        needs_draw |= effects.redraw && client_loaded && startup_requests.is_empty();
         if effects.quit {
           break 'event_loop;
         }
       }
       Ok(ClientEvent::Server(message)) => {
+        if let ServerMessage::Reply { id, .. } = &message {
+          startup_requests.remove(id);
+        }
         let mut effects = handle_server_message(message, &mut session);
         for (tab_id, input) in &effects.inputs {
           let _ = tab_id;
           send_request(&sender, &mut next_request_id, ClientRequest::Input(input.clone()))?;
         }
-        if !effects.events.is_empty() {
+        if !effects.events.is_empty() || !effects.commands.is_empty() {
           effects = dispatch_ui_events(effects, &mut ClientContext {
             session: &mut session,
             outer_size: &mut outer_size,
@@ -1287,7 +1416,35 @@ fn run_event_loop(
             trace: &trace,
           })?;
         }
-        needs_draw |= effects.redraw;
+        if !client_loaded || !startup_requests.is_empty() {
+          startup_requests.extend(effects.awaited_requests.iter().copied());
+        }
+        if !client_loaded && startup_requests.is_empty() {
+          let loaded = dispatch_ui_events(
+            Effects {
+              events: vec![UiEvent {
+                name: "ClientLoaded".to_owned(),
+                ..UiEvent::default()
+              }],
+              ..Effects::default()
+            },
+            &mut ClientContext {
+              session: &mut session,
+              outer_size: &mut outer_size,
+              viewport: &mut viewport,
+              dispatcher: &mut dispatcher,
+              sender: &sender,
+              next_request_id: &mut next_request_id,
+              lua: &config.lua,
+              trace: &trace,
+            },
+          )?;
+          startup_requests.extend(loaded.awaited_requests.iter().copied());
+          effects.merge(loaded);
+          client_loaded = true;
+          needs_draw = startup_requests.is_empty();
+        }
+        needs_draw |= effects.redraw && client_loaded && startup_requests.is_empty();
         if effects.quit {
           break 'event_loop;
         }
@@ -2396,9 +2553,27 @@ fn send_request(
   next_id: &mut u64,
   request: ClientRequest,
 ) -> Result<(), Box<dyn std::error::Error>> {
+  send_request_with_id(sender, next_id, request).map(|_| ())
+}
+
+fn send_request_with_id(
+  sender: &Sender<ClientMessage>,
+  next_id: &mut u64,
+  request: ClientRequest,
+) -> Result<u64, Box<dyn std::error::Error>> {
   let id = *next_id;
   *next_id = next_id.saturating_add(1);
   sender.send(ClientMessage::Request { id, request })?;
+  Ok(id)
+}
+
+fn send_tracked_request(
+  context: &mut ClientContext<'_>,
+  effects: &mut Effects,
+  request: ClientRequest,
+) -> Result<(), Box<dyn std::error::Error>> {
+  let id = send_request_with_id(context.sender, context.next_request_id, request)?;
+  effects.awaited_requests.push(id);
   Ok(())
 }
 
@@ -2413,6 +2588,8 @@ fn dispatch_ui_events(
   context: &mut ClientContext<'_>,
 ) -> Result<Effects, Box<dyn std::error::Error>> {
   let mut effects = effects;
+  let commands = std::mem::take(&mut effects.commands);
+  effects.merge(execute_runtime_commands(commands, context)?);
   let mut pending: VecDeque<_> = effects.events.drain(..).collect();
   let mut dispatched = 0;
   while let Some(event) = pending.pop_front() {
@@ -2441,11 +2618,7 @@ fn dispatch_ui_events(
       if next_viewport != *context.viewport {
         *context.viewport = next_viewport;
         context.session.resize(next_viewport);
-        send_request(
-          context.sender,
-          context.next_request_id,
-          ClientRequest::Resize(next_viewport),
-        )?;
+        send_tracked_request(context, &mut effects, ClientRequest::Resize(next_viewport))?;
         effects.redraw = true;
       }
       effects.merge(execute_runtime_commands(commands, context)?);
@@ -2490,7 +2663,7 @@ fn execute_runtime_commands(
           query: String::new(),
           highlighted: 0,
         });
-        send_request(context.sender, context.next_request_id, ClientRequest::ListSessions)?;
+        send_tracked_request(context, &mut effects, ClientRequest::ListSessions)?;
         effects.redraw = true;
       }
       RuntimeCommand::ToggleWorkspaceDrawer => {
@@ -2521,44 +2694,42 @@ fn execute_runtime_commands(
           } else {
             (current + workspaces.len() - 1) % workspaces.len()
           };
-          send_request(
-            context.sender,
-            context.next_request_id,
+          send_tracked_request(
+            context,
+            &mut effects,
             ClientRequest::SelectWorkspace(workspaces[next].id),
           )?;
         }
       }
       RuntimeCommand::SelectWorkspace(id) => {
-        send_request(context.sender, context.next_request_id, ClientRequest::SelectWorkspace(id))?;
+        send_tracked_request(context, &mut effects, ClientRequest::SelectWorkspace(id))?;
       }
       RuntimeCommand::CloseWorkspace => {
-        send_request(context.sender, context.next_request_id, ClientRequest::CloseWorkspace)?;
+        send_tracked_request(context, &mut effects, ClientRequest::CloseWorkspace)?;
       }
       RuntimeCommand::Detach => {
-        send_request(context.sender, context.next_request_id, ClientRequest::Detach)?;
+        send_tracked_request(context, &mut effects, ClientRequest::Detach)?;
         effects.quit = true;
       }
       RuntimeCommand::KillSession => {
-        send_request(context.sender, context.next_request_id, ClientRequest::KillSession)?
+        send_tracked_request(context, &mut effects, ClientRequest::KillSession)?
       }
       RuntimeCommand::StopServer => {
-        send_request(context.sender, context.next_request_id, ClientRequest::StopServer)?;
+        send_tracked_request(context, &mut effects, ClientRequest::StopServer)?;
         effects.quit = true;
       }
-      RuntimeCommand::NewTab => {
-        send_request(context.sender, context.next_request_id, ClientRequest::NewTab)?
-      }
+      RuntimeCommand::NewTab => send_tracked_request(context, &mut effects, ClientRequest::NewTab)?,
       RuntimeCommand::CloseTab => {
-        send_request(context.sender, context.next_request_id, ClientRequest::CloseTab)?
+        send_tracked_request(context, &mut effects, ClientRequest::CloseTab)?
       }
       RuntimeCommand::NextTab => {
-        send_request(context.sender, context.next_request_id, ClientRequest::NextTab)?
+        send_tracked_request(context, &mut effects, ClientRequest::NextTab)?
       }
       RuntimeCommand::PreviousTab => {
-        send_request(context.sender, context.next_request_id, ClientRequest::PreviousTab)?
+        send_tracked_request(context, &mut effects, ClientRequest::PreviousTab)?
       }
       RuntimeCommand::SelectTab(index) => {
-        send_request(context.sender, context.next_request_id, ClientRequest::SelectTab(index))?
+        send_tracked_request(context, &mut effects, ClientRequest::SelectTab(index))?
       }
     }
   }
@@ -2586,9 +2757,12 @@ fn render_bars(lua: &LuaConfig) -> mlua::Result<ui::BarContents> {
 
 #[cfg(test)]
 mod tests {
-  use zmux::protocol::{
-    SessionSummary,
-    TerminalSnapshot,
+  use zmux::{
+    protocol::{
+      SessionSummary,
+      TerminalSnapshot,
+    },
+    transport::Endpoint,
   };
 
   use super::{
@@ -2597,8 +2771,84 @@ mod tests {
     WorkspaceDialog,
     WorkspaceDialogMode,
     WorkspaceField,
+    run_pre_client,
+    run_pre_client_with_picker,
     session_picker_visible_indices,
   };
+  use crate::lua::{
+    self,
+    LaunchState,
+    RuntimeCommand,
+  };
+
+  #[test]
+  fn pre_client_runs_handlers_and_returns_commands_for_client_initialization() {
+    let config = lua::load_config_with_context(
+      r#"
+            cmd.event.on("PreClient", function()
+                assert(args[1] == "attach")
+                launch.session = "replacement"
+                cmd.tab.create()
+            end)
+            "#,
+      &["attach".to_owned(), "original".to_owned()],
+      LaunchState {
+        command: "attach".to_owned(),
+        session_name: Some("original".to_owned()),
+        create_if_missing: false,
+        fail_if_exists: false,
+        require_session: true,
+        working_directory: "/work".into(),
+      },
+    )
+    .expect("startup config");
+    let endpoint = Endpoint::new(Some("pre-client-test")).expect("test endpoint");
+
+    let (launch, commands) = run_pre_client(&endpoint, &config).expect("run PreClient");
+
+    assert_eq!(launch.session_name.as_deref(), Some("replacement"));
+    assert_eq!(commands, vec![RuntimeCommand::NewTab]);
+  }
+
+  #[test]
+  fn interrupt_picker_finishes_before_later_pre_client_handlers_run() {
+    let config = lua::load_config_with_context(
+      r#"
+            cmd.event.on("PreClient", function()
+                cmd.ui.pick({"alpha"}, function(selected)
+                    launch.session = selected
+                end)
+            end, { interrupt = true })
+            cmd.event.on("PreClient", function()
+                assert(launch.session == "alpha")
+                cmd.tab.create()
+            end)
+            "#,
+      &["new".to_owned()],
+      LaunchState {
+        command: "new".to_owned(),
+        session_name: None,
+        create_if_missing: true,
+        fail_if_exists: false,
+        require_session: false,
+        working_directory: "/work".into(),
+      },
+    )
+    .expect("interrupt startup config");
+    let endpoint = Endpoint::new(Some("pre-client-interrupt-test")).expect("test endpoint");
+    let mut picker_calls = 0;
+
+    let (launch, commands) = run_pre_client_with_picker(&endpoint, &config, |_, labels, _, _| {
+      picker_calls += 1;
+      assert_eq!(labels, &["alpha"]);
+      Ok(Some(0))
+    })
+    .expect("run interrupt handler");
+
+    assert_eq!(picker_calls, 1);
+    assert_eq!(launch.session_name.as_deref(), Some("alpha"));
+    assert_eq!(commands, vec![RuntimeCommand::NewTab]);
+  }
 
   #[test]
   fn session_picker_filters_by_session_name_not_metadata() {

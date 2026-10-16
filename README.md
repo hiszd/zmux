@@ -61,6 +61,20 @@ The default configuration is `./zmux.lua`; set `ZMUX_CONFIG` to load another fil
 
 Commands are registered under `cmd`, options under `opt`, and Rust supplies the server-authoritative `g`/`global` snapshot. Register event handlers with `cmd.event.on`; commands requested by key and event callbacks are applied after the callback returns. The generic fuzzy picker is `cmd.ui.pick(items, callback)`: it calls back with the selected item on Enter or `nil` on Escape.
 
+Startup customization uses two lifecycle events. `PreClient` runs before connecting and showing the interactive Client; the raw command-line arguments are available in `args`, and mutable launch settings are in `launch`. For example, `launch.session` selects the Session to attach to. Mark a `PreClient` handler with `{ interrupt = true }` when startup must wait for its built-in interactive work, such as `cmd.ui.pick` or `cmd.session.switch()`. Other runtime commands from `PreClient` are applied in order after the selected Session is connected and before the first normal frame. `ClientLoaded` runs after those startup commands have settled and before that first frame.
+
+```lua
+cmd.event.on("PreClient", function()
+    if args[1] == "list" then
+        cmd.session.switch()
+    end
+end, { interrupt = true })
+
+cmd.event.on("ClientLoaded", function()
+    -- Client state is available through g; ordinary runtime commands work here.
+end)
+```
+
 Key bindings use neovim-style notation and Lua callbacks: `cmd.key.bind('tw', function() cmd.tab.close() end, { desc = 'Close the focused tab' })`. Pass `nil` as the callback to unbind a sequence. Bindings are entered after the required prefix (`opt.prefix_key`, default `<C-Space>`); multi-key sequences are supported and `opt.sequence_timeout_ms` defaults to 700 ms; set it to `0` to disable leader/sequence timeouts. Completing a binding exits leader mode, including when timeouts are disabled; an unbound key also exits leader mode and shows a yellow warning. `<Esc>` cannot be bound because it is reserved for cancellation. When a sequence has continuations, zmux displays a bottom-anchored, full-width which-key popup. Unknown keys and callback errors appear briefly in yellow at the bottom right.
 
 ## Tracing

@@ -47,6 +47,16 @@ pub struct AppConfig {
   pub lua: LuaConfig,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LaunchState {
+  pub command: String,
+  pub session_name: Option<String>,
+  pub create_if_missing: bool,
+  pub fail_if_exists: bool,
+  pub require_session: bool,
+  pub working_directory: PathBuf,
+}
+
 impl Default for AppConfig {
   fn default() -> Self {
     load_config(include_str!("../../zmux.lua")).expect("built-in Lua defaults are valid")
@@ -165,7 +175,16 @@ pub struct BarSegment {
   pub style: Option<Style>,
 }
 
-pub struct LuaCallback(Function);
+pub struct LuaCallback {
+  function: Function,
+  pub interrupt: bool,
+}
+
+#[derive(Clone)]
+struct RegisteredCallback {
+  function: Function,
+  interrupt: bool,
+}
 
 struct PendingPicker {
   labels: Vec<String>,
@@ -178,10 +197,11 @@ pub struct LuaConfig {
   options: Table,
   globals: Table,
   snapshot: RefCell<AppSnapshot>,
-  handlers: Rc<RefCell<HashMap<String, Vec<Function>>>>,
+  handlers: Rc<RefCell<HashMap<String, Vec<RegisteredCallback>>>>,
   commands: Rc<RefCell<VecDeque<RuntimeCommand>>>,
   in_event_callback: Rc<Cell<bool>>,
   pending_pickers: Rc<RefCell<HashMap<u64, PendingPicker>>>,
+  launch: Table,
 }
 
 impl LuaConfig {
@@ -284,8 +304,27 @@ impl LuaConfig {
       .cloned()
       .unwrap_or_default()
       .into_iter()
-      .map(LuaCallback)
+      .map(|handler| LuaCallback {
+        function: handler.function,
+        interrupt: handler.interrupt,
+      })
       .collect()
+  }
+
+  pub fn set_launch_session(&self, session_name: Option<&str>) -> LuaResult<()> {
+    self.launch.set("session", session_name)?;
+    Ok(())
+  }
+
+  pub fn launch_state(&self) -> LuaResult<LaunchState> {
+    Ok(LaunchState {
+      command: self.launch.get("command")?,
+      session_name: self.launch.get("session")?,
+      create_if_missing: self.launch.get("create_if_missing")?,
+      fail_if_exists: self.launch.get("fail_if_exists")?,
+      require_session: self.launch.get("require_session")?,
+      working_directory: PathBuf::from(self.launch.get::<String>("working_directory")?),
+    })
   }
 
   pub fn invoke_event_handler(
@@ -294,7 +333,7 @@ impl LuaConfig {
     event: &AppEvent,
   ) -> LuaResult<Vec<RuntimeCommand>> {
     let value = self.event_value(event)?;
-    self.invoke_callback(&callback.0, value)
+    self.invoke_callback(&callback.function, value)
   }
 
   pub fn invoke_key_callback(&self, callback: &Function) -> LuaResult<Vec<RuntimeCommand>> {
@@ -637,9 +676,17 @@ fn parse_color(value: Value) -> LuaResult<Color> {
 }
 
 pub fn load_config(source: &str) -> LuaResult<AppConfig> {
+  load_config_with_context(source, &[], LaunchState::default())
+}
+
+pub fn load_config_with_context(
+  source: &str,
+  arguments: &[String],
+  initial_launch: LaunchState,
+) -> LuaResult<AppConfig> {
   let lua = Lua::new();
   let keymap = Rc::new(RefCell::new(KeyMap::default()));
-  let handlers = Rc::new(RefCell::new(HashMap::<String, Vec<Function>>::new()));
+  let handlers = Rc::new(RefCell::new(HashMap::<String, Vec<RegisteredCallback>>::new()));
   let commands = Rc::new(RefCell::new(VecDeque::<RuntimeCommand>::new()));
   let in_event_callback = Rc::new(Cell::new(false));
   let pending_pickers = Rc::new(RefCell::new(HashMap::<u64, PendingPicker>::new()));
@@ -649,6 +696,19 @@ pub fn load_config(source: &str) -> LuaResult<AppConfig> {
   lua.globals().set("g", globals.clone())?;
   lua.globals().set("global", globals.clone())?;
   lua.globals().set("inf", lua.create_table()?)?;
+  let arguments_table = lua.create_table_with_capacity(arguments.len(), 0)?;
+  for (index, argument) in arguments.iter().enumerate() {
+    arguments_table.set(index + 1, argument.as_str())?;
+  }
+  lua.globals().set("args", arguments_table)?;
+  let launch = lua.create_table()?;
+  launch.set("command", initial_launch.command)?;
+  launch.set("session", initial_launch.session_name)?;
+  launch.set("create_if_missing", initial_launch.create_if_missing)?;
+  launch.set("fail_if_exists", initial_launch.fail_if_exists)?;
+  launch.set("require_session", initial_launch.require_session)?;
+  launch.set("working_directory", initial_launch.working_directory.to_string_lossy().as_ref())?;
+  lua.globals().set("launch", launch.clone())?;
 
   let bind = {
     let keymap = Rc::clone(&keymap);
@@ -680,22 +740,32 @@ pub fn load_config(source: &str) -> LuaResult<AppConfig> {
   let on = {
     let handlers = Rc::clone(&handlers);
     let config_loading = Rc::clone(&config_loading);
-    lua.create_function(move |_, (name, callback): (String, Function)| {
-      if !config_loading.get() {
-        return Err(mlua::Error::external(
-          "cmd.event.on is only available while loading configuration",
-        ));
-      }
-      if !valid_event_name(&name) {
-        return Err(mlua::Error::external(format!("unknown event: {name}")));
-      }
-      handlers
-        .borrow_mut()
-        .entry(name)
-        .or_default()
-        .push(callback);
-      Ok(())
-    })?
+    lua.create_function(
+      move |_, (name, callback, options): (String, Function, Option<Table>)| {
+        if !config_loading.get() {
+          return Err(mlua::Error::external(
+            "cmd.event.on is only available while loading configuration",
+          ));
+        }
+        if !valid_event_name(&name) {
+          return Err(mlua::Error::external(format!("unknown event: {name}")));
+        }
+        let interrupt = options
+          .map(|options| options.get::<Option<bool>>("interrupt"))
+          .transpose()?
+          .flatten()
+          .unwrap_or(false);
+        handlers
+          .borrow_mut()
+          .entry(name)
+          .or_default()
+          .push(RegisteredCallback {
+            function: callback,
+            interrupt,
+          });
+        Ok(())
+      },
+    )?
   };
   let cmd = lua.create_table()?;
   let key = lua.create_table()?;
@@ -927,6 +997,7 @@ pub fn load_config(source: &str) -> LuaResult<AppConfig> {
       commands,
       in_event_callback,
       pending_pickers,
+      launch,
     },
   })
 }
@@ -959,7 +1030,9 @@ fn picker_item(value: Value) -> LuaResult<(String, Value)> {
 fn valid_event_name(name: &str) -> bool {
   matches!(
     name,
-    "session_created"
+    "PreClient"
+      | "ClientLoaded"
+      | "session_created"
       | "session_selected"
       | "session_closed"
       | "workspace_created"
@@ -1006,9 +1079,13 @@ fn ensure_command_context(in_callback: &Cell<bool>) -> LuaResult<()> {
   }
 }
 
-pub fn load_file(path: &std::path::Path) -> LuaResult<AppConfig> {
+pub fn load_file_with_context(
+  path: &std::path::Path,
+  arguments: &[String],
+  launch: LaunchState,
+) -> LuaResult<AppConfig> {
   let source = std::fs::read_to_string(path).map_err(mlua::Error::external)?;
-  load_config(&source)
+  load_config_with_context(&source, arguments, launch)
 }
 
 #[cfg(test)]
@@ -1040,6 +1117,66 @@ mod tests {
       terminal_rows: 40,
       terminal_columns: 120,
     }
+  }
+
+  #[test]
+  fn pre_client_handlers_receive_arguments_and_mutate_launch_state() {
+    let launch = LaunchState {
+      command: "list".to_owned(),
+      session_name: None,
+      create_if_missing: false,
+      fail_if_exists: false,
+      require_session: true,
+      working_directory: "/work".into(),
+    };
+    let config = load_config_with_context(
+      r#"
+            assert(args[1] == "list")
+            assert(args[2] == "-a")
+            cmd.event.on("PreClient", function(event)
+                assert(event.name == "PreClient")
+                launch.session = "alpha"
+                launch.working_directory = "/workspace/alpha"
+                launch.create_if_missing = true
+                cmd.tab.create()
+            end, { interrupt = true })
+            cmd.event.on("ClientLoaded", function(event)
+                assert(event.name == "ClientLoaded")
+            end)
+            "#,
+      &["list".to_owned(), "-a".to_owned()],
+      launch,
+    )
+    .expect("startup Lua configuration");
+
+    let handlers = config.lua.event_handlers("PreClient");
+    assert_eq!(handlers.len(), 1);
+    assert!(handlers[0].interrupt);
+    assert_eq!(
+      config
+        .lua
+        .invoke_event_handler(&handlers[0], &AppEvent {
+          name: "PreClient".to_owned(),
+          ..AppEvent::default()
+        })
+        .expect("run PreClient handler"),
+      vec![RuntimeCommand::NewTab]
+    );
+    let launch = config.lua.launch_state().expect("launch state");
+    assert_eq!(launch.session_name.as_deref(), Some("alpha"));
+    assert_eq!(launch.working_directory, PathBuf::from("/workspace/alpha"));
+    assert!(launch.create_if_missing);
+
+    let handlers = config.lua.event_handlers("ClientLoaded");
+    assert_eq!(handlers.len(), 1);
+    assert!(!handlers[0].interrupt);
+    config
+      .lua
+      .invoke_event_handler(&handlers[0], &AppEvent {
+        name: "ClientLoaded".to_owned(),
+        ..AppEvent::default()
+      })
+      .expect("run ClientLoaded handler");
   }
 
   #[test]

@@ -61,6 +61,38 @@ opt.ui.style = function(segment, g)
 	return { fg = "gray" }
 end
 
+-- Startup hooks run before the Client is connected. `args` contains the raw
+-- command-line arguments (excluding the executable), and `launch` holds the
+-- mutable launch settings. Interrupt handlers wait for built-in interactions.
+--
+-- Example: let `zmux new` choose an existing Session before connecting.
+-- cmd.event.on("PreClient", function()
+-- 	if args[1] ~= "new" or launch.session ~= nil then
+-- 		return
+-- 	end
+-- 	cmd.ui.pick({ "work", "personal" }, function(session)
+-- 		if session then
+-- 			launch.session = session
+-- 			launch.create_if_missing = false
+-- 		end
+-- 	end)
+-- end, { interrupt = true })
+--
+-- Example: use the built-in Session picker for `zmux list -a`.
+-- cmd.event.on("PreClient", function()
+-- 	if args[1] == "list" then
+-- 		cmd.session.switch()
+-- 	end
+-- end, { interrupt = true })
+--
+-- ClientLoaded runs after queued startup commands have settled and before the
+-- first normal frame. Commands here are applied before that frame is drawn.
+-- cmd.event.on("ClientLoaded", function()
+-- 	if launch.command == "new" then
+-- 		cmd.tab.create()
+-- 	end
+-- end)
+
 -- Bindings are sequences entered after opt.prefix_key. Descriptions are shown
 -- by the which-key popup when a sequence has multiple continuations.
 cmd.key.bind("q", function()

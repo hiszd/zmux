@@ -57,7 +57,8 @@ struct CliOptions {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-  let options = parse_args(std::env::args().skip(1))?;
+  let arguments: Vec<String> = std::env::args().skip(1).collect();
+  let options = parse_args(arguments.clone().into_iter())?;
   let endpoint = Endpoint::new(Some(&options.socket_instance))?;
   if options.server_process {
     return server::run(endpoint);
@@ -68,43 +69,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
       session_name,
       strict,
       path,
-    } => {
-      ensure_server(&endpoint)?;
-      client::run(
-        endpoint,
-        session_name,
-        true,
-        strict,
-        path.unwrap_or(std::env::current_dir()?),
-        configuration(),
-      )
-    }
-    Command::Attach(session_name) => {
-      ensure_server(&endpoint)?;
-      client::run(
-        endpoint,
-        Some(session_name),
-        false,
-        false,
-        std::env::current_dir()?,
-        configuration(),
-      )
-    }
-    Command::List { attach: true } => {
-      let cursor_shape = configuration().cursor_shape;
-      let Some(session_name) = client::choose_session(&endpoint, cursor_shape)? else {
-        return Ok(());
-      };
-      ensure_server(&endpoint)?;
-      client::run(
-        endpoint,
-        Some(session_name),
-        false,
-        false,
-        std::env::current_dir()?,
-        configuration(),
-      )
-    }
+    } => launch_client(&endpoint, &arguments, lua::LaunchState {
+      command: "new".to_owned(),
+      session_name,
+      create_if_missing: true,
+      fail_if_exists: strict,
+      require_session: false,
+      working_directory: path.unwrap_or(std::env::current_dir()?),
+    }),
+    Command::Attach(session_name) => launch_client(&endpoint, &arguments, lua::LaunchState {
+      command: "attach".to_owned(),
+      session_name: Some(session_name),
+      create_if_missing: false,
+      fail_if_exists: false,
+      require_session: true,
+      working_directory: std::env::current_dir()?,
+    }),
+    Command::List { attach: true } => launch_client(&endpoint, &arguments, lua::LaunchState {
+      command: "list".to_owned(),
+      session_name: None,
+      create_if_missing: false,
+      fail_if_exists: false,
+      require_session: true,
+      working_directory: std::env::current_dir()?,
+    }),
     command => run_admin_command(endpoint, command),
   }
 }
@@ -383,21 +371,35 @@ fn ensure_server(endpoint: &Endpoint) -> Result<(), Box<dyn std::error::Error>> 
   )
 }
 
-fn configuration() -> lua::AppConfig {
+fn launch_client(
+  endpoint: &Endpoint,
+  arguments: &[String],
+  launch: lua::LaunchState,
+) -> Result<(), Box<dyn std::error::Error>> {
+  let config = configuration(arguments, launch);
+  let (launch, startup_commands) = client::run_pre_client(endpoint, &config)?;
+  if launch.require_session && launch.session_name.is_none() {
+    println!("no active sessions");
+    return Ok(());
+  }
+  ensure_server(endpoint)?;
+  client::run(endpoint.clone(), launch, startup_commands, config)
+}
+
+fn configuration(arguments: &[String], launch: lua::LaunchState) -> lua::AppConfig {
   let path = std::env::var_os("ZMUX_CONFIG")
     .map(PathBuf::from)
-    .or_else(|| Some(PathBuf::from("zmux.lua")));
-  let Some(path) = path else {
-    return lua::AppConfig::default();
-  };
+    .unwrap_or_else(|| PathBuf::from("zmux.lua"));
   if !path.exists() {
-    return lua::AppConfig::default();
+    return lua::load_config_with_context(include_str!("../zmux.lua"), arguments, launch)
+      .expect("built-in Lua defaults are valid");
   }
-  match lua::load_file(&path) {
+  match lua::load_file_with_context(&path, arguments, launch.clone()) {
     Ok(config) => config,
     Err(error) => {
       eprintln!("could not load {}: {error}", path.display());
-      lua::AppConfig::default()
+      lua::load_config_with_context(include_str!("../zmux.lua"), arguments, launch)
+        .expect("built-in Lua defaults are valid")
     }
   }
 }
