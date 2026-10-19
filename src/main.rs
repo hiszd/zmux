@@ -21,6 +21,7 @@ use std::{
   time::Duration,
 };
 
+use trace::Trace;
 use zmux::{
   protocol::{
     AdminRequest,
@@ -54,6 +55,9 @@ enum Command {
     path: Option<PathBuf>,
     arguments: Vec<String>,
   },
+  Keybinds {
+    json: bool,
+  },
 }
 
 struct CliOptions {
@@ -62,13 +66,26 @@ struct CliOptions {
   server_process: bool,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
+  let trace = Trace::from_environment();
+  if let Err(error) = run() {
+    trace.error("application", error.as_ref());
+    eprintln!("Error: {error}");
+    std::process::exit(1);
+  }
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
   let arguments: Vec<String> = std::env::args().skip(1).collect();
   let options = parse_args(arguments.clone().into_iter())?;
-  let endpoint = Endpoint::new(Some(&options.socket_instance))?;
   if options.server_process {
-    return server::run(endpoint);
+    return server::run(Endpoint::new(Some(&options.socket_instance))?);
   }
+  if let Command::Keybinds { json } = &options.command {
+    let config = keybinds_configuration(&arguments)?;
+    return print_keybinds(&config, *json);
+  }
+  let endpoint = Endpoint::new(Some(&options.socket_instance))?;
 
   match options.command {
     Command::New {
@@ -145,6 +162,20 @@ fn parse_args(mut arguments: impl Iterator<Item = String>) -> Result<CliOptions,
 
   let mut socket_instance = "default".to_owned();
   let command = match command.as_str() {
+    "keybinds" => {
+      let mut json = false;
+      for argument in arguments.by_ref() {
+        match argument.as_str() {
+          "--json" => json = true,
+          "--help" | "-h" => {
+            print_help();
+            std::process::exit(0);
+          }
+          other => return Err(invalid_argument(other)),
+        }
+      }
+      Command::Keybinds { json }
+    }
     "run" => {
       let mut path = None;
       let mut source = None;
@@ -341,6 +372,7 @@ fn print_help() {
   println!("  zmux kill SESSION [--socket NAME]");
   println!("  zmux server stop [--socket NAME]");
   println!("  zmux server status [--socket NAME]");
+  println!("  zmux keybinds [--json]");
   println!(
     "  zmux run [--socket NAME] [--path DIRECTORY] [SCRIPT.lua | --string SOURCE] [SCRIPT_ARGS...]"
   );
@@ -348,6 +380,7 @@ fn print_help() {
   println!("new attaches to SESSION or creates it if missing; --strict fails if SESSION exists.");
   println!("attach requires SESSION to already exist.");
   println!("run accepts a positional Lua file or inline source with --string.");
+  println!("keybinds lists the configured key sequences; --json emits pretty JSON.");
 }
 
 fn run_admin_command(
@@ -360,7 +393,9 @@ fn run_admin_command(
     Command::Kill(name) => AdminRequest::KillSession(name),
     Command::ServerStop => AdminRequest::StopServer,
     Command::ServerStatus => AdminRequest::Status,
-    Command::New { .. } | Command::Attach(_) | Command::Run { .. } => unreachable!(),
+    Command::New { .. } | Command::Attach(_) | Command::Run { .. } | Command::Keybinds { .. } => {
+      unreachable!()
+    }
   };
   let mut stream = match transport::connect(&endpoint) {
     Ok(stream) => stream,
@@ -459,6 +494,67 @@ fn launch_client(
   client::run(endpoint.clone(), launch, startup_commands, config)
 }
 
+#[derive(serde::Serialize)]
+struct KeybindsOutput {
+  prefix_key: String,
+  bindings: Vec<KeybindOutput>,
+}
+
+#[derive(serde::Serialize)]
+struct KeybindOutput {
+  keys: String,
+  description: Option<String>,
+}
+
+fn keybinds_json(config: &lua::AppConfig) -> Result<String, serde_json::Error> {
+  let output = KeybindsOutput {
+    prefix_key: input::key_notation::key_stroke_to_string(&config.prefix_key),
+    bindings: config
+      .keymap
+      .entries()
+      .into_iter()
+      .map(|(keys, description)| KeybindOutput { keys, description })
+      .collect(),
+  };
+  serde_json::to_string_pretty(&output)
+}
+
+fn print_keybinds(config: &lua::AppConfig, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+  if json {
+    println!("{}", keybinds_json(config)?);
+  } else {
+    println!("Prefix: {}", input::key_notation::key_stroke_to_string(&config.prefix_key));
+    println!("SEQUENCE  DESCRIPTION");
+    for (keys, description) in config.keymap.entries() {
+      println!("{keys:<9} {}", description.as_deref().unwrap_or("(no description)"));
+    }
+  }
+  Ok(())
+}
+
+fn keybinds_configuration(
+  arguments: &[String],
+) -> Result<lua::AppConfig, Box<dyn std::error::Error>> {
+  let explicit_path = std::env::var_os("ZMUX_CONFIG").map(PathBuf::from);
+  let path = explicit_path
+    .clone()
+    .unwrap_or_else(|| PathBuf::from("zmux.lua"));
+  let launch = lua::LaunchState {
+    command: "keybinds".to_owned(),
+    working_directory: std::env::current_dir()?,
+    ..lua::LaunchState::default()
+  };
+
+  if path.exists() {
+    return lua::load_file_with_context(&path, arguments, launch)
+      .map_err(|error| format!("could not load {}: {error}", path.display()).into());
+  }
+  if explicit_path.is_some() {
+    return Err(format!("could not load {}: file does not exist", path.display()).into());
+  }
+  lua::load_config_with_context(include_str!("../zmux.lua"), arguments, launch).map_err(Into::into)
+}
+
 fn configuration(arguments: &[String], launch: lua::LaunchState) -> lua::AppConfig {
   let path = std::env::var_os("ZMUX_CONFIG")
     .map(PathBuf::from)
@@ -482,6 +578,8 @@ mod tests {
   use super::{
     Command,
     headless::ScriptInput,
+    keybinds_json,
+    lua,
     parse_args,
   };
 
@@ -504,7 +602,7 @@ mod tests {
     );
     assert_eq!(options.socket_instance, "project");
     assert!(
-      matches!(&options.command, Command::New { path: Some(path), .. } if path == "/work/project")
+      matches!(&options.command, Command::New { path: Some(path), .. } if path == std::path::Path::new("/work/project"))
     );
   }
 
@@ -586,5 +684,41 @@ mod tests {
     );
     assert!(parse_args(["attach", "project"].map(str::to_owned).into_iter()).is_ok());
     assert!(parse_args(["new", "--socket"].map(str::to_owned).into_iter()).is_err());
+  }
+
+  #[test]
+  fn keybinds_accepts_optional_json_output_flag() {
+    let plain = parse_args(["keybinds"].map(str::to_owned).into_iter()).expect("keybind command");
+    let json = parse_args(["keybinds", "--json"].map(str::to_owned).into_iter())
+      .expect("JSON keybind command");
+
+    assert!(matches!(plain.command, Command::Keybinds { json: false }));
+    assert!(matches!(json.command, Command::Keybinds { json: true }));
+    assert!(parse_args(["keybinds", "--yaml"].map(str::to_owned).into_iter()).is_err());
+  }
+
+  #[test]
+  fn keybinds_json_is_pretty_printed_and_includes_prefix_and_descriptions() {
+    let config = lua::load_config(
+      "opt.prefix_key = '<C-x>'\ncmd.key.bind('z', function() end)\ncmd.key.bind('a', function() end, { desc = 'Create tab' })",
+    )
+    .expect("valid keybind config");
+
+    assert_eq!(
+      keybinds_json(&config).expect("serialize keybinds"),
+      r#"{
+  "prefix_key": "<C-x>",
+  "bindings": [
+    {
+      "keys": "a",
+      "description": "Create tab"
+    },
+    {
+      "keys": "z",
+      "description": null
+    }
+  ]
+}"#
+    );
   }
 }

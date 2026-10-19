@@ -438,8 +438,8 @@ pub fn draw(frame: &mut Frame<'_>, view: &UiRender<'_>) -> mlua::Result<()> {
     view.bars.bottom.clone(),
     default_bottom_parts(view.active_title, view.active_exit_code, area.width, area.height),
   );
-  apply_styles(view.lua, &mut top_contents)?;
-  apply_styles(view.lua, &mut bottom_contents)?;
+  apply_styles(view.lua, &mut top_contents, "top", view.trace)?;
+  apply_styles(view.lua, &mut bottom_contents, "bottom", view.trace)?;
   if let Some(warning) = view.key_warning {
     bottom_contents.right = Some(vec![BarSegment {
       text: format!(" {warning} "),
@@ -702,15 +702,32 @@ impl Widget for &WorkspaceDrawerRender<'_> {
 }
 
 /// Resolves Lua-defined default styles for every segment in a bar.
-fn apply_styles(lua: &LuaConfig, parts: &mut BarParts) -> mlua::Result<()> {
-  for segment in parts
-    .left
-    .iter_mut()
-    .flatten()
-    .chain(parts.center.iter_mut().flatten())
-    .chain(parts.right.iter_mut().flatten())
-  {
-    lua.apply_default_style(segment)?;
+fn apply_styles(
+  lua: &LuaConfig,
+  parts: &mut BarParts,
+  anchor: &str,
+  trace: &Trace,
+) -> mlua::Result<()> {
+  for (part_name, segments) in [
+    ("left", parts.left.as_mut()),
+    ("center", parts.center.as_mut()),
+    ("right", parts.right.as_mut()),
+  ] {
+    if let Some(segments) = segments {
+      for (index, segment) in segments.iter_mut().enumerate() {
+        if let Err(error) = lua.apply_default_style(segment) {
+          trace.error(
+            &format!(
+              "ui.default_style anchor={anchor} part={part_name} segment={} role={:?}",
+              index + 1,
+              segment.role
+            ),
+            &error,
+          );
+          return Err(error);
+        }
+      }
+    }
   }
   Ok(())
 }
@@ -765,7 +782,7 @@ fn default_bottom_parts(
   let status = exit_code.map_or_else(String::new, |code| format!(" exited ({code})"));
   BarParts {
     left: Some(vec![BarSegment {
-      text: format!(" {}{} ", active_title, status),
+      text: format!(" {active_title}{status} "),
       role: Some("active_terminal".to_owned()),
       style: None,
     }]),
@@ -925,6 +942,8 @@ fn _area(_: Rect) {
 #[cfg(test)]
 mod tests {
   use ratatui::{
+    Terminal,
+    backend::TestBackend,
     buffer::Buffer,
     layout::Rect,
     widgets::Widget,
@@ -1002,7 +1021,12 @@ mod tests {
       highlighted_id: 1,
       items: &workspaces,
     };
-    (&expanded).render(area, &mut buffer);
+    let backend = TestBackend::new(area.width, area.height);
+    let mut terminal = Terminal::new(backend).expect("create test terminal");
+    terminal
+      .draw(|frame| frame.render_widget(&expanded, frame.area()))
+      .expect("render workspace drawer");
+    let buffer = terminal.backend().buffer();
     assert_eq!(buffer[(1, 0)].symbol(), "a");
     assert_eq!(buffer[(1, 1)].symbol(), "b");
   }

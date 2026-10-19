@@ -808,7 +808,7 @@ impl ServerState {
       let session = self
         .session(number)
         .ok_or_else(|| "Session no longer exists".to_owned())?;
-      let name = name.unwrap_or_else(|| next_workspace_name(&session.model));
+      let name = name.unwrap_or_else(|| next_workspace_name(&session.model, &working_directory));
       if session
         .model
         .workspaces()
@@ -1255,15 +1255,24 @@ fn sanitize_viewport(viewport: Viewport) -> Viewport {
   }
 }
 
-fn next_workspace_name(session: &Session) -> String {
+fn next_workspace_name(session: &Session, working_directory: &std::path::Path) -> String {
   let used: HashSet<String> = session
     .workspaces()
     .iter()
     .map(|workspace| workspace.name().into_owned())
     .collect();
+  let base = working_directory
+    .file_name()
+    .unwrap_or(working_directory.as_os_str())
+    .to_string_lossy()
+    .into_owned();
+  if !used.contains(&base) {
+    return base;
+  }
+
   let mut number = 1_u64;
   loop {
-    let candidate = number.to_string();
+    let candidate = format!("{base}{number}");
     if !used.contains(&candidate) {
       return candidate;
     }
@@ -1650,7 +1659,7 @@ mod tests {
         .find(|workspace| workspace.id == workspace_id)
         .expect("new active Workspace")
         .name,
-      "1"
+      "first"
     );
     write_frame(&mut client, &ClientMessage::Request {
       id: 2,
@@ -1677,7 +1686,7 @@ mod tests {
         .find(|workspace| workspace.id == workspace_id)
         .expect("edited Workspace")
         .name,
-      "1"
+      "first"
     );
     write_frame(&mut client, &ClientMessage::Request {
       id: 4,
@@ -1707,6 +1716,44 @@ mod tests {
 
     write_frame(&mut client, &ClientMessage::Request {
       id: 6,
+      request: ClientRequest::CreateWorkspace {
+        working_directory: first_directory.clone(),
+        name: None,
+      },
+    })
+    .expect("create duplicate Workspace");
+    let duplicate_state = read_state_with_workspace_count(&mut client, 3);
+    assert_eq!(
+      duplicate_state
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == duplicate_state.active_workspace_id)
+        .expect("new duplicate Workspace")
+        .name,
+      "first1"
+    );
+
+    write_frame(&mut client, &ClientMessage::Request {
+      id: 7,
+      request: ClientRequest::CreateWorkspace {
+        working_directory: first_directory,
+        name: None,
+      },
+    })
+    .expect("create second duplicate Workspace");
+    let second_duplicate_state = read_state_with_workspace_count(&mut client, 4);
+    assert_eq!(
+      second_duplicate_state
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == second_duplicate_state.active_workspace_id)
+        .expect("new second duplicate Workspace")
+        .name,
+      "first2"
+    );
+
+    write_frame(&mut client, &ClientMessage::Request {
+      id: 8,
       request: ClientRequest::StopServer,
     })
     .expect("stop Server");
@@ -1971,7 +2018,7 @@ mod tests {
         .iter()
         .map(|workspace| workspace.id.as_str())
         .collect::<Vec<_>>(),
-      ["headless:project", "headless:1"]
+      ["headless:project", "headless:zmux"]
     );
 
     assert_eq!(

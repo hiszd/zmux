@@ -241,7 +241,14 @@ pub fn encode_key(event: CrosstermKeyEvent) -> Option<Vec<u8>> {
       output.extend(character.to_string().as_bytes());
       output
     }
-    (KeyCode::Char(character), _) => character.to_string().into_bytes(),
+    (KeyCode::Char(character), modifiers) => {
+      let character = if modifiers.contains(KeyModifiers::SHIFT) {
+        character.to_ascii_uppercase()
+      } else {
+        character
+      };
+      character.to_string().into_bytes()
+    }
     (KeyCode::Enter, _) => vec![b'\r'],
     (KeyCode::Esc, _) => vec![0x1b],
     (KeyCode::Backspace, _) => vec![0x7f],
@@ -309,5 +316,16 @@ mod tests {
     assert_eq!(encode_key(event), Some(vec![3]));
     let uppercase = CrosstermKeyEvent::new(KeyCode::Char('Z'), KeyModifiers::SHIFT);
     assert_eq!(encode_key(uppercase), Some(b"Z".to_vec()));
+
+    let function_key = CrosstermKeyEvent::new(KeyCode::F(12), KeyModifiers::NONE);
+    assert_eq!(
+      KeyStroke::from_crossterm(function_key),
+      Some(KeyStroke {
+        key: Key::F(12),
+        ctrl: false,
+        alt: false,
+        shift: false,
+      })
+    );
   }
 }
