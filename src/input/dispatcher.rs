@@ -20,6 +20,7 @@ use super::{
     Key,
     KeySeq,
     KeyStroke,
+    key_seq_to_string,
   },
 };
 
@@ -42,6 +43,17 @@ impl KeyMap {
   }
 
   pub fn unbind(&mut self, sequence: &[KeyStroke]) -> bool { self.bindings.unbind(sequence) }
+
+  pub fn entries(&self) -> Vec<(String, Option<String>)> {
+    let mut entries: Vec<_> = self
+      .bindings
+      .entries()
+      .into_iter()
+      .map(|(sequence, desc)| (key_seq_to_string(&sequence), desc))
+      .collect();
+    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+    entries
+  }
 
   #[cfg(test)]
   pub fn binding_for(&self, sequence: &[KeyStroke]) -> Option<Function> {
@@ -309,6 +321,18 @@ mod tests {
     ));
     press_prefix(&mut dispatcher, now);
     assert!(dispatcher.is_leader());
+  }
+
+  #[test]
+  fn shift_v_is_forwarded_as_uppercase_v() {
+    let (_lua, mut dispatcher) = dispatcher(&[]);
+    let now = Instant::now();
+    let KeyOutcome::Forward(bytes) =
+      dispatcher.handle_event(key(KeyCode::Char('v'), KeyModifiers::SHIFT), now)
+    else {
+      panic!("Shift+v should be forwarded to the PTY");
+    };
+    assert_eq!(bytes, b"V");
   }
 
   #[test]

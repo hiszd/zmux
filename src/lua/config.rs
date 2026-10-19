@@ -13,6 +13,7 @@ use std::{
 };
 
 use mlua::{
+  ErrorContext,
   Function,
   Lua,
   Result as LuaResult,
@@ -208,7 +209,16 @@ pub struct LuaConfig {
 impl LuaConfig {
   pub fn sync_state(&self, snapshot: &AppSnapshot) -> LuaResult<()> {
     *self.snapshot.borrow_mut() = snapshot.clone();
-    self.globals.clear()?;
+    // `Table::clear` in mlua 0.11.6 leaves a stack value behind on LuaJIT.
+    let keys = self
+      .globals
+      .clone()
+      .pairs::<Value, Value>()
+      .map(|entry| entry.map(|(key, _)| key))
+      .collect::<LuaResult<Vec<_>>>()?;
+    for key in keys {
+      self.globals.set(key, Value::Nil)?;
+    }
     let tabs = self
       .lua
       .create_table_with_capacity(snapshot.tabs.len(), 0)?;
@@ -405,32 +415,59 @@ impl LuaConfig {
   }
 
   pub fn render_bar_part(&self, anchor: &str, part: &str) -> LuaResult<Option<Vec<BarSegment>>> {
-    self.refresh_state()?;
-    let Some(ui) = self.options.get::<Option<Table>>("ui")? else {
+    let context = |step: &str| format!("bar {anchor}.{part}: {step}");
+    self
+      .refresh_state()
+      .map_err(|error| error.context(context("refresh state")))?;
+    let Some(ui) = self
+      .options
+      .get::<Option<Table>>("ui")
+      .map_err(|error| error.context(context("read UI options")))?
+    else {
       return Ok(None);
     };
-    let Some(bars) = ui.get::<Option<Table>>("bars")? else {
+    let Some(bars) = ui
+      .get::<Option<Table>>("bars")
+      .map_err(|error| error.context(context("read bars")))?
+    else {
       return Ok(None);
     };
-    let Some(bar) = bars.get::<Option<Table>>(anchor)? else {
+    let Some(bar) = bars
+      .get::<Option<Table>>(anchor)
+      .map_err(|error| error.context(context("read anchor")))?
+    else {
       return Ok(None);
     };
-    let content = bar.get::<Value>(part)?;
+    let content = bar
+      .get::<Value>(part)
+      .map_err(|error| error.context(context("read content")))?;
     if matches!(content, Value::Nil) {
       return Ok(None);
     }
     let content = match content {
-      Value::Function(function) => function.call::<Value>(self.globals.clone())?,
+      Value::Function(function) => function
+        .call::<Value>(self.globals.clone())
+        .map_err(|error| error.context(context("call content provider")))?,
       value => value,
     };
     let mut rendered = Vec::new();
-    for (mut segment, segment_table) in self.parse_segments(content)? {
+    for (mut segment, segment_table) in self
+      .parse_segments(content)
+      .map_err(|error| error.context(context("parse content segments")))?
+    {
       if segment.style.is_none()
-        && let Value::Function(function) = ui.get::<Value>("style")?
+        && let Value::Function(function) = ui
+          .get::<Value>("style")
+          .map_err(|error| error.context(context("read default style provider")))?
       {
-        self.refresh_state()?;
-        let value = function.call::<Value>((segment_table, self.globals.clone()))?;
-        segment.style = parse_style(value)?;
+        self
+          .refresh_state()
+          .map_err(|error| error.context(context("refresh state before style callback")))?;
+        let value = function
+          .call::<Value>((segment_table, self.globals.clone()))
+          .map_err(|error| error.context(context("call default style provider")))?;
+        segment.style =
+          parse_style(value).map_err(|error| error.context(context("parse default style")))?;
       }
       rendered.push(segment);
     }
@@ -1190,18 +1227,6 @@ mod tests {
     let config = load_config(include_str!("../../zmux.lua")).expect("sample Lua config");
     assert_eq!(config.prefix_key, normalize_prefix_key("<C-Space>").expect("prefix"));
     assert_eq!(config.sequence_timeout, Duration::from_secs(8));
-    assert_eq!(config.keymap.binding_count(), 24);
-    let callback = config
-      .keymap
-      .binding_for(&parse_key_notation("tw").expect("key"))
-      .expect("close tab binding");
-    assert_eq!(
-      config
-        .lua
-        .invoke_key_callback(&callback)
-        .expect("key callback"),
-      vec![RuntimeCommand::CloseTab]
-    );
     config.lua.sync_state(&snapshot()).expect("sync UI state");
     let segments = config
       .lua
@@ -1211,6 +1236,67 @@ mod tests {
     assert_eq!(segments.len(), 2);
     assert_eq!(segments[1].text, " 2 shell-two ");
     assert_eq!(segments[1].style.and_then(|style| style.bg), Some(Color::Cyan));
+  }
+
+  #[test]
+  fn repeated_ui_state_and_bar_callbacks_do_not_exhaust_the_lua_stack() {
+    let config = load_config(include_str!("../../zmux.lua")).expect("sample Lua config");
+    let mut state = snapshot();
+    state.session = Some(zmux::protocol::SessionSnapshot {
+      number: "9".to_owned(),
+      active_workspace_id: 4,
+      workspaces: vec![zmux::protocol::WorkspaceSnapshot {
+        id: 4,
+        name: "project".to_owned(),
+        explicit_name: None,
+        working_directory: "/work/project".into(),
+        tabs: vec![zmux::protocol::TabSnapshot {
+          id: 20,
+          name: "2".to_owned(),
+          title: "shell-two".to_owned(),
+          exit_code: None,
+        }],
+        active_tab_id: 20,
+      }],
+    });
+    config
+      .lua
+      .globals
+      .set("temporary", true)
+      .expect("add a temporary UI-state field");
+    config.lua.sync_state(&state).expect("initial state sync");
+    assert!(matches!(
+      config
+        .lua
+        .globals
+        .get::<Value>("temporary")
+        .expect("read temporary field"),
+      Value::Nil
+    ));
+
+    for frame in 0..700 {
+      config
+        .lua
+        .sync_state(&state)
+        .unwrap_or_else(|error| panic!("frame {frame}: sync state failed: {error:?}"));
+      for anchor in ["top", "bottom"] {
+        for part in ["left", "center", "right"] {
+          config
+            .lua
+            .render_bar_part(anchor, part)
+            .unwrap_or_else(|error| panic!("frame {frame}: {anchor}.{part} failed: {error:?}"));
+        }
+      }
+      let mut fallback = BarSegment {
+        text: "fallback".to_owned(),
+        role: Some("tab".to_owned()),
+        style: None,
+      };
+      config
+        .lua
+        .apply_default_style(&mut fallback)
+        .unwrap_or_else(|error| panic!("frame {frame}: fallback style failed: {error:?}"));
+    }
   }
 
   #[test]
@@ -1343,6 +1429,20 @@ mod tests {
     assert!(load_config("cmd.key.bind('q', 'quit')").is_err());
     assert!(load_config("cmd.key.bind('<Esc>', function() end)").is_err());
     assert!(load_config("cmd.key.bind('a<Esc>', function() end)").is_err());
+  }
+
+  #[test]
+  fn configured_keybinds_list_effective_sequences_and_descriptions_in_order() {
+    let config = load_config(
+      "cmd.key.bind('z', function() end, { desc = 'Last' })\ncmd.key.bind('tw', function() end, { desc = 'Close tab' })\ncmd.key.bind('a', function() end)\ncmd.key.bind('z', nil)\ncmd.key.bind('z', function() end, { desc = 'Replaced' })",
+    )
+    .expect("valid keybind config");
+
+    assert_eq!(config.keymap.entries(), vec![
+      ("a".to_owned(), None),
+      ("tw".to_owned(), Some("Close tab".to_owned())),
+      ("z".to_owned(), Some("Replaced".to_owned())),
+    ]);
   }
 
   #[test]

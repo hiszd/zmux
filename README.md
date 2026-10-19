@@ -94,6 +94,8 @@ end)
 
 Key bindings use neovim-style notation and Lua callbacks: `cmd.key.bind('tw', function() cmd.tab.close() end, { desc = 'Close the focused tab' })`. Pass `nil` as the callback to unbind a sequence. Bindings are entered after the required prefix (`opt.prefix_key`, default `<C-Space>`); multi-key sequences are supported and `opt.sequence_timeout_ms` defaults to 700 ms; set it to `0` to disable leader/sequence timeouts. Completing a binding exits leader mode, including when timeouts are disabled; an unbound key also exits leader mode and shows a yellow warning. `<Esc>` cannot be bound because it is reserved for cancellation. When a sequence has continuations, zmux displays a bottom-anchored, full-width which-key popup. Unknown keys and callback errors appear briefly in yellow at the bottom right.
 
+List the effective bindings from the loaded configuration with `zmux keybinds`; use `--json` for pretty-printed JSON on stdout. Each entry includes its sequence and optional description, and the configured prefix is reported separately. This command loads the Lua config but does not connect to or start the Server.
+
 ## Tracing
 
 Enable latency tracing without corrupting the TUI:

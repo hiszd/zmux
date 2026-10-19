@@ -157,8 +157,12 @@ pub fn run(
   startup_commands: Vec<RuntimeCommand>,
   config: lua::AppConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-  let size = crossterm::terminal::size()?;
-  let options = config.lua.sync_options()?;
+  let trace = Trace::from_environment();
+  trace.mark("client-start");
+  let size = crossterm::terminal::size().inspect_err(|error| {
+    trace.error("client.terminal_size", error);
+  })?;
+  let options = traced_lua(&trace, "lua.sync_options initial", config.lua.sync_options())?;
   let pane_size = ui::pane_size(size.0, size.1, options, false);
   let viewport = Viewport {
     rows: pane_size.0.max(1),
@@ -172,14 +176,18 @@ pub fn run(
     launch.working_directory.clone(),
     viewport,
     config.default_shell.as_deref(),
-  )?;
+  )
+  .inspect_err(|error| {
+    trace.error("client.connect", error.as_ref());
+  })?;
   let (reader, writer) = connection.stream.split();
   let (event_sender, receiver) = mpsc::channel();
   spawn_server_reader(reader, event_sender.clone())?;
   let request_sender = spawn_server_writer(writer, event_sender.clone())?;
 
-  let terminal_mode = TerminalModeGuard::enter(config.cursor_shape)?;
-  let trace = Trace::from_environment();
+  let terminal_mode = TerminalModeGuard::enter(config.cursor_shape).inspect_err(|error| {
+    trace.error("client.terminal_mode", error);
+  })?;
   let backend = CrosstermBackend::new(io::stdout());
   let mut terminal = Terminal::new(backend)?;
   let input_stop = Arc::new(AtomicBool::new(false));
@@ -195,9 +203,16 @@ pub fn run(
       created_session: launch.session_name.is_none(),
       commands: startup_commands,
     },
+    trace.clone(),
   );
 
-  trace.mark("shutdown-event-loop-returned");
+  if let Err(error) = &result {
+    trace.error("client.event_loop", error.as_ref());
+  }
+  trace.mark(&format!(
+    "shutdown-event-loop-returned outcome={}",
+    if result.is_ok() { "ok" } else { "error" }
+  ));
   thread::sleep(SHUTDOWN_DELAY);
   trace.mark("shutdown-delay-complete");
   input_stop.store(true, Ordering::Relaxed);
@@ -1179,6 +1194,7 @@ struct ClientStartup {
 /// The render phase assembles a [`ui::UiRender`] from the client session and
 /// invokes `ratatui`'s `Terminal::draw`; event handling resumes only after the
 /// frame is complete.
+#[allow(clippy::too_many_arguments)] // The shared trace sink spans the loop and caller-side cleanup.
 fn run_event_loop(
   terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
   config: lua::AppConfig,
@@ -1187,12 +1203,12 @@ fn run_event_loop(
   mut session: ClientSession,
   client_id: u64,
   startup: ClientStartup,
+  trace: Trace,
 ) -> Result<(), Box<dyn std::error::Error>> {
-  let trace = Trace::from_environment();
   trace.mark("client-attached");
   let size = terminal.size()?;
   let mut outer_size = (size.width, size.height);
-  let mut ui_options = config.lua.sync_options()?;
+  let mut ui_options = traced_lua(&trace, "lua.sync_options initial", config.lua.sync_options())?;
   let initial_pane = ui::pane_size(outer_size.0, outer_size.1, ui_options, session.drawer_expanded);
   let mut viewport = Viewport {
     rows: initial_pane.0.max(1),
@@ -1260,7 +1276,7 @@ fn run_event_loop(
     if needs_draw {
       let size = terminal.size()?;
       outer_size = (size.width, size.height);
-      ui_options = config.lua.sync_options()?;
+      ui_options = traced_lua(&trace, "lua.sync_options redraw", config.lua.sync_options())?;
       session.which_key_options = ui_options.which;
       let pane = ui::pane_size(outer_size.0, outer_size.1, ui_options, session.drawer_expanded);
       let new_viewport = Viewport {
@@ -1272,12 +1288,16 @@ fn run_event_loop(
         session.resize(viewport);
         send_request(&sender, &mut next_request_id, ClientRequest::Resize(viewport))?;
       }
-      config.lua.sync_state(&session.snapshot_for_lua(
-        dispatcher.is_leader(),
-        outer_size.0,
-        outer_size.1,
-      ))?;
-      let bars = render_bars(&config.lua)?;
+      traced_lua(
+        &trace,
+        "lua.sync_state redraw",
+        config.lua.sync_state(&session.snapshot_for_lua(
+          dispatcher.is_leader(),
+          outer_size.0,
+          outer_size.1,
+        )),
+      )?;
+      let bars = render_bars(&config.lua, &trace)?;
       let active_terminal = session
         .active_terminal()
         .ok_or("active Tab has no terminal snapshot")?;
@@ -1343,12 +1363,17 @@ fn run_event_loop(
         trace: &trace,
       };
       let mut draw_error = None;
-      terminal.draw(|frame| {
-        if let Err(error) = ui::draw(frame, &ui_frame) {
-          draw_error = Some(error);
-        }
-      })?;
+      terminal
+        .draw(|frame| {
+          if let Err(error) = ui::draw(frame, &ui_frame) {
+            draw_error = Some(error);
+          }
+        })
+        .inspect_err(|error| {
+          trace.error("terminal.draw", error);
+        })?;
       if let Some(error) = draw_error {
+        trace.error("ui.draw", &error);
         return Err(error.into());
       }
       needs_draw = false;
@@ -1361,6 +1386,8 @@ fn run_event_loop(
       .min(Duration::from_millis(250));
     match receiver.recv_timeout(timeout) {
       Ok(ClientEvent::Input(event)) => {
+        let event_description = format!("{event:?}");
+        trace.mark(&format!("client-input-start event={event_description}"));
         let effects = {
           let mut context = ClientContext {
             session: &mut session,
@@ -1372,8 +1399,15 @@ fn run_event_loop(
             lua: &config.lua,
             trace: &trace,
           };
-          handle_input(event, &mut context)?
+          let result = handle_input(event, &mut context);
+          if let Err(error) = &result {
+            context
+              .trace
+              .error(&format!("client.handle_input event={event_description}"), error.as_ref());
+          }
+          result?
         };
+        trace.mark("client-input-complete");
         needs_draw |= effects.redraw;
         if effects.quit {
           break 'event_loop;
@@ -1455,6 +1489,7 @@ fn run_event_loop(
         if let Some(timeout) = dispatcher.expire(now) {
           match timeout {
             KeyTimeout::Execute(callback) => {
+              trace.mark("lua-key-timeout-callback-start");
               let mut effects = match config.lua.invoke_key_callback(&callback) {
                 Ok(commands) => execute_runtime_commands(commands, &mut ClientContext {
                   session: &mut session,
@@ -1467,6 +1502,7 @@ fn run_event_loop(
                   trace: &trace,
                 })?,
                 Err(error) => {
+                  trace.error("lua.key_callback_timeout", &error);
                   session.key_warning = Some((
                     format!("Key callback: {error}"),
                     Instant::now() + Duration::from_secs(3),
@@ -1474,6 +1510,7 @@ fn run_event_loop(
                   Effects::default()
                 }
               };
+              trace.mark("lua-key-timeout-callback-complete");
               effects.redraw = true;
               effects.events.push(UiEvent {
                 name: "leader_mode_changed".to_owned(),
@@ -2075,6 +2112,18 @@ fn handle_input(
       let was_leader = context.dispatcher.is_leader();
       context.trace.mark(&format!("input-dispatch-event {key:?}"));
       let outcome = context.dispatcher.handle_event(key, now);
+      let outcome_name = match &outcome {
+        KeyOutcome::PrefixEntered => "prefix-entered",
+        KeyOutcome::PrefixCancelled => "prefix-cancelled",
+        KeyOutcome::Execute(_) => "execute-callback",
+        KeyOutcome::Forward(_) => "forward-to-pty",
+        KeyOutcome::Unbound(_) => "unbound",
+        KeyOutcome::Ignored => "ignored",
+      };
+      context.trace.mark(&format!(
+        "key-dispatch-outcome outcome={outcome_name} leader={}",
+        context.dispatcher.is_leader()
+      ));
       let leader_changed = was_leader != context.dispatcher.is_leader();
       if leader_changed && !context.dispatcher.is_leader() {
         context.session.which_key_scroll = 0;
@@ -2100,8 +2149,14 @@ fn handle_input(
         }
         KeyOutcome::Execute(callback) => {
           effects.redraw = true;
+          context
+            .trace
+            .mark(&format!("lua-key-callback-start key={key:?}"));
           match context.lua.invoke_key_callback(&callback) {
             Ok(commands) => {
+              context
+                .trace
+                .mark(&format!("lua-key-callback-complete commands={}", commands.len()));
               if commands.iter().any(|command| {
                 matches!(command, RuntimeCommand::Detach | RuntimeCommand::StopServer)
               }) {
@@ -2114,6 +2169,7 @@ fn handle_input(
               }
             }
             Err(error) => {
+              context.trace.error("lua.key_callback", &error);
               context.session.key_warning =
                 Some((format!("Key callback: {error}"), now + Duration::from_secs(3)));
               effects.redraw = true;
@@ -2152,7 +2208,8 @@ fn handle_input(
     }
     Event::Resize(width, height) => {
       *context.outer_size = (width, height);
-      let options = context.lua.sync_options()?;
+      let options =
+        traced_lua(context.trace, "lua.sync_options terminal resize", context.lua.sync_options())?;
       let pane = ui::pane_size(width, height, options, context.session.drawer_expanded);
       let viewport = Viewport {
         rows: pane.0.max(1),
@@ -2599,14 +2656,36 @@ fn dispatch_ui_events(
     if dispatched > MAX_CALLBACK_COMMANDS {
       return Err("Lua callback command/event loop exceeded its safety limit".into());
     }
-    for callback in context.lua.event_handlers(&event.name) {
-      context.lua.sync_state(&context.session.snapshot_for_lua(
-        context.dispatcher.is_leader(),
-        context.outer_size.0,
-        context.outer_size.1,
-      ))?;
-      let commands = context.lua.invoke_event_handler(&callback, &event)?;
-      let options = context.lua.sync_options()?;
+    for (handler_index, callback) in context
+      .lua
+      .event_handlers(&event.name)
+      .into_iter()
+      .enumerate()
+    {
+      traced_lua(
+        context.trace,
+        "lua.sync_state event callback",
+        context.lua.sync_state(&context.session.snapshot_for_lua(
+          context.dispatcher.is_leader(),
+          context.outer_size.0,
+          context.outer_size.1,
+        )),
+      )?;
+      let callback_context =
+        format!("lua.event_callback event={} handler={handler_index}", event.name);
+      context.trace.mark(&format!("{callback_context} start"));
+      let commands = match context.lua.invoke_event_handler(&callback, &event) {
+        Ok(commands) => commands,
+        Err(error) => {
+          context.trace.error(&callback_context, &error);
+          return Err(error.into());
+        }
+      };
+      context
+        .trace
+        .mark(&format!("{callback_context} complete commands={}", commands.len()));
+      let options =
+        traced_lua(context.trace, "lua.sync_options event callback", context.lua.sync_options())?;
       let pane = ui::pane_size(
         context.outer_size.0,
         context.outer_size.1,
@@ -2742,17 +2821,23 @@ fn execute_runtime_commands(
 ///
 /// Missing parts remain `None`, allowing [`ui::draw`] to supply its built-in
 /// defaults; an explicitly empty Lua result suppresses that group.
-fn render_bars(lua: &LuaConfig) -> mlua::Result<ui::BarContents> {
+fn traced_lua<T>(trace: &Trace, context: &str, result: mlua::Result<T>) -> mlua::Result<T> {
+  result.inspect_err(|error| {
+    trace.error(context, error);
+  })
+}
+
+fn render_bars(lua: &LuaConfig, trace: &Trace) -> mlua::Result<ui::BarContents> {
   Ok(ui::BarContents {
     top: ui::BarParts {
-      left: lua.render_bar_part("top", "left")?,
-      center: lua.render_bar_part("top", "center")?,
-      right: lua.render_bar_part("top", "right")?,
+      left: traced_lua(trace, "lua.bar top.left", lua.render_bar_part("top", "left"))?,
+      center: traced_lua(trace, "lua.bar top.center", lua.render_bar_part("top", "center"))?,
+      right: traced_lua(trace, "lua.bar top.right", lua.render_bar_part("top", "right"))?,
     },
     bottom: ui::BarParts {
-      left: lua.render_bar_part("bottom", "left")?,
-      center: lua.render_bar_part("bottom", "center")?,
-      right: lua.render_bar_part("bottom", "right")?,
+      left: traced_lua(trace, "lua.bar bottom.left", lua.render_bar_part("bottom", "left"))?,
+      center: traced_lua(trace, "lua.bar bottom.center", lua.render_bar_part("bottom", "center"))?,
+      right: traced_lua(trace, "lua.bar bottom.right", lua.render_bar_part("bottom", "right"))?,
     },
   })
 }

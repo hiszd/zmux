@@ -2,7 +2,10 @@ use std::collections::HashMap;
 
 use mlua::Function;
 
-use super::key_notation::KeyStroke;
+use super::key_notation::{
+  KeySeq,
+  KeyStroke,
+};
 
 #[derive(Clone)]
 pub struct Binding {
@@ -76,6 +79,28 @@ impl BindingTrie {
       .collect();
     completions.sort_by_key(|(key, _, _)| *key);
     completions
+  }
+
+  pub fn entries(&self) -> Vec<(KeySeq, Option<String>)> {
+    fn collect(
+      node: &TrieNode,
+      sequence: &mut KeySeq,
+      entries: &mut Vec<(KeySeq, Option<String>)>,
+    ) {
+      if let Some(binding) = &node.binding {
+        entries.push((sequence.clone(), binding.desc.clone()));
+      }
+      for (key, child) in &node.children {
+        sequence.push(*key);
+        collect(child, sequence, entries);
+        sequence.pop();
+      }
+    }
+
+    let mut entries = Vec::new();
+    collect(&self.root, &mut Vec::new(), &mut entries);
+    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+    entries
   }
 
   #[cfg(test)]
