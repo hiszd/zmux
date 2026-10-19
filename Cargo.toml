@@ -5,10 +5,10 @@ edition = "2024"
 rust-version = "1.88"
 
 [dependencies]
-alacritty_terminal = "0.25"
+alacritty_terminal = "0.26"
 crossterm = "0.29"
-mlua = { version = "0.11", features = ["luajit", "vendored"] }
-portable-pty = "0.8"
+mlua = { version = "0.12", features = ["luajit", "vendored"] }
+portable-pty = "0.9"
 ratatui = "0.30"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }

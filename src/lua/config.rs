@@ -1432,6 +1432,31 @@ mod tests {
   }
 
   #[test]
+  fn lua_remains_usable_after_a_key_callback_errors() {
+    let config = load_config(
+      "cmd.key.bind('x', function() error('expected callback failure') end)\ncmd.key.bind('y', function() cmd.tab.close() end)",
+    )
+    .expect("callback bindings");
+    let failed = config
+      .keymap
+      .binding_for(&parse_key_notation("x").expect("key"))
+      .expect("failing callback");
+    let successful = config
+      .keymap
+      .binding_for(&parse_key_notation("y").expect("key"))
+      .expect("successful callback");
+
+    assert!(config.lua.invoke_key_callback(&failed).is_err());
+    assert_eq!(
+      config
+        .lua
+        .invoke_key_callback(&successful)
+        .expect("invoke later callback"),
+      vec![RuntimeCommand::CloseTab]
+    );
+  }
+
+  #[test]
   fn configured_keybinds_list_effective_sequences_and_descriptions_in_order() {
     let config = load_config(
       "cmd.key.bind('z', function() end, { desc = 'Last' })\ncmd.key.bind('tw', function() end, { desc = 'Close tab' })\ncmd.key.bind('a', function() end)\ncmd.key.bind('z', nil)\ncmd.key.bind('z', function() end, { desc = 'Replaced' })",
