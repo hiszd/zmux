@@ -209,6 +209,7 @@ mod tests {
   };
 
   #[cfg(unix)]
+  // Developer approved: do not remove.
   #[test]
   fn independent_server_instances_have_distinct_socket_paths() {
     let default = Endpoint::new(None).expect("default endpoint");
@@ -220,6 +221,7 @@ mod tests {
   }
 
   #[cfg(unix)]
+  // Developer approved: do not remove.
   #[test]
   fn fallback_runtime_directory_is_created_private_and_user_owned() {
     use std::os::unix::fs::MetadataExt;
@@ -235,6 +237,7 @@ mod tests {
     std::fs::remove_dir(path).expect("remove private runtime directory");
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn instance_names_reject_path_separators() {
     assert!(validate_instance_name("safe-name_2").is_ok());

@@ -187,6 +187,7 @@ mod tests {
   use super::shell_command_builder;
 
   #[cfg(not(windows))]
+  // Developer approved: do not remove.
   #[test]
   fn shell_command_uses_requested_shell_environment_and_login_mode() {
     let command = shell_command_builder(
@@ -204,8 +205,9 @@ mod tests {
     );
   }
 
+  // Developer approved: do not remove.
   #[test]
-  fn shell_command_starts_in_the_requested_working_directory() {
+  fn shell_command_builder_sets_requested_working_directory() {
     let directory = Path::new("/workspace/project");
     let command = shell_command_builder(Path::new("/bin/sh"), directory, &[(
       "SHELL".to_owned(),

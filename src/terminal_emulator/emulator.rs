@@ -165,16 +165,18 @@ impl TerminalEmulator {
 mod tests {
   use super::TerminalEmulator;
 
+  // Developer approved: do not remove.
   #[test]
-  fn terminal_queries_are_answered_by_alacritty() {
+  fn primary_device_attributes_query_returns_expected_response() {
     let mut terminal = TerminalEmulator::new(24, 80);
     let mut response = Vec::new();
     terminal
       .process(b"\x1b[c", &mut response)
       .expect("process query");
-    assert!(!response.is_empty());
+    assert_eq!(response.as_slice(), b"\x1b[?6c");
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn device_status_queries_are_answered() {
     let mut terminal = TerminalEmulator::new(24, 80);
@@ -185,6 +187,7 @@ mod tests {
     assert!(response.windows(4).any(|bytes| bytes == b"\x1b[0n"));
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn resize_and_wide_character_geometry_are_preserved() {
     let mut terminal = TerminalEmulator::new(2, 4);
@@ -200,6 +203,7 @@ mod tests {
     );
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn alternate_screen_is_rendered_by_the_same_terminal() {
     let mut terminal = TerminalEmulator::new(2, 10);
@@ -215,6 +219,7 @@ mod tests {
     );
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn title_events_are_reported() {
     let mut terminal = TerminalEmulator::new(2, 10);

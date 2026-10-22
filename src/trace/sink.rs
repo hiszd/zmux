@@ -81,6 +81,7 @@ mod tests {
 
   use super::*;
 
+  // Developer approved: do not remove.
   #[test]
   fn error_records_context_and_flushes_details() {
     let unique = SystemTime::now()

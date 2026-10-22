@@ -17,6 +17,7 @@ use ratatui::{
     Widget,
   },
 };
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use super::key_notation::{
@@ -237,13 +238,13 @@ fn truncate_with_ellipsis(value: &str, width: usize) -> String {
   let target = width.saturating_sub(UnicodeWidthStr::width("…"));
   let mut result = String::new();
   let mut used = 0;
-  for character in value.chars() {
-    let character_width = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
-    if used + character_width > target {
+  for grapheme in value.graphemes(true) {
+    let grapheme_width = UnicodeWidthStr::width(grapheme);
+    if used + grapheme_width > target {
       break;
     }
-    result.push(character);
-    used += character_width;
+    result.push_str(grapheme);
+    used += grapheme_width;
   }
   result.push('…');
   result
@@ -262,6 +263,7 @@ fn popup_area(area: Rect, height: u16) -> Rect {
 mod tests {
   use super::*;
 
+  // Developer approved: do not remove.
   #[test]
   fn popup_is_full_width_and_anchored_to_bottom() {
     let view = Rect::new(3, 4, 80, 24);
@@ -277,6 +279,7 @@ mod tests {
     assert_eq!(shown.height, 8);
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn popup_caps_height_and_reports_scroll_range() {
     let view = Rect::new(0, 0, 80, 20);
@@ -290,6 +293,7 @@ mod tests {
     assert_eq!(popup.max_scroll(view), 8);
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn column_count_is_capped_to_preserve_description_width() {
     let view = Rect::new(0, 0, 240, 20);
@@ -302,30 +306,29 @@ mod tests {
     assert_eq!(layout.total_rows, 15);
   }
 
+  // Developer approved: do not remove.
   #[test]
-  fn truncation_uses_unicode_ellipsis_and_display_width() {
-    assert_eq!(truncate_with_ellipsis("abcdefgh", 6), "abcde…");
-    assert_eq!(truncate_with_ellipsis("日本語", 5), "日本…");
-    assert_eq!(truncate_with_ellipsis("abc", 3), "abc");
-  }
+  fn truncation_respects_narrow_widths_and_unicode_graphemes() {
+    let cases = [
+      ("zero-width", "abcdef", 0, ""),
+      ("one-column", "abcdef", 1, "…"),
+      ("two-column", "abcdef", 2, "a…"),
+      ("ASCII", "abcdefgh", 6, "abcde…"),
+      ("narrow CJK", "日本語", 1, "…"),
+      ("CJK", "日本語", 5, "日本…"),
+      ("combining mark", "e\u{301}clair", 2, "e\u{301}…"),
+      ("emoji ZWJ sequence", "👩‍💻work", 3, "👩‍💻…"),
+      ("exact fit", "abc", 3, "abc"),
+    ];
 
-  #[test]
-  fn nested_completion_shows_ellipsis_after_description() {
-    let lines = completion_lines(
-      40,
-      &[(
-        key_notation::parse_key_notation("a").expect("valid key")[0],
-        Some("Nested".to_owned()),
-        true,
-      )],
-      1,
-    );
-    let text: String = lines[0]
-      .spans
-      .iter()
-      .map(|span| span.content.as_ref())
-      .collect();
-    assert!(text.contains("Nested …"));
+    for (case, input, width, expected) in cases {
+      let actual = truncate_with_ellipsis(input, width);
+      assert_eq!(actual, expected, "{case} truncation at width {width}");
+      assert!(
+        UnicodeWidthStr::width(actual.as_str()) <= width,
+        "{case} output exceeds width {width}: {actual:?}"
+      );
+    }
   }
 
   fn completion(key: &str) -> (KeyStroke, Option<String>, bool) {

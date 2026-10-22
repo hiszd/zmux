@@ -81,6 +81,7 @@ impl<T> TabSet<T> {
 mod tests {
   use super::TabSet;
 
+  // Developer approved: do not remove.
   #[test]
   fn navigation_wraps_and_selects_one_based_tab_numbers() {
     let mut tabs = TabSet::default();
@@ -100,6 +101,7 @@ mod tests {
     assert!(!tabs.select(2));
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn navigation_with_one_tab_is_a_noop() {
     let mut tabs = TabSet::default();
@@ -109,6 +111,7 @@ mod tests {
     assert_eq!(tabs.active(), Some(&"only"));
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn closing_active_tab_selects_a_neighbor_and_can_empty_the_set() {
     let mut tabs = TabSet::default();

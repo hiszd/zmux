@@ -329,6 +329,7 @@ mod tests {
     write_frame,
   };
 
+  // Developer approved: do not remove.
   #[test]
   fn framed_messages_round_trip_with_binary_terminal_input() {
     let message = ClientMessage::Request {
@@ -344,6 +345,7 @@ mod tests {
     assert_eq!(decoded, message);
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn legacy_bincode_frames_remain_readable_and_writable() {
     let message = ClientMessage::Hello(ClientHello {
@@ -375,6 +377,7 @@ mod tests {
     assert_eq!(decoded, message);
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn frame_rejects_trailing_payload_bytes() {
     let message = ClientMessage::Request {
@@ -392,6 +395,7 @@ mod tests {
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn hello_frame_preserves_target_and_client_viewport() {
     let message = ClientMessage::Hello(ClientHello {

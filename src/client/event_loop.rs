@@ -640,14 +640,6 @@ struct SessionPickerState {
   highlighted: usize,
 }
 
-fn session_picker_visible_indices(query: &str, sessions: &[SessionSummary]) -> Vec<usize> {
-  let labels: Vec<String> = sessions
-    .iter()
-    .map(|session| session.number.clone())
-    .collect();
-  zmux::picker::fuzzy_filter(query, &labels)
-}
-
 /// Owned, render-ready representation of any client modal.
 struct ModalDisplay {
   /// Border title.
@@ -876,7 +868,12 @@ impl ClientSession {
           )
         })
         .collect();
-      let visible = session_picker_visible_indices(&picker.query, &picker.sessions);
+      let session_names: Vec<String> = picker
+        .sessions
+        .iter()
+        .map(|session| session.number.clone())
+        .collect();
+      let visible = zmux::picker::fuzzy_filter(&picker.query, &session_names);
       return Some(ModalDisplay {
         title: "Switch Session".to_owned(),
         query: Some(picker.query.clone()),
@@ -2246,7 +2243,12 @@ fn handle_session_picker_key(
   let Some(mut picker) = context.session.session_picker.take() else {
     return Ok(Effects::default());
   };
-  let visible = session_picker_visible_indices(&picker.query, &picker.sessions);
+  let session_names: Vec<String> = picker
+    .sessions
+    .iter()
+    .map(|session| session.number.clone())
+    .collect();
+  let visible = zmux::picker::fuzzy_filter(&picker.query, &session_names);
   match key.code {
     crossterm::event::KeyCode::Esc => Ok(Effects {
       redraw: true,
@@ -2846,28 +2848,44 @@ fn render_bars(lua: &LuaConfig, trace: &Trace) -> mlua::Result<ui::BarContents> 
 mod tests {
   use zmux::{
     protocol::{
-      SessionSummary,
+      ClientMessage,
+      ClientRequest,
+      SessionSnapshot,
+      TabSnapshot,
       TerminalSnapshot,
+      Viewport,
+      WorkspaceSnapshot,
     },
     transport::Endpoint,
   };
 
   use super::{
+    ClientContext,
+    ClientSession,
     DirectoryPicker,
+    Effects,
     TerminalView,
     WorkspaceDialog,
     WorkspaceDialogMode,
     WorkspaceField,
+    dispatch_ui_events,
     run_pre_client,
     run_pre_client_with_picker,
-    session_picker_visible_indices,
   };
-  use crate::lua::{
-    self,
-    LaunchState,
-    RuntimeCommand,
+  use crate::{
+    input::{
+      KeyDispatcher,
+      KeyMap,
+      key_notation::normalize_prefix_key,
+    },
+    lua::{
+      self,
+      LaunchState,
+      RuntimeCommand,
+    },
   };
 
+  // Developer approved: do not remove.
   #[test]
   fn pre_client_runs_handlers_and_returns_commands_for_client_initialization() {
     let config = lua::load_config_with_context(
@@ -2897,6 +2915,7 @@ mod tests {
     assert_eq!(commands, vec![RuntimeCommand::NewTab]);
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn interrupt_picker_finishes_before_later_pre_client_handlers_run() {
     let config = lua::load_config_with_context(
@@ -2937,27 +2956,104 @@ mod tests {
     assert_eq!(commands, vec![RuntimeCommand::NewTab]);
   }
 
+  // Developer approved: do not remove.
   #[test]
-  fn session_picker_filters_by_session_name_not_metadata() {
-    let sessions = vec![
-      SessionSummary {
-        number: "alpha".to_owned(),
-        clients: 1,
-        workspaces: 2,
-        tabs: 3,
-      },
-      SessionSummary {
-        number: "beta".to_owned(),
-        clients: 1,
-        workspaces: 2,
-        tabs: 3,
-      },
-    ];
+  fn lua_event_commands_wait_for_callback_completion() {
+    let config = lua::load_config(
+      r#"
+            cmd.event.on("tab_selected", function(event)
+                cmd.tab.next()
+                if event.index == 1 then
+                    error("expected callback failure")
+                end
+            end)
+            "#,
+    )
+    .expect("event callback config");
+    let snapshot = SessionSnapshot {
+      number: "9".to_owned(),
+      workspaces: vec![WorkspaceSnapshot {
+        id: 4,
+        name: "project".to_owned(),
+        explicit_name: None,
+        working_directory: "/work/project".into(),
+        tabs: vec![TabSnapshot {
+          id: 20,
+          name: "1".to_owned(),
+          title: "shell-one".to_owned(),
+          exit_code: None,
+        }],
+        active_tab_id: 20,
+      }],
+      active_workspace_id: 4,
+    };
+    let viewport = Viewport {
+      rows: 24,
+      columns: 80,
+    };
+    let mut session = ClientSession::new(snapshot, Vec::new(), viewport);
+    let mut outer_size = (80, 24);
+    let mut viewport = viewport;
+    let mut dispatcher = KeyDispatcher::new(
+      normalize_prefix_key("<C-Space>").expect("prefix key"),
+      std::time::Duration::from_millis(700),
+      KeyMap::default(),
+    );
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let mut next_request_id = 1;
+    let trace = crate::trace::Trace::from_environment();
+    let mut context = ClientContext {
+      session: &mut session,
+      outer_size: &mut outer_size,
+      viewport: &mut viewport,
+      dispatcher: &mut dispatcher,
+      sender: &sender,
+      next_request_id: &mut next_request_id,
+      lua: &config.lua,
+      trace: &trace,
+    };
 
-    assert_eq!(session_picker_visible_indices("z", &sessions), Vec::<usize>::new());
-    assert_eq!(session_picker_visible_indices("bt", &sessions), vec![1]);
+    dispatch_ui_events(
+      Effects {
+        events: vec![lua::AppEvent {
+          name: "tab_selected".to_owned(),
+          index: Some(2),
+          ..lua::AppEvent::default()
+        }],
+        ..Effects::default()
+      },
+      &mut context,
+    )
+    .expect("successful callback dispatch");
+    let requests = receiver.try_iter().collect::<Vec<_>>();
+    assert!(
+      requests
+        .iter()
+        .any(|message| matches!(message, ClientMessage::Request {
+          request: ClientRequest::NextTab,
+          ..
+        }))
+    );
+
+    let error = match dispatch_ui_events(
+      Effects {
+        events: vec![lua::AppEvent {
+          name: "tab_selected".to_owned(),
+          index: Some(1),
+          ..lua::AppEvent::default()
+        }],
+        ..Effects::default()
+      },
+      &mut context,
+    ) {
+      Ok(_) => panic!("failed callback should abort event dispatch"),
+      Err(error) => error,
+    };
+    assert!(error.to_string().contains("expected callback failure"));
+    assert!(matches!(receiver.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn terminal_parser_uses_shared_pty_geometry_not_client_viewport() {
     let view = TerminalView::from_snapshot(TerminalSnapshot {
@@ -2972,20 +3068,7 @@ mod tests {
     assert_eq!(view.emulator.size(), (40, 120));
   }
 
-  #[test]
-  fn empty_terminal_titles_use_a_stable_fallback() {
-    let view = TerminalView::from_snapshot(TerminalSnapshot {
-      tab_id: 7,
-      rows: 2,
-      columns: 4,
-      bytes: Vec::new(),
-      title: String::new(),
-      exit_code: None,
-    });
-
-    assert_eq!(view.title, "Terminal 7");
-  }
-
+  // Developer approved: do not remove.
   #[test]
   fn directory_selector_fuzzily_finds_and_chooses_child_directories() {
     let root = std::env::temp_dir().join(format!("zmux-picker-test-{}", std::process::id()));

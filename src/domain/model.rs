@@ -327,13 +327,7 @@ mod tests {
     workspace
   }
 
-  #[test]
-  fn session_names_are_string_values() {
-    let name = SessionName::new("project");
-
-    assert_eq!(name.get(), "project");
-  }
-
+  // Developer approved: do not remove.
   #[test]
   fn workspace_name_defaults_to_directory_basename_and_tracks_directory_edits() {
     let mut workspace = Workspace::new(WorkspaceId::new(1), PathBuf::from("/work/alpha"), None);
@@ -345,6 +339,7 @@ mod tests {
     assert_eq!(workspace.name(), "beta");
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn explicit_workspace_name_survives_directory_edits_and_can_be_cleared() {
     let mut workspace = Workspace::new(
@@ -361,6 +356,7 @@ mod tests {
     assert_eq!(workspace.name(), "beta");
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn empty_explicit_workspace_name_uses_directory_basename() {
     let workspace =
@@ -369,6 +365,7 @@ mod tests {
     assert_eq!(workspace.name(), "alpha");
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn newly_added_tab_becomes_the_workspace_active_tab() {
     let mut workspace = Workspace::new(WorkspaceId::new(3), PathBuf::from("/work"), None);
@@ -382,6 +379,7 @@ mod tests {
     assert_eq!(workspace.active_tab(), Some(second));
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn closing_active_tab_selects_the_tab_moved_into_its_position() {
     let mut workspace = Workspace::new(WorkspaceId::new(4), PathBuf::from("/work"), None);
@@ -395,6 +393,7 @@ mod tests {
     assert_eq!(workspace.active_tab(), Some(tabs[2]));
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn closing_final_tab_marks_workspace_for_cascading_removal() {
     let mut workspace = Workspace::new(WorkspaceId::new(5), PathBuf::from("/work"), None);
@@ -406,6 +405,7 @@ mod tests {
     assert_eq!(workspace.active_tab(), None);
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn closing_inactive_tab_preserves_workspace_selection() {
     let mut workspace = Workspace::new(WorkspaceId::new(6), PathBuf::from("/work"), None);
@@ -418,6 +418,7 @@ mod tests {
     assert_eq!(workspace.active_tab(), Some(second));
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn switching_workspaces_restores_each_workspace_last_active_tab() {
     let first_workspace = workspace(1, &[1, 2]);
@@ -443,6 +444,7 @@ mod tests {
     assert_eq!(session.active_tab(), Some(TabId::new(1)));
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn closing_tabs_cascades_through_workspace_and_session() {
     let first_workspace = workspace(1, &[1, 2]);

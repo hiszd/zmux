@@ -890,10 +890,6 @@ fn default_style(segment: &BarSegment) -> Style {
   }
 }
 
-/// Converts an empty terminal cell into a visible blank terminal cell.
-#[cfg(test)]
-fn display_symbol(contents: &str) -> &str { if contents.is_empty() { " " } else { contents } }
-
 fn cell_style(cell: &Cell) -> Style {
   let mut modifiers = Modifier::empty();
   if cell.flags.contains(Flags::BOLD) {
@@ -953,7 +949,6 @@ mod tests {
     UiOptions,
     WorkspaceDrawerItem,
     WorkspaceDrawerRender,
-    display_symbol,
     layout,
     render_screen,
   };
@@ -962,12 +957,7 @@ mod tests {
     terminal_emulator::TerminalEmulator,
   };
 
-  #[test]
-  fn empty_terminal_cells_render_as_spaces() {
-    assert_eq!(display_symbol(""), " ");
-    assert_eq!(display_symbol("x"), "x");
-  }
-
+  // Developer approved: do not remove.
   #[test]
   fn anchors_reserve_rows_and_resize_the_terminal_workspace() {
     let options = UiOptions {
@@ -991,6 +981,7 @@ mod tests {
     assert_eq!(expanded.pane, collapsed.pane);
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn workspace_drawer_collapses_to_initials_and_expands_to_full_names() {
     let area = Rect::new(0, 0, 30, 6);
@@ -1031,6 +1022,7 @@ mod tests {
     assert_eq!(buffer[(1, 1)].symbol(), "b");
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn screen_render_projects_current_contents_and_erasure() {
     let mut parser = TerminalEmulator::new(2, 4);

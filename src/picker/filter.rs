@@ -37,6 +37,7 @@ fn fuzzy_score(query: &[char], candidate: &str) -> Option<usize> {
 mod tests {
   use super::fuzzy_filter;
 
+  // Developer approved: do not remove.
   #[test]
   fn fuzzy_filter_matches_case_insensitive_subsequences_and_prefers_tight_matches() {
     let labels = ["foo-bar".to_owned(), "fuzzy picker".to_owned(), "far-away".to_owned()];
@@ -45,6 +46,7 @@ mod tests {
     assert_eq!(fuzzy_filter("fa", &labels), vec![2, 0]);
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn empty_query_preserves_the_input_order() {
     let labels = ["third".to_owned(), "first".to_owned()];

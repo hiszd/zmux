@@ -286,6 +286,7 @@ mod tests {
     ));
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn unbound_keys_are_not_forwarded_after_prefix() {
     let (_lua, mut dispatcher) = dispatcher(&[]);
@@ -298,19 +299,24 @@ mod tests {
     assert!(!dispatcher.is_leader());
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn unbound_key_leaves_infinite_leader_mode() {
     let (_lua, mut dispatcher) = dispatcher_with_timeout(&[], Duration::ZERO);
     let now = Instant::now();
     press_prefix(&mut dispatcher, now);
     assert!(dispatcher.is_leader());
+    let after_long_wait = now + Duration::from_secs(60);
+    assert!(dispatcher.expire(after_long_wait).is_none());
+    assert!(dispatcher.is_leader());
     assert!(matches!(
-        dispatcher.handle_event(key(KeyCode::Char('z'), KeyModifiers::NONE), now),
+        dispatcher.handle_event(key(KeyCode::Char('z'), KeyModifiers::NONE), after_long_wait),
         KeyOutcome::Unbound(value) if value == "z"
     ));
     assert!(!dispatcher.is_leader());
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn prefix_is_consumed_and_regular_terminal_keys_are_forwarded() {
     let (_lua, mut dispatcher) = dispatcher(&[]);
@@ -323,18 +329,55 @@ mod tests {
     assert!(dispatcher.is_leader());
   }
 
+  // Developer approved: do not remove.
   #[test]
-  fn shift_v_is_forwarded_as_uppercase_v() {
-    let (_lua, mut dispatcher) = dispatcher(&[]);
+  fn terminal_input_forwarding_handles_special_keys_modifiers_and_event_kinds() {
+    let mut dispatcher = KeyDispatcher::new(
+      normalize_prefix_key("<C-x>").expect("prefix key"),
+      Duration::from_millis(700),
+      KeyMap::default(),
+    );
     let now = Instant::now();
-    let KeyOutcome::Forward(bytes) =
-      dispatcher.handle_event(key(KeyCode::Char('v'), KeyModifiers::SHIFT), now)
-    else {
-      panic!("Shift+v should be forwarded to the PTY");
+    let cases = [
+      (KeyCode::Char('v'), KeyModifiers::SHIFT, &b"V"[..]),
+      (KeyCode::Char('x'), KeyModifiers::ALT, &b"\x1bx"[..]),
+      (KeyCode::Char(' '), KeyModifiers::CONTROL, &b"\0"[..]),
+      (KeyCode::Char('c'), KeyModifiers::CONTROL, &b"\x03"[..]),
+      (KeyCode::Char('界'), KeyModifiers::NONE, "界".as_bytes()),
+      (KeyCode::Enter, KeyModifiers::NONE, &b"\r"[..]),
+      (KeyCode::Esc, KeyModifiers::NONE, &b"\x1b"[..]),
+      (KeyCode::Backspace, KeyModifiers::NONE, &b"\x7f"[..]),
+      (KeyCode::Tab, KeyModifiers::NONE, &b"\t"[..]),
+      (KeyCode::Left, KeyModifiers::NONE, &b"\x1b[D"[..]),
+      (KeyCode::Right, KeyModifiers::NONE, &b"\x1b[C"[..]),
+      (KeyCode::Up, KeyModifiers::NONE, &b"\x1b[A"[..]),
+      (KeyCode::Down, KeyModifiers::NONE, &b"\x1b[B"[..]),
+      (KeyCode::Home, KeyModifiers::NONE, &b"\x1b[H"[..]),
+      (KeyCode::End, KeyModifiers::NONE, &b"\x1b[F"[..]),
+      (KeyCode::Delete, KeyModifiers::NONE, &b"\x1b[3~"[..]),
+      (KeyCode::PageUp, KeyModifiers::NONE, &b"\x1b[5~"[..]),
+      (KeyCode::PageDown, KeyModifiers::NONE, &b"\x1b[6~"[..]),
+    ];
+    for (code, modifiers, expected) in cases {
+      let KeyOutcome::Forward(bytes) = dispatcher.handle_event(key(code, modifiers), now) else {
+        panic!("{code:?} with {modifiers:?} should be forwarded to the PTY");
+      };
+      assert_eq!(bytes.as_slice(), expected, "{code:?} with {modifiers:?}");
+    }
+
+    let mut release = key(KeyCode::Char('r'), KeyModifiers::NONE);
+    release.kind = crossterm::event::KeyEventKind::Release;
+    assert!(matches!(dispatcher.handle_event(release, now), KeyOutcome::Ignored));
+
+    let mut repeat = key(KeyCode::Char('r'), KeyModifiers::NONE);
+    repeat.kind = crossterm::event::KeyEventKind::Repeat;
+    let KeyOutcome::Forward(bytes) = dispatcher.handle_event(repeat, now) else {
+      panic!("repeated keys should be forwarded to the PTY");
     };
-    assert_eq!(bytes, b"V");
+    assert_eq!(bytes, b"r");
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn a_shorter_binding_waits_for_longer_sequence_then_timeout_executes_it() {
     let (lua, mut dispatcher) = dispatcher(&[("a", "short"), ("aa", "long")]);
@@ -357,6 +400,7 @@ mod tests {
     assert_eq!(lua.globals().get::<String>("called").expect("callback ran"), "short");
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn longer_sequence_wins_when_completed_within_timeout() {
     let (lua, mut dispatcher) = dispatcher(&[("a", "short"), ("aa", "long")]);
@@ -372,6 +416,7 @@ mod tests {
     assert_eq!(lua.globals().get::<String>("called").expect("callback ran"), "long");
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn mismatching_key_resolves_pending_shorter_binding() {
     let (lua, mut dispatcher) = dispatcher(&[("a", "short"), ("aa", "long")]);

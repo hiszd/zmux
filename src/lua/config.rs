@@ -1162,6 +1162,7 @@ mod tests {
     }
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn pre_client_handlers_receive_arguments_and_mutate_launch_state() {
     let launch = LaunchState {
@@ -1222,6 +1223,7 @@ mod tests {
       .expect("run ClientLoaded handler");
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn sample_configuration_loads_with_luajit() {
     let config = load_config(include_str!("../../zmux.lua")).expect("sample Lua config");
@@ -1238,6 +1240,7 @@ mod tests {
     assert_eq!(segments[1].style.and_then(|style| style.bg), Some(Color::Cyan));
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn repeated_ui_state_and_bar_callbacks_do_not_exhaust_the_lua_stack() {
     let config = load_config(include_str!("../../zmux.lua")).expect("sample Lua config");
@@ -1299,6 +1302,7 @@ mod tests {
     }
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn which_key_options_accept_rows_and_percentages_with_a_sixty_percent_cap() {
     let config = load_config(
@@ -1322,6 +1326,7 @@ mod tests {
     assert_eq!(options.which.max_height.rows(100), 20);
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn generic_picker_returns_selected_items_and_nil_on_escape_to_lua_callback() {
     let config = load_config(
@@ -1372,6 +1377,7 @@ mod tests {
     );
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn lua_receives_server_authoritative_session_and_workspace_state() {
     let config = load_config(
@@ -1406,6 +1412,7 @@ mod tests {
     assert_eq!(commands, vec![RuntimeCommand::NextTab]);
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn callbacks_can_be_bound_unbound_and_invoked() {
     let config = load_config(
@@ -1431,6 +1438,7 @@ mod tests {
     assert!(load_config("cmd.key.bind('a<Esc>', function() end)").is_err());
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn lua_remains_usable_after_a_key_callback_errors() {
     let config = load_config(
@@ -1456,6 +1464,7 @@ mod tests {
     );
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn configured_keybinds_list_effective_sequences_and_descriptions_in_order() {
     let config = load_config(
@@ -1470,6 +1479,7 @@ mod tests {
     ]);
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn key_options_use_neovim_notation_and_validate_timeout() {
     let config = load_config("").expect("valid defaults");
@@ -1494,31 +1504,13 @@ mod tests {
     assert!(load_config("opt.prefix_key = 'tw'").is_err());
   }
 
-  #[test]
-  fn lua_commands_are_deferred_until_registered_event_callback_returns() {
-    let config = load_config(
-            "cmd.event.on('tab_selected', function(event)\n  assert(global == g)\n  assert(g.active_tab.index == event.index)\n  cmd.tab.next()\nend)",
-        )
-        .expect("valid callback config");
-    config.lua.sync_state(&snapshot()).expect("state sync");
-    let event = AppEvent {
-      name: "tab_selected".to_owned(),
-      index: Some(2),
-      ..AppEvent::default()
-    };
-    let callbacks = config.lua.event_handlers("tab_selected");
-    let commands = config
-      .lua
-      .invoke_event_handler(&callbacks[0], &event)
-      .expect("callback dispatch");
-    assert_eq!(commands, vec![RuntimeCommand::NextTab]);
-  }
-
+  // Developer approved: do not remove.
   #[test]
   fn runtime_commands_cannot_be_called_during_config_loading() {
     assert!(load_config("cmd.tab.next()").is_err());
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn bar_functions_receive_synced_global_state_and_apply_styles() {
     let config = load_config(

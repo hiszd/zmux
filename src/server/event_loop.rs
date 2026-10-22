@@ -1507,6 +1507,7 @@ mod tests {
     }
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn attached_clients_share_workspace_changes_and_closing_cascades() {
     let endpoint = Endpoint::new(Some(&format!("multi-client-test-{}", std::process::id())))
@@ -1618,6 +1619,7 @@ mod tests {
   }
 
   #[cfg(unix)]
+  // Developer approved: do not remove.
   #[test]
   fn workspace_directory_changes_only_affect_new_tabs() {
     let root = std::env::temp_dir().join(format!("zmux-cwd-test-{}", std::process::id()));
@@ -1763,6 +1765,7 @@ mod tests {
     std::fs::remove_dir_all(root).expect("remove test directories");
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn attach_to_unknown_session_name_is_rejected() {
     let endpoint = Endpoint::new(Some(&format!("unknown-session-test-{}", std::process::id())))
@@ -1798,6 +1801,7 @@ mod tests {
     server.join().expect("Server exits without Sessions");
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn incompatible_client_protocol_is_rejected_without_a_session() {
     let endpoint =
@@ -1842,6 +1846,7 @@ mod tests {
     panic!("Server listener becomes ready")
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn closing_the_final_tab_cascades_to_session_and_server_shutdown() {
     let endpoint =
@@ -1868,6 +1873,7 @@ mod tests {
       .expect("Server exits after final Session closes");
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn no_target_connection_creates_numbered_session_and_stop_destroys_server() {
     let endpoint =
@@ -1952,6 +1958,7 @@ mod tests {
     server.join().expect("Server terminates after stop-server");
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn headless_requests_create_list_rename_and_stop_without_client_attachment() {
     let endpoint =

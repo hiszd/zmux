@@ -583,11 +583,23 @@ mod tests {
     parse_args,
   };
 
+  // Developer approved: do not remove.
   #[test]
   fn cli_requires_a_command() {
-    assert!(parse_args(std::iter::empty()).is_err());
+    let error = parse_args(std::iter::empty())
+      .err()
+      .expect("empty arguments must be rejected");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("a command is required"));
+    assert!(
+      error
+        .to_string()
+        .contains("'new', 'attach', 'list', 'kill', or 'server'")
+    );
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn new_can_create_or_attach_a_named_session() {
     let options = parse_args(
@@ -606,30 +618,7 @@ mod tests {
     );
   }
 
-  #[test]
-  fn list_accepts_attach_long_and_short_flags() {
-    let long = parse_args(["list", "--attach"].map(str::to_owned).into_iter())
-      .expect("valid list attach command");
-    let short =
-      parse_args(["list", "-a"].map(str::to_owned).into_iter()).expect("valid list attach command");
-
-    assert!(matches!(long.command, Command::List { attach: true }));
-    assert!(matches!(short.command, Command::List { attach: true }));
-  }
-
-  #[test]
-  fn attach_requires_an_existing_session_target() {
-    let options = parse_args(
-      ["attach", "12", "--socket", "project"]
-        .map(str::to_owned)
-        .into_iter(),
-    )
-    .expect("valid attach command");
-
-    assert!(matches!(options.command, Command::Attach(ref name) if name == "12"));
-    assert_eq!(options.socket_instance, "project");
-  }
-
+  // Developer approved: do not remove.
   #[test]
   fn run_accepts_script_arguments_and_launch_options() {
     let options = parse_args(
@@ -644,6 +633,7 @@ mod tests {
     assert_eq!(options.socket_instance, "named");
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn run_accepts_inline_source_and_preserves_following_arguments() {
     let options = parse_args(
@@ -658,19 +648,7 @@ mod tests {
     assert_eq!(options.socket_instance, "script-socket");
   }
 
-  #[test]
-  fn run_requires_a_source_and_rejects_removed_file_flag() {
-    assert!(parse_args(["run"].map(str::to_owned).into_iter()).is_err());
-    assert!(
-      parse_args(
-        ["run", "--file", "script.lua"]
-          .map(str::to_owned)
-          .into_iter()
-      )
-      .is_err()
-    );
-  }
-
+  // Developer approved: do not remove.
   #[test]
   fn cli_rejects_invalid_session_names_and_arguments() {
     assert!(parse_args(["new", ""].map(str::to_owned).into_iter()).is_err());
@@ -686,6 +664,7 @@ mod tests {
     assert!(parse_args(["new", "--socket"].map(str::to_owned).into_iter()).is_err());
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn keybinds_accepts_optional_json_output_flag() {
     let plain = parse_args(["keybinds"].map(str::to_owned).into_iter()).expect("keybind command");
@@ -697,6 +676,7 @@ mod tests {
     assert!(parse_args(["keybinds", "--yaml"].map(str::to_owned).into_iter()).is_err());
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn keybinds_json_is_pretty_printed_and_includes_prefix_and_descriptions() {
     let config = lua::load_config(

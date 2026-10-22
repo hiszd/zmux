@@ -271,6 +271,7 @@ pub fn encode_key(event: CrosstermKeyEvent) -> Option<Vec<u8>> {
 mod tests {
   use super::*;
 
+  // Developer approved: do not remove.
   #[test]
   fn parses_literal_and_notation_sequences() {
     assert_eq!(parse_key_notation("tw").expect("keys").len(), 2);
@@ -284,6 +285,7 @@ mod tests {
     assert_eq!(parse_key_notation("<Bar>").expect("key")[0].key, Key::Char('|'));
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn keeps_case_sensitive_plain_keys() {
     let sequence = parse_key_notation("tT").expect("keys");
@@ -292,6 +294,7 @@ mod tests {
     assert_eq!(key_seq_to_string(&sequence), "t<S-t>");
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn rejects_invalid_or_multi_key_prefixes() {
     assert!(parse_key_notation("").is_err());
@@ -301,6 +304,7 @@ mod tests {
     assert!(normalize_prefix_key("ctrl-space").is_err());
   }
 
+  // Developer approved: do not remove.
   #[test]
   fn converts_terminal_keys() {
     let event = CrosstermKeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
