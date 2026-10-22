@@ -68,9 +68,9 @@ The Server starts automatically in the background and remains alive while Sessio
 - **Workspace**: collection of Tabs with a working directory. Its display name defaults to the directory basename, unless explicitly named. New Tabs start there; changing a shell's current directory does not change the Workspace directory.
 - **Tab**: exactly one PTY-backed terminal.
 
-The left Workspace Drawer is always visible as a one-character rail. A configured binding expands it to show full names and take focus; arrows move the temporary highlight, Enter switches the shared active Workspace and collapses the Drawer, and Escape collapses without switching. The Drawer overlays the terminal view and does not resize PTYs. Shared PTYs use the largest attached Client pane dimensions; each Client renders the shared screen in its own viewport.
+There is no built-in Workspace Drawer. Workspace selection remains available through Lua-bound commands such as `cmd.workspace.next()` and `cmd.workspace.previous()`; custom navigation UI can be built with the configurable UI Elements. Shared PTYs use the largest attached Client pane dimensions; each Client renders the shared screen in its own viewport.
 
-Workspace creation and editing use a directory selector and optional name field. Tab moves to the name field; an omitted name receives the first unused numeric sibling name. The initial Workspace of a Session defaults to the launch directory basename. Creating a Workspace starts a Tab there and activates the Workspace. The sample config binds Drawer toggle, Workspace creation/editing, and tab navigation; additional commands can be bound in `zmux.lua`.
+Workspace creation and editing use a directory selector and optional name field. Tab moves to the name field; an omitted name receives the first unused numeric sibling name. The initial Workspace of a Session defaults to the launch directory basename. Creating a Workspace starts a Tab there and activates the Workspace. The sample config binds Workspace creation/editing and tab navigation; additional commands can be bound in `zmux.lua`.
 
 ## Lua configuration
 
@@ -92,9 +92,41 @@ cmd.event.on("ClientLoaded", function()
 end)
 ```
 
-Key bindings use neovim-style notation and Lua callbacks: `cmd.key.bind('tw', function() cmd.tab.close() end, { desc = 'Close the focused tab' })`. Pass `nil` as the callback to unbind a sequence. Bindings are entered after the required prefix (`opt.prefix_key`, default `<C-Space>`); multi-key sequences are supported and `opt.sequence_timeout_ms` defaults to 700 ms; set it to `0` to disable leader/sequence timeouts. Completing a binding exits leader mode, including when timeouts are disabled; an unbound key also exits leader mode and shows a yellow warning. `<Esc>` cannot be bound because it is reserved for cancellation. When a sequence has continuations, zmux displays a bottom-anchored, full-width which-key popup. Unknown keys and callback errors appear briefly in yellow at the bottom right.
+Key bindings use neovim-style notation and Lua callbacks: `cmd.key.bind('tw', function() cmd.tab.close() end, { desc = 'Close the focused tab' })`. Pass `nil` as the callback to unbind a sequence. Bindings are entered after the required prefix (`opt.prefix_key`, default `<C-Space>`); multi-key sequences are supported and `opt.sequence_timeout_ms` defaults to 700 ms; set it to `0` to disable leader/sequence timeouts. Completing a binding exits leader mode, including when timeouts are disabled; an unbound key also exits leader mode and shows a yellow warning. `<Esc>` cannot be bound in the global keymap because it is reserved for cancellation. A focused UI element may bind it; otherwise it blurs the element (or cancels an active global leader sequence). When a sequence has continuations, zmux displays a bottom-anchored, full-width which-key popup. Unknown keys and callback errors appear briefly in yellow at the bottom right.
 
-List the effective bindings from the loaded configuration with `zmux keybinds`; use `--json` for pretty-printed JSON on stdout. Each entry includes its sequence and optional description, and the configured prefix is reported separately. This command loads the Lua config but does not connect to or start the Server.
+### Configurable UI Elements
+
+UI elements are created during config loading and retain a nested tree of `Text`, `row`, and `column` nodes. The built-in Workspace Drawer has been removed; this minimal example creates a custom informational drawer:
+
+```lua
+local ui = cmd.ui
+local status = ui.text({ text = "Ready" })
+local drawer = ui.create({
+    type = "drawer",
+    side = "right",
+    width = "auto",
+    title = "Status",
+    border = "rounded",
+    content = ui.column({ status }),
+    keys = {
+        r = function(element, key)
+            status.set("text", "Handled " .. key.key)
+        end,
+        q = function(element)
+            element.hide()
+        end,
+    },
+})
+
+cmd.key.bind("ui", function()
+    drawer.show()
+    drawer.focus()
+end, { desc = "Show status drawer" })
+```
+
+`Text`, `row`, and `column` constructors return handles. Layout children may be auto-sized, fixed in terminal cells, or set to `"fill"` to share remaining space equally. A focused Drawer checks its direct key bindings before the global key dispatcher; unbound keys can invoke global leader mappings but are never sent to the PTY. When global leader mode is active, element bindings are ignored. A no-op function consumes a local binding; omitting a key removes it. Setters such as `status.set("text", "Updated")` and `drawer.set("border", "double")` invalidate the retained UI and schedule a coalesced redraw.
+
+List global bindings from the loaded configuration with `zmux keybinds`; use `--json` for pretty-printed JSON on stdout. Each entry includes its sequence and optional description, and the configured prefix is reported separately. Focus-scoped UI Element bindings are not included in this listing. This command loads the Lua config but does not connect to or start the Server.
 
 ## Tracing
 

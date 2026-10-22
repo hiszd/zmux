@@ -119,9 +119,6 @@ cmd.key.bind("tc", function()
 end, { desc = "Create a tab" })
 
 -- Workspace
-cmd.key.bind("<C-h>", function()
-	cmd.ui.workspace_drawer.toggle()
-end, { desc = "Toggle workspace drawer" })
 cmd.key.bind("we", function()
 	cmd.workspace.edit()
 end, { desc = "Edit the active workspace" })
@@ -149,3 +146,24 @@ end, { desc = "Switch active session" })
 cmd.key.bind("px", function()
 	cmd.server.stop()
 end, { desc = "Stop the background process" })
+
+local ui = cmd.ui
+
+local message = ui.text({ text = "Hello from your custom drawer!" })
+local drawer = ui.create({
+	type = "drawer",
+	side = "left",
+	width = 36,
+	border = "quadrant_inside",
+	content = ui.column({ message }),
+	keys = {
+		q = function(element)
+			element.hide()
+		end,
+	},
+})
+
+-- Press the configured leader, then "ui" to open and focus the drawer.
+cmd.key.bind("ui", function()
+	drawer.focus() -- Also shows it if it's hidden.
+end, { desc = "Open custom drawer" })

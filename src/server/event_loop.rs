@@ -1967,6 +1967,13 @@ mod tests {
     let server = thread::spawn(move || run(server_endpoint).expect("server loop"));
     let mut client = connect_for_hello(&endpoint);
     let directory = std::env::current_dir().expect("current directory");
+    let default_workspace_id = format!(
+      "headless:{}",
+      directory
+        .file_name()
+        .expect("current directory has a final component")
+        .to_string_lossy()
+    );
     write_frame(
       &mut client,
       &ClientMessage::HeadlessHello(HeadlessHello {
@@ -2023,9 +2030,9 @@ mod tests {
     assert_eq!(
       workspaces
         .iter()
-        .map(|workspace| workspace.id.as_str())
+        .map(|workspace| workspace.id.clone())
         .collect::<Vec<_>>(),
-      ["headless:project", "headless:zmux"]
+      vec!["headless:project".to_owned(), default_workspace_id]
     );
 
     assert_eq!(

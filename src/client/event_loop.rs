@@ -122,6 +122,7 @@ use crate::{
     KeyDispatcher,
     KeyOutcome,
     KeyTimeout,
+    key_notation::KeyStroke,
     which_key::WhichKeyPopup,
   },
   lua::{
@@ -163,7 +164,7 @@ pub fn run(
     trace.error("client.terminal_size", error);
   })?;
   let options = traced_lua(&trace, "lua.sync_options initial", config.lua.sync_options())?;
-  let pane_size = ui::pane_size(size.0, size.1, options, false);
+  let pane_size = ui::pane_size(size.0, size.1, options);
   let viewport = Viewport {
     rows: pane_size.0.max(1),
     columns: pane_size.1.max(1),
@@ -665,8 +666,6 @@ struct ClientSession {
   viewport: Viewport,
   last_error: Option<String>,
   key_warning: Option<(String, Instant)>,
-  drawer_expanded: bool,
-  drawer_highlighted_workspace: Option<u64>,
   workspace_modal: Option<WorkspaceModal>,
   lua_picker: Option<LuaPickerState>,
   session_picker: Option<SessionPickerState>,
@@ -690,8 +689,6 @@ impl ClientSession {
       viewport,
       last_error: None,
       key_warning: None,
-      drawer_expanded: false,
-      drawer_highlighted_workspace: None,
       workspace_modal: None,
       lua_picker: None,
       session_picker: None,
@@ -736,20 +733,8 @@ impl ClientSession {
   fn active_terminal(&self) -> Option<&TerminalView> { self.terminals.get(&self.active_tab()?.id) }
 
   /// Replaces server state and rebuilds all terminal parsers.
-  ///
-  /// A missing highlighted workspace is reset to the new active workspace so
-  /// drawer navigation cannot retain a deleted ID.
   fn set_snapshot(&mut self, snapshot: SessionSnapshot, terminals: Vec<TerminalSnapshot>) {
     self.snapshot = snapshot;
-    if self.drawer_highlighted_workspace.is_none_or(|id| {
-      !self
-        .snapshot
-        .workspaces
-        .iter()
-        .any(|workspace| workspace.id == id)
-    }) {
-      self.drawer_highlighted_workspace = Some(self.snapshot.active_workspace_id);
-    }
     self.terminals = terminals
       .into_iter()
       .map(|terminal| {
@@ -1206,7 +1191,7 @@ fn run_event_loop(
   let size = terminal.size()?;
   let mut outer_size = (size.width, size.height);
   let mut ui_options = traced_lua(&trace, "lua.sync_options initial", config.lua.sync_options())?;
-  let initial_pane = ui::pane_size(outer_size.0, outer_size.1, ui_options, session.drawer_expanded);
+  let initial_pane = ui::pane_size(outer_size.0, outer_size.1, ui_options);
   let mut viewport = Viewport {
     rows: initial_pane.0.max(1),
     columns: initial_pane.1.max(1),
@@ -1275,7 +1260,7 @@ fn run_event_loop(
       outer_size = (size.width, size.height);
       ui_options = traced_lua(&trace, "lua.sync_options redraw", config.lua.sync_options())?;
       session.which_key_options = ui_options.which;
-      let pane = ui::pane_size(outer_size.0, outer_size.1, ui_options, session.drawer_expanded);
+      let pane = ui::pane_size(outer_size.0, outer_size.1, ui_options);
       let new_viewport = Viewport {
         rows: pane.0.max(1),
         columns: pane.1.max(1),
@@ -1298,23 +1283,6 @@ fn run_event_loop(
       let active_terminal = session
         .active_terminal()
         .ok_or("active Tab has no terminal snapshot")?;
-      let drawer_items: Vec<_> = session
-        .snapshot
-        .workspaces
-        .iter()
-        .map(|workspace| ui::WorkspaceDrawerItem {
-          id: workspace.id,
-          name: &workspace.name,
-        })
-        .collect();
-      let drawer = ui::WorkspaceDrawerRender {
-        expanded: session.drawer_expanded,
-        active_id: session.snapshot.active_workspace_id,
-        highlighted_id: session
-          .drawer_highlighted_workspace
-          .unwrap_or(session.snapshot.active_workspace_id),
-        items: &drawer_items,
-      };
       let modal_display = session.modal_display();
       let modal = modal_display.as_ref().map(|display| ui::ModalOverlay {
         title: &display.title,
@@ -1330,7 +1298,8 @@ fn run_event_loop(
         .map(|(warning, _)| warning.as_str());
       let ui_frame = ui::UiRender {
         screen: active_terminal.emulator.grid(),
-        cursor_visible: active_terminal.emulator.cursor_visible(),
+        cursor_visible: config.lua.focused_ui().is_none()
+          && active_terminal.emulator.cursor_visible(),
         leader_mode: dispatcher.is_leader(),
         tab_count: session
           .active_workspace()
@@ -1341,7 +1310,6 @@ fn run_event_loop(
           .as_deref()
           .unwrap_or(active_terminal.title.as_str()),
         active_exit_code: active_terminal.exit_code,
-        workspace_drawer: drawer,
         modal,
         which_key: WhichKeyPopup {
           prefix: dispatcher.sequence().to_vec(),
@@ -1954,12 +1922,12 @@ fn diff_session_state(old: &SessionSnapshot, new: &SessionSnapshot) -> Vec<UiEve
   events
 }
 
-/// Routes one terminal event through modal, drawer, key-dispatch, and resize
+/// Routes one terminal event through modal, focused UI, key dispatch, and resize
 /// handling.
 ///
-/// Modal and drawer controls take precedence over normal key dispatch unless
-/// the leader/prefix sequence is active. Normal keys are converted into
-/// forwarded PTY bytes, Lua callback execution, warnings, or ignored input.
+/// Modals take precedence. Outside global leader mode, a focused UI Element's
+/// direct binding gets first chance; unmatched keys fall through to the global
+/// dispatcher, but are never forwarded to the PTY while UI focus is held.
 fn handle_input(
   event: Event,
   context: &mut ClientContext<'_>,
@@ -2005,6 +1973,43 @@ fn handle_input(
   {
     return handle_workspace_modal_key(*key, context);
   }
+  if !context.dispatcher.is_leader()
+    && let Event::Key(key) = &event
+    && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+    && context.lua.focused_ui().is_some()
+  {
+    let stroke = KeyStroke::from_crossterm(*key);
+    if let Some((_, callback, handle)) =
+      stroke.and_then(|stroke| context.lua.focused_ui_binding(stroke))
+    {
+      context
+        .trace
+        .mark(&format!("ui-key-callback-start key={key:?}"));
+      let effects = match context.lua.invoke_ui_key_callback(&callback, handle, *key) {
+        Ok(commands) => execute_runtime_commands(commands, context)?,
+        Err(error) => {
+          context.trace.error("lua.ui_key_callback", &error);
+          context.session.key_warning =
+            Some((format!("UI key callback: {error}"), Instant::now() + Duration::from_secs(3)));
+          Effects {
+            redraw: true,
+            ..Effects::default()
+          }
+        }
+      };
+      context.trace.mark("ui-key-callback-complete");
+      return Ok(effects);
+    }
+    if key.code == crossterm::event::KeyCode::Esc
+      && key.modifiers.is_empty()
+      && context.lua.blur_focused_ui()
+    {
+      return Ok(Effects {
+        redraw: true,
+        ..Effects::default()
+      });
+    }
+  }
   if context.dispatcher.is_leader()
     && let Event::Key(key) = &event
     && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
@@ -2035,71 +2040,6 @@ fn handle_input(
         redraw: true,
         ..Effects::default()
       });
-    }
-  }
-  if context.session.drawer_expanded
-    && !leader_input
-    && let Event::Key(key) = &event
-  {
-    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-      return Ok(Effects::default());
-    }
-    let workspaces = &context.session.snapshot.workspaces;
-    let active_id = context.session.snapshot.active_workspace_id;
-    let current_id = context
-      .session
-      .drawer_highlighted_workspace
-      .unwrap_or(active_id);
-    let current_index = workspaces
-      .iter()
-      .position(|workspace| workspace.id == current_id)
-      .unwrap_or_default();
-    match key.code {
-      crossterm::event::KeyCode::Esc => {
-        context.session.drawer_expanded = false;
-        return Ok(Effects {
-          redraw: true,
-          ..Effects::default()
-        });
-      }
-      crossterm::event::KeyCode::Up if !workspaces.is_empty() => {
-        let index = if current_index == 0 {
-          workspaces.len() - 1
-        } else {
-          current_index - 1
-        };
-        context.session.drawer_highlighted_workspace = Some(workspaces[index].id);
-        return Ok(Effects {
-          redraw: true,
-          ..Effects::default()
-        });
-      }
-      crossterm::event::KeyCode::Down if !workspaces.is_empty() => {
-        let index = (current_index + 1) % workspaces.len();
-        context.session.drawer_highlighted_workspace = Some(workspaces[index].id);
-        return Ok(Effects {
-          redraw: true,
-          ..Effects::default()
-        });
-      }
-      crossterm::event::KeyCode::Enter => {
-        if let Some(workspace_id) = context.session.drawer_highlighted_workspace
-          && workspace_id != active_id
-        {
-          send_request(
-            context.sender,
-            context.next_request_id,
-            ClientRequest::SelectWorkspace(workspace_id),
-          )?;
-        }
-        context.session.drawer_expanded = false;
-        context.session.drawer_highlighted_workspace = None;
-        return Ok(Effects {
-          redraw: true,
-          ..Effects::default()
-        });
-      }
-      _ => return Ok(Effects::default()),
     }
   }
   match event {
@@ -2182,10 +2122,14 @@ fn handle_input(
           }
         }
         KeyOutcome::Forward(bytes) => {
-          context
-            .trace
-            .mark(&format!("input-forwarded bytes={bytes:?}"));
-          send_request(context.sender, context.next_request_id, ClientRequest::Input(bytes))?
+          if context.lua.focused_ui().is_some() {
+            context.trace.mark("focused-ui-suppressed-pty-forward");
+          } else {
+            context
+              .trace
+              .mark(&format!("input-forwarded bytes={bytes:?}"));
+            send_request(context.sender, context.next_request_id, ClientRequest::Input(bytes))?;
+          }
         }
         KeyOutcome::Unbound(key) => {
           context.session.key_warning =
@@ -2207,7 +2151,7 @@ fn handle_input(
       *context.outer_size = (width, height);
       let options =
         traced_lua(context.trace, "lua.sync_options terminal resize", context.lua.sync_options())?;
-      let pane = ui::pane_size(width, height, options, context.session.drawer_expanded);
+      let pane = ui::pane_size(width, height, options);
       let viewport = Viewport {
         rows: pane.0.max(1),
         columns: pane.1.max(1),
@@ -2688,12 +2632,7 @@ fn dispatch_ui_events(
         .mark(&format!("{callback_context} complete commands={}", commands.len()));
       let options =
         traced_lua(context.trace, "lua.sync_options event callback", context.lua.sync_options())?;
-      let pane = ui::pane_size(
-        context.outer_size.0,
-        context.outer_size.1,
-        options,
-        context.session.drawer_expanded,
-      );
+      let pane = ui::pane_size(context.outer_size.0, context.outer_size.1, options);
       let next_viewport = Viewport {
         rows: pane.0.max(1),
         columns: pane.1.max(1),
@@ -2747,14 +2686,6 @@ fn execute_runtime_commands(
           highlighted: 0,
         });
         send_tracked_request(context, &mut effects, ClientRequest::ListSessions)?;
-        effects.redraw = true;
-      }
-      RuntimeCommand::ToggleWorkspaceDrawer => {
-        context.session.drawer_expanded = !context.session.drawer_expanded;
-        context.session.drawer_highlighted_workspace = context
-          .session
-          .drawer_expanded
-          .then_some(context.session.snapshot.active_workspace_id);
         effects.redraw = true;
       }
       RuntimeCommand::CreateWorkspace => {
@@ -2869,6 +2800,7 @@ mod tests {
     WorkspaceDialogMode,
     WorkspaceField,
     dispatch_ui_events,
+    handle_input,
     run_pre_client,
     run_pre_client_with_picker,
   };
@@ -3051,6 +2983,99 @@ mod tests {
     };
     assert!(error.to_string().contains("expected callback failure"));
     assert!(matches!(receiver.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+  }
+
+  #[test]
+  fn focused_drawer_routes_direct_keys_then_global_leader_without_pty_fallback() {
+    use crossterm::event::{
+      Event,
+      KeyCode,
+      KeyEvent,
+      KeyModifiers,
+    };
+
+    let config = lua::load_config(
+      r#"
+        cmd.key.bind("a", function() cmd.tab.next() end)
+        local label = cmd.ui.text({ text = "Idle" })
+        local drawer = cmd.ui.create({
+          type = "drawer",
+          content = cmd.ui.column({ label }),
+          keys = {
+            x = function(_, key)
+              assert(key.key == "x")
+              label.set("text", "Changed")
+            end,
+            a = function() cmd.tab.close() end,
+            n = function() end,
+          },
+        })
+        drawer.show()
+        drawer.focus()
+      "#,
+    )
+    .expect("valid UI keymap config");
+    let viewport = Viewport {
+      rows: 24,
+      columns: 80,
+    };
+    let snapshot = SessionSnapshot {
+      number: "1".to_owned(),
+      workspaces: Vec::new(),
+      active_workspace_id: 0,
+    };
+    let mut session = ClientSession::new(snapshot, Vec::new(), viewport);
+    let mut outer_size = (80, 24);
+    let mut viewport = viewport;
+    let mut dispatcher =
+      KeyDispatcher::new(config.prefix_key, config.sequence_timeout, config.keymap.clone());
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let mut next_request_id = 1;
+    let trace = crate::trace::Trace::from_environment();
+    let mut context = ClientContext {
+      session: &mut session,
+      outer_size: &mut outer_size,
+      viewport: &mut viewport,
+      dispatcher: &mut dispatcher,
+      sender: &sender,
+      next_request_id: &mut next_request_id,
+      lua: &config.lua,
+      trace: &trace,
+    };
+
+    let direct =
+      handle_input(Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)), &mut context)
+        .expect("dispatch direct Drawer binding");
+    assert!(direct.redraw);
+    let no_op =
+      handle_input(Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)), &mut context)
+        .expect("consume no-op direct mapping");
+    assert!(!no_op.redraw);
+    let unmatched =
+      handle_input(Event::Key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE)), &mut context)
+        .expect("swallow unmatched focused key");
+    assert!(!unmatched.redraw);
+    assert!(receiver.try_iter().next().is_none(), "focused keys never reach the PTY");
+
+    handle_input(
+      Event::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL)),
+      &mut context,
+    )
+    .expect("enter global leader mode");
+    handle_input(Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)), &mut context)
+      .expect("main leader binding takes precedence");
+    let requests = receiver.try_iter().collect::<Vec<_>>();
+    assert_eq!(requests.len(), 1);
+    assert!(matches!(requests[0], ClientMessage::Request {
+      request: ClientRequest::NextTab,
+      ..
+    }));
+
+    let escape =
+      handle_input(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), &mut context)
+        .expect("Escape blurs focused Drawer");
+    assert!(escape.redraw);
+    assert!(context.lua.focused_ui().is_none());
   }
 
   // Developer approved: do not remove.

@@ -36,7 +36,18 @@ use crate::{
       parse_key_notation,
     },
   },
-  ui::CursorShape,
+  ui::{
+    CursorShape,
+    DrawerBorder,
+    DrawerProperty,
+    DrawerSide,
+    DrawerValue,
+    DrawerWidth,
+    LayoutAxis,
+    UiChild,
+    UiDrawerOptions,
+    UiTree,
+  },
 };
 
 pub struct AppConfig {
@@ -110,7 +121,6 @@ pub enum RuntimeCommand {
   Detach,
   KillSession,
   StopServer,
-  ToggleWorkspaceDrawer,
   CreateWorkspace,
   EditWorkspace,
   NextWorkspace,
@@ -203,6 +213,8 @@ pub struct LuaConfig {
   commands: Rc<RefCell<VecDeque<RuntimeCommand>>>,
   in_event_callback: Rc<Cell<bool>>,
   pending_pickers: Rc<RefCell<HashMap<u64, PendingPicker>>>,
+  ui_tree: Rc<RefCell<UiTree>>,
+  ui_handles: Rc<RefCell<HashMap<u64, Table>>>,
   launch: Table,
 }
 
@@ -328,6 +340,45 @@ impl LuaConfig {
   pub fn set_launch_session(&self, session_name: Option<&str>) -> LuaResult<()> {
     self.launch.set("session", session_name)?;
     Ok(())
+  }
+
+  pub fn render_ui_elements(
+    &self,
+    area: ratatui::layout::Rect,
+    buffer: &mut ratatui::buffer::Buffer,
+  ) {
+    self.ui_tree.borrow_mut().render(area, buffer);
+  }
+
+  pub fn focused_ui(&self) -> Option<u64> { self.ui_tree.borrow().focused_drawer() }
+
+  pub fn focused_ui_binding(&self, key: KeyStroke) -> Option<(u64, Function, Table)> {
+    let id = self.ui_tree.borrow().focused_drawer()?;
+    let handles = self.ui_handles.borrow();
+    let handle = handles.get(&id)?.clone();
+    let keys = handle.get::<Table>("__zmux_ui_keys").ok()?;
+    let key_name = crate::input::key_notation::key_stroke_to_string(&key);
+    let callback = keys.get::<Option<Function>>(key_name).ok().flatten()?;
+    Some((id, callback, handle))
+  }
+
+  pub fn blur_focused_ui(&self) -> bool { self.ui_tree.borrow_mut().blur_focused() }
+
+  pub fn invoke_ui_key_callback(
+    &self,
+    callback: &Function,
+    handle: Table,
+    key: crossterm::event::KeyEvent,
+  ) -> LuaResult<Vec<RuntimeCommand>> {
+    let key_stroke = KeyStroke::from_crossterm(key)
+      .ok_or_else(|| mlua::Error::external("unsupported UI key event"))?;
+    let key_value = self.lua.create_table()?;
+    key_value.set("key", crate::input::key_notation::key_stroke_to_string(&key_stroke))?;
+    key_value.set("ctrl", key_stroke.ctrl)?;
+    key_value.set("alt", key_stroke.alt)?;
+    key_value.set("shift", key_stroke.shift)?;
+    key_value.set("is_repeat", key.kind == crossterm::event::KeyEventKind::Repeat)?;
+    self.invoke_callback(callback, (handle, key_value))
   }
 
   pub fn launch_state(&self) -> LuaResult<LaunchState> {
@@ -731,6 +782,8 @@ pub fn load_config_with_context(
   let commands = Rc::new(RefCell::new(VecDeque::<RuntimeCommand>::new()));
   let in_event_callback = Rc::new(Cell::new(false));
   let pending_pickers = Rc::new(RefCell::new(HashMap::<u64, PendingPicker>::new()));
+  let ui_tree = Rc::new(RefCell::new(UiTree::default()));
+  let ui_handles = Rc::new(RefCell::new(HashMap::<u64, Table>::new()));
   let next_picker_id = Rc::new(Cell::new(1_u64));
   let config_loading = Rc::new(Cell::new(true));
   let globals = lua.create_table()?;
@@ -814,7 +867,6 @@ pub fn load_config_with_context(
   let event = lua.create_table()?;
   event.set("on", on)?;
   let ui = lua.create_table()?;
-  let workspace_drawer = lua.create_table()?;
   let client = lua.create_table()?;
   let server = lua.create_table()?;
   let session = lua.create_table()?;
@@ -828,7 +880,6 @@ pub fn load_config_with_context(
   cmd.set("session", session.clone())?;
   cmd.set("workspace", workspace.clone())?;
   cmd.set("tab", tab.clone())?;
-  ui.set("workspace_drawer", workspace_drawer.clone())?;
   {
     let pending_pickers = Rc::clone(&pending_pickers);
     let next_picker_id = Rc::clone(&next_picker_id);
@@ -866,15 +917,16 @@ pub fn load_config_with_context(
       })?,
     )?;
   }
-  register_command(&lua, &ui, &commands, &in_event_callback, "redraw", RuntimeCommand::Redraw)?;
-  register_command(
+  register_ui_api(
     &lua,
-    &workspace_drawer,
+    &ui,
+    &ui_tree,
+    &ui_handles,
     &commands,
+    &config_loading,
     &in_event_callback,
-    "toggle",
-    RuntimeCommand::ToggleWorkspaceDrawer,
   )?;
+  register_command(&lua, &ui, &commands, &in_event_callback, "redraw", RuntimeCommand::Redraw)?;
   register_command(&lua, &client, &commands, &in_event_callback, "detach", RuntimeCommand::Detach)?;
   register_command(
     &lua,
@@ -1038,9 +1090,464 @@ pub fn load_config_with_context(
       commands,
       in_event_callback,
       pending_pickers,
+      ui_tree,
+      ui_handles,
       launch,
     },
   })
+}
+
+fn register_ui_api(
+  lua: &Lua,
+  ui: &Table,
+  tree: &Rc<RefCell<UiTree>>,
+  handles: &Rc<RefCell<HashMap<u64, Table>>>,
+  commands: &Rc<RefCell<VecDeque<RuntimeCommand>>>,
+  config_loading: &Rc<Cell<bool>>,
+  in_callback: &Rc<Cell<bool>>,
+) -> LuaResult<()> {
+  let text = {
+    let tree = Rc::clone(tree);
+    let commands = Rc::clone(commands);
+    let config_loading = Rc::clone(config_loading);
+    let in_callback = Rc::clone(in_callback);
+    lua.create_function(move |lua, options: Table| {
+      ensure_ui_creation_context(&config_loading)?;
+      let text = options
+        .get::<Option<String>>("text")?
+        .ok_or_else(|| mlua::Error::external("Text nodes require a 'text' string"))?;
+      let style = options
+        .get::<Value>("style")
+        .and_then(parse_optional_style)?
+        .unwrap_or_default();
+      make_text_handle(lua, &tree, text, style, &commands, &config_loading, &in_callback)
+    })?
+  };
+  let row = create_layout_constructor(
+    lua,
+    tree,
+    commands,
+    config_loading,
+    in_callback,
+    LayoutAxis::Horizontal,
+  )?;
+  let column = create_layout_constructor(
+    lua,
+    tree,
+    commands,
+    config_loading,
+    in_callback,
+    LayoutAxis::Vertical,
+  )?;
+  let create = {
+    let tree = Rc::clone(tree);
+    let handles = Rc::clone(handles);
+    let commands = Rc::clone(commands);
+    let config_loading = Rc::clone(config_loading);
+    let in_callback = Rc::clone(in_callback);
+    lua.create_function(move |lua, options: Table| {
+      ensure_ui_creation_context(&config_loading)?;
+      create_drawer_handle(lua, &tree, &handles, options, &commands, &config_loading, &in_callback)
+    })?
+  };
+  ui.set("text", text)?;
+  ui.set("row", row)?;
+  ui.set("column", column)?;
+  ui.set("create", create)?;
+  Ok(())
+}
+
+fn ensure_ui_creation_context(config_loading: &Cell<bool>) -> LuaResult<()> {
+  if config_loading.get() {
+    Ok(())
+  } else {
+    Err(mlua::Error::external("cmd.ui constructors may only be used while loading configuration"))
+  }
+}
+
+fn ensure_ui_mutation_context(
+  config_loading: &Cell<bool>,
+  in_callback: &Cell<bool>,
+) -> LuaResult<()> {
+  if config_loading.get() {
+    Ok(())
+  } else {
+    ensure_command_context(in_callback)
+  }
+}
+
+fn finish_ui_mutation(
+  changed: bool,
+  config_loading: &Cell<bool>,
+  commands: &RefCell<VecDeque<RuntimeCommand>>,
+) {
+  if changed && !config_loading.get() {
+    commands.borrow_mut().push_back(RuntimeCommand::Redraw);
+  }
+}
+
+fn parse_optional_style(value: Value) -> LuaResult<Option<Style>> { parse_style(value) }
+
+fn ui_node_id(handle: &Table) -> LuaResult<u64> {
+  handle
+    .get::<Option<u64>>("__zmux_ui_node")?
+    .ok_or_else(|| mlua::Error::external("expected a UI node handle"))
+}
+
+fn parse_child_size(value: Value) -> LuaResult<crate::ui::ChildSize> {
+  match value {
+    Value::Nil => Ok(crate::ui::ChildSize::Auto),
+    Value::Integer(size) if (0..=i64::from(u16::MAX)).contains(&size) => {
+      Ok(crate::ui::ChildSize::Fixed(size as u16))
+    }
+    Value::String(value) => match value.to_string_lossy().as_str() {
+      "auto" => Ok(crate::ui::ChildSize::Auto),
+      "fill" => Ok(crate::ui::ChildSize::Fill),
+      _ => Err(mlua::Error::external("size must be 'auto', 'fill', or a cell count")),
+    },
+    _ => Err(mlua::Error::external("size must be 'auto', 'fill', or a cell count")),
+  }
+}
+
+fn parse_ui_children(children: &Table) -> LuaResult<Vec<UiChild>> {
+  children
+    .sequence_values::<Value>()
+    .map(|value| {
+      let value = value?;
+      let Value::Table(spec) = value else {
+        return Err(mlua::Error::external(
+          "Layout children must be UI node handles or child specs",
+        ));
+      };
+      if let Some(handle) = spec.get::<Option<Table>>("node")? {
+        Ok(UiChild {
+          node_id: ui_node_id(&handle)?,
+          size: parse_child_size(spec.get::<Value>("size")?)?,
+        })
+      } else {
+        Ok(UiChild {
+          node_id: ui_node_id(&spec)?,
+          size: crate::ui::ChildSize::Auto,
+        })
+      }
+    })
+    .collect()
+}
+
+fn parse_ui_keys(keys: &Table) -> LuaResult<HashMap<KeyStroke, Function>> {
+  let mut bindings = HashMap::new();
+  for entry in keys.clone().pairs::<Value, Value>() {
+    let (key, callback) = entry?;
+    let Value::String(key) = key else {
+      return Err(mlua::Error::external("UI key binding names must be strings"));
+    };
+    let key = key.to_string_lossy();
+    let sequence = parse_key_notation(&key).map_err(mlua::Error::external)?;
+    if sequence.len() != 1 {
+      return Err(mlua::Error::external(
+        "focused UI bindings must be single direct keys; use the global leader map for sequences",
+      ));
+    }
+    let Value::Function(callback) = callback else {
+      return Err(mlua::Error::external("UI key bindings must be functions"));
+    };
+    let stroke = sequence[0];
+    if bindings.insert(stroke, callback).is_some() {
+      return Err(mlua::Error::external(format!("duplicate UI key binding '{key}'")));
+    }
+  }
+  Ok(bindings)
+}
+
+fn ui_keymap_table(lua: &Lua, bindings: &HashMap<KeyStroke, Function>) -> LuaResult<Table> {
+  let table = lua.create_table_with_capacity(bindings.len(), 0)?;
+  for (key, callback) in bindings {
+    table.set(crate::input::key_notation::key_stroke_to_string(key), callback.clone())?;
+  }
+  Ok(table)
+}
+
+fn parse_drawer_side(value: &str) -> LuaResult<DrawerSide> {
+  match value {
+    "left" => Ok(DrawerSide::Left),
+    "right" => Ok(DrawerSide::Right),
+    _ => Err(mlua::Error::external("drawer side must be 'left' or 'right'")),
+  }
+}
+
+fn parse_drawer_width(value: Value) -> LuaResult<DrawerWidth> {
+  match value {
+    Value::Nil => Ok(DrawerWidth::Auto),
+    Value::Integer(width) if (0..=i64::from(u16::MAX)).contains(&width) => {
+      Ok(DrawerWidth::Fixed(width as u16))
+    }
+    Value::String(width) if width.to_string_lossy() == "auto" => Ok(DrawerWidth::Auto),
+    _ => Err(mlua::Error::external("drawer width must be 'auto' or a cell count")),
+  }
+}
+
+fn parse_drawer_border(value: Value) -> LuaResult<DrawerBorder> {
+  let Value::String(value) = value else {
+    return Err(mlua::Error::external("drawer border must be a Ratatui border preset"));
+  };
+  match value.to_string_lossy().as_str() {
+    "none" => Ok(DrawerBorder::None),
+    "plain" => Ok(DrawerBorder::Plain),
+    "rounded" => Ok(DrawerBorder::Rounded),
+    "double" => Ok(DrawerBorder::Double),
+    "thick" => Ok(DrawerBorder::Thick),
+    "light_double_dashed" => Ok(DrawerBorder::LightDoubleDashed),
+    "heavy_double_dashed" => Ok(DrawerBorder::HeavyDoubleDashed),
+    "light_triple_dashed" => Ok(DrawerBorder::LightTripleDashed),
+    "heavy_triple_dashed" => Ok(DrawerBorder::HeavyTripleDashed),
+    "light_quadruple_dashed" => Ok(DrawerBorder::LightQuadrupleDashed),
+    "heavy_quadruple_dashed" => Ok(DrawerBorder::HeavyQuadrupleDashed),
+    "quadrant_inside" => Ok(DrawerBorder::QuadrantInside),
+    "quadrant_outside" => Ok(DrawerBorder::QuadrantOutside),
+    value => Err(mlua::Error::external(format!("unknown drawer border preset '{value}'"))),
+  }
+}
+
+fn make_text_handle(
+  lua: &Lua,
+  tree: &Rc<RefCell<UiTree>>,
+  text: String,
+  style: Style,
+  commands: &Rc<RefCell<VecDeque<RuntimeCommand>>>,
+  config_loading: &Rc<Cell<bool>>,
+  in_callback: &Rc<Cell<bool>>,
+) -> LuaResult<Table> {
+  let id = tree
+    .borrow_mut()
+    .create_text(text, style)
+    .map_err(mlua::Error::external)?;
+  let handle = lua.create_table()?;
+  handle.set("__zmux_ui_node", id)?;
+  let set = {
+    let tree = Rc::clone(tree);
+    let commands = Rc::clone(commands);
+    let config_loading = Rc::clone(config_loading);
+    let in_callback = Rc::clone(in_callback);
+    lua.create_function(move |_, (property, value): (String, Value)| {
+      ensure_ui_mutation_context(&config_loading, &in_callback)?;
+      let changed = match property.as_str() {
+        "text" => {
+          let Value::String(value) = value else {
+            return Err(mlua::Error::external("Text 'text' property must be a string"));
+          };
+          tree
+            .borrow_mut()
+            .set_text(id, value.to_string_lossy())
+            .map_err(mlua::Error::external)?
+        }
+        "style" => {
+          let style = parse_style(value)?.unwrap_or_default();
+          tree
+            .borrow_mut()
+            .set_text_style(id, style)
+            .map_err(mlua::Error::external)?
+        }
+        _ => return Err(mlua::Error::external(format!("unknown Text property '{property}'"))),
+      };
+      finish_ui_mutation(changed, &config_loading, &commands);
+      Ok(())
+    })?
+  };
+  handle.set("set", set)?;
+  Ok(handle)
+}
+
+fn create_layout_constructor(
+  lua: &Lua,
+  tree: &Rc<RefCell<UiTree>>,
+  commands: &Rc<RefCell<VecDeque<RuntimeCommand>>>,
+  config_loading: &Rc<Cell<bool>>,
+  in_callback: &Rc<Cell<bool>>,
+  axis: LayoutAxis,
+) -> LuaResult<Function> {
+  let tree = Rc::clone(tree);
+  let commands = Rc::clone(commands);
+  let config_loading = Rc::clone(config_loading);
+  let in_callback = Rc::clone(in_callback);
+  lua.create_function(move |lua, children: Table| {
+    ensure_ui_creation_context(&config_loading)?;
+    let children = parse_ui_children(&children)?;
+    let id = tree
+      .borrow_mut()
+      .create_layout(axis, children)
+      .map_err(mlua::Error::external)?;
+    let handle = lua.create_table()?;
+    handle.set("__zmux_ui_node", id)?;
+    let set = {
+      let tree = Rc::clone(&tree);
+      let commands = Rc::clone(&commands);
+      let config_loading = Rc::clone(&config_loading);
+      let in_callback = Rc::clone(&in_callback);
+      lua.create_function(move |_, (property, value): (String, Value)| {
+        ensure_ui_mutation_context(&config_loading, &in_callback)?;
+        if property != "children" {
+          return Err(mlua::Error::external(format!("unknown Layout property '{property}'")));
+        }
+        let Value::Table(children) = value else {
+          return Err(mlua::Error::external("Layout 'children' property must be an array"));
+        };
+        let children = parse_ui_children(&children)?;
+        let changed = tree
+          .borrow_mut()
+          .set_children(id, children)
+          .map_err(mlua::Error::external)?;
+        finish_ui_mutation(changed, &config_loading, &commands);
+        Ok(())
+      })?
+    };
+    handle.set("set", set)?;
+    Ok(handle)
+  })
+}
+
+fn create_drawer_handle(
+  lua: &Lua,
+  tree: &Rc<RefCell<UiTree>>,
+  handles: &Rc<RefCell<HashMap<u64, Table>>>,
+  options: Table,
+  commands: &Rc<RefCell<VecDeque<RuntimeCommand>>>,
+  config_loading: &Rc<Cell<bool>>,
+  in_callback: &Rc<Cell<bool>>,
+) -> LuaResult<Table> {
+  let element_type = options
+    .get::<Option<String>>("type")?
+    .unwrap_or_else(|| "drawer".to_owned());
+  if element_type != "drawer" {
+    return Err(mlua::Error::external("cmd.ui.create currently supports type 'drawer' only"));
+  }
+  let side = parse_drawer_side(
+    &options
+      .get::<Option<String>>("side")?
+      .unwrap_or_else(|| "left".to_owned()),
+  )?;
+  let width = parse_drawer_width(options.get::<Value>("width")?)?;
+  let title = options.get::<Option<String>>("title")?.unwrap_or_default();
+  let border = match options.get::<Value>("border")? {
+    Value::Nil => DrawerBorder::Plain,
+    value => parse_drawer_border(value)?,
+  };
+  let border_style = options
+    .get::<Value>("border_style")
+    .and_then(parse_optional_style)?
+    .unwrap_or_default();
+  let content = options
+    .get::<Option<Table>>("content")?
+    .ok_or_else(|| mlua::Error::external("Drawer requires a 'content' UI node"))?;
+  let content_id = ui_node_id(&content)?;
+  let keys = options
+    .get::<Option<Table>>("keys")?
+    .map(|keys| parse_ui_keys(&keys))
+    .transpose()?
+    .unwrap_or_default();
+  let id = Rc::new(Cell::new(0_u64));
+  let handle =
+    make_drawer_handle(lua, tree, Rc::clone(&id), commands, config_loading, in_callback)?;
+  let drawer_id = tree
+    .borrow_mut()
+    .create_drawer(UiDrawerOptions {
+      side,
+      width,
+      title,
+      border,
+      border_style,
+      content_id,
+      visible: options.get::<Option<bool>>("visible")?.unwrap_or(false),
+    })
+    .map_err(mlua::Error::external)?;
+  id.set(drawer_id);
+  handle.set("__zmux_ui_drawer", drawer_id)?;
+  handle.set("__zmux_ui_keys", ui_keymap_table(lua, &keys)?)?;
+  handles.borrow_mut().insert(drawer_id, handle.clone());
+  Ok(handle)
+}
+
+fn make_drawer_handle(
+  lua: &Lua,
+  tree: &Rc<RefCell<UiTree>>,
+  id: Rc<Cell<u64>>,
+  commands: &Rc<RefCell<VecDeque<RuntimeCommand>>>,
+  config_loading: &Rc<Cell<bool>>,
+  in_callback: &Rc<Cell<bool>>,
+) -> LuaResult<Table> {
+  let handle = lua.create_table()?;
+  let set = {
+    let tree = Rc::clone(tree);
+    let handle_for_keys = handle.clone();
+    let commands = Rc::clone(commands);
+    let config_loading = Rc::clone(config_loading);
+    let in_callback = Rc::clone(in_callback);
+    let id = Rc::clone(&id);
+    lua.create_function(move |lua, (property, value): (String, Value)| {
+      ensure_ui_mutation_context(&config_loading, &in_callback)?;
+      if property == "keys" {
+        let Value::Table(keys) = value else {
+          return Err(mlua::Error::external("Drawer 'keys' property must be a table"));
+        };
+        let keys = parse_ui_keys(&keys)?;
+        handle_for_keys.set("__zmux_ui_keys", ui_keymap_table(lua, &keys)?)?;
+        return Ok(());
+      }
+      let (property_kind, value) = match property.as_str() {
+        "side" => {
+          let Value::String(value) = value else {
+            return Err(mlua::Error::external("Drawer 'side' property must be a string"));
+          };
+          (DrawerProperty::Side, DrawerValue::Side(parse_drawer_side(&value.to_string_lossy())?))
+        }
+        "width" => (DrawerProperty::Width, DrawerValue::Width(parse_drawer_width(value)?)),
+        "title" => {
+          let Value::String(value) = value else {
+            return Err(mlua::Error::external("Drawer 'title' property must be a string"));
+          };
+          (DrawerProperty::Title, DrawerValue::Title(value.to_string_lossy()))
+        }
+        "border" => (DrawerProperty::Border, DrawerValue::Border(parse_drawer_border(value)?)),
+        "border_style" => {
+          let style = parse_style(value)?.unwrap_or_default();
+          (DrawerProperty::BorderStyle, DrawerValue::Style(style))
+        }
+        _ => return Err(mlua::Error::external(format!("unknown Drawer property '{property}'"))),
+      };
+      let changed = tree
+        .borrow_mut()
+        .set_drawer_property(id.get(), property_kind, value)
+        .map_err(mlua::Error::external)?;
+      finish_ui_mutation(changed, &config_loading, &commands);
+      Ok(())
+    })?
+  };
+  handle.set("set", set)?;
+  for action in ["show", "hide", "toggle", "focus", "blur"] {
+    let tree = Rc::clone(tree);
+    let commands = Rc::clone(commands);
+    let config_loading = Rc::clone(config_loading);
+    let in_callback = Rc::clone(in_callback);
+    let id = Rc::clone(&id);
+    let action_name = action;
+    handle.set(
+      action,
+      lua.create_function(move |_, ()| {
+        ensure_ui_mutation_context(&config_loading, &in_callback)?;
+        let changed = match action_name {
+          "show" => tree.borrow_mut().show(id.get()),
+          "hide" => tree.borrow_mut().hide(id.get()),
+          "toggle" => tree.borrow_mut().toggle(id.get()),
+          "focus" => tree.borrow_mut().focus(id.get()),
+          "blur" => tree.borrow_mut().blur(id.get()),
+          _ => unreachable!(),
+        }
+        .map_err(mlua::Error::external)?;
+        finish_ui_mutation(changed, &config_loading, &commands);
+        Ok(())
+      })?,
+    )?;
+  }
+  Ok(handle)
 }
 
 fn picker_item(value: Value) -> LuaResult<(String, Value)> {
@@ -1508,6 +2015,170 @@ mod tests {
   #[test]
   fn runtime_commands_cannot_be_called_during_config_loading() {
     assert!(load_config("cmd.tab.next()").is_err());
+  }
+
+  #[test]
+  fn drawers_accept_ratatui_border_presets_and_reject_unknown_styles() {
+    for border in [
+      "none",
+      "plain",
+      "rounded",
+      "double",
+      "thick",
+      "light_double_dashed",
+      "heavy_double_dashed",
+      "light_triple_dashed",
+      "heavy_triple_dashed",
+      "light_quadruple_dashed",
+      "heavy_quadruple_dashed",
+      "quadrant_inside",
+      "quadrant_outside",
+    ] {
+      let source = format!(
+        "local text = cmd.ui.text({{text = 'x'}})\ncmd.ui.create({{content = text, border = '{border}'}})"
+      );
+      load_config(&source).unwrap_or_else(|error| panic!("border preset {border}: {error}"));
+    }
+    assert!(
+      load_config(
+        "local text = cmd.ui.text({text = 'x'})\ncmd.ui.create({content = text, border = 'zigzag'})"
+      )
+      .is_err()
+    );
+  }
+
+  #[test]
+  fn retained_layouts_reject_ancestor_cycles_and_multiple_parents() {
+    let cycle = load_config(
+      r#"
+        local child = cmd.ui.column({})
+        local root = cmd.ui.column({ child })
+        child.set("children", { root })
+      "#,
+    );
+    assert!(cycle.is_err());
+
+    let multiple_parents = load_config(
+      r#"
+        local node = cmd.ui.text({ text = "shared" })
+        cmd.ui.column({ node })
+        cmd.ui.row({ node })
+      "#,
+    );
+    assert!(multiple_parents.is_err());
+  }
+
+  #[test]
+  fn detached_child_handles_remain_mutable_and_can_be_reattached() {
+    use ratatui::{
+      buffer::Buffer,
+      layout::Rect,
+    };
+
+    let config = load_config(
+      r#"
+        local ui = cmd.ui
+        local detached = ui.text({ text = "Before" })
+        local replacement = ui.text({ text = "Temporary" })
+        local content = ui.column({ detached })
+        local drawer = ui.create({ content = content, visible = true })
+        cmd.event.on("ClientLoaded", function()
+          content.set("children", { replacement })
+          detached.set("text", "After detach")
+          content.set("children", { detached })
+        end)
+      "#,
+    )
+    .expect("valid retained tree configuration");
+    let callbacks = config.lua.event_handlers("ClientLoaded");
+    let commands = config
+      .lua
+      .invoke_event_handler(&callbacks[0], &AppEvent::default())
+      .expect("mutate and reattach detached node");
+    assert_eq!(commands, vec![
+      RuntimeCommand::Redraw,
+      RuntimeCommand::Redraw,
+      RuntimeCommand::Redraw,
+    ]);
+
+    let area = Rect::new(0, 0, 40, 10);
+    let mut buffer = Buffer::empty(area);
+    config.lua.render_ui_elements(area, &mut buffer);
+    let contents = buffer
+      .content
+      .iter()
+      .map(|cell| cell.symbol())
+      .collect::<String>();
+    assert!(contents.contains("After detach"));
+    assert!(!contents.contains("Temporary"));
+  }
+
+  #[test]
+  fn retained_drawer_handles_mutate_nested_content_and_invoke_direct_keys() {
+    use crossterm::event::{
+      KeyCode,
+      KeyEvent,
+      KeyModifiers,
+    };
+    use ratatui::{
+      buffer::Buffer,
+      layout::Rect,
+    };
+
+    let config = load_config(
+      r#"
+        local ui = cmd.ui
+        local status = ui.text({ text = "Idle" })
+        local content = ui.column({ status })
+        local drawer = ui.create({
+          type = "drawer",
+          side = "right",
+          width = 16,
+          title = "Tasks",
+          border = "rounded",
+          content = content,
+          keys = {
+            x = function(element, key)
+              assert(key.key == "x")
+              status.set("text", "Ready")
+              element.set("title", "Updated")
+            end,
+          },
+        })
+        drawer.show()
+        drawer.focus()
+      "#,
+    )
+    .expect("valid retained UI configuration");
+    let key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+    let stroke = KeyStroke::from_crossterm(key).expect("convert direct key");
+    let (_, callback, handle) = config
+      .lua
+      .focused_ui_binding(stroke)
+      .expect("focused Drawer binding");
+    assert_eq!(
+      config
+        .lua
+        .invoke_ui_key_callback(&callback, handle, key)
+        .expect("invoke Drawer binding"),
+      vec![RuntimeCommand::Redraw, RuntimeCommand::Redraw]
+    );
+
+    let area = Rect::new(0, 0, 40, 10);
+    let mut buffer = Buffer::empty(area);
+    config.lua.render_ui_elements(area, &mut buffer);
+    let contents = buffer
+      .content
+      .iter()
+      .map(|cell| cell.symbol())
+      .collect::<String>();
+    assert!(contents.contains("Updated"));
+    assert!(contents.contains("Ready"));
+    assert_eq!(
+      buffer[(25, 1)].symbol(),
+      "R",
+      "fixed-width right drawer content starts inside its border"
+    );
   }
 
   // Developer approved: do not remove.

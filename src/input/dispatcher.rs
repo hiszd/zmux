@@ -340,6 +340,7 @@ mod tests {
     let now = Instant::now();
     let cases = [
       (KeyCode::Char('v'), KeyModifiers::SHIFT, &b"V"[..]),
+      (KeyCode::Char(';'), KeyModifiers::SHIFT, &b":"[..]),
       (KeyCode::Char('x'), KeyModifiers::ALT, &b"\x1bx"[..]),
       (KeyCode::Char(' '), KeyModifiers::CONTROL, &b"\0"[..]),
       (KeyCode::Char('c'), KeyModifiers::CONTROL, &b"\x03"[..]),

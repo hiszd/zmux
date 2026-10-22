@@ -7,7 +7,7 @@ Status: The domain and lifecycle behavior is agreed. The wire protocol is implem
 - The background Server owns live Sessions, Workspaces, Tabs, PTYs, terminal state, and Session names.
 - A Session contains one or more Workspaces. A Workspace has a working directory and Tabs; new Tabs start there. A Tab's shell changing directories does not update the Workspace directory.
 - Active Workspace and active Tab selections are Session state shared by attached Clients. A Session retains its active Workspace while detached or switched away from; each Workspace retains its active Tab. Switching back resumes the previous selection.
-- Each Client owns its terminal, viewport, Lua configuration, and local presentation state such as Drawer visibility, pending highlight, and modal state.
+- Each Client owns its terminal, viewport, Lua configuration, and local presentation state such as UI Element visibility/focus and modal state.
 - Lua `g`/`global` values are read-only snapshots of Server-owned state. `cmd` operations send requests to the Server.
 
 ## Connection and lifecycle
@@ -26,12 +26,11 @@ Status: The domain and lifecycle behavior is agreed. The wire protocol is implem
 
 ## Shared PTY sizing
 
-A Tab has one PTY geometry at a time. The Server uses the maximum usable pane rows and columns independently among Clients attached to that Session, recomputing on attach, detach, and resize. It keeps the last size while no Clients are attached. Each Client renders the shared screen in its own viewport; smaller views may clip content and larger views may have unused cells. This is projection, not true scaling or per-client shell reflow. Client-only overlays, including the Workspace Drawer, never affect PTY dimensions. See [ADR 0002](../adr/0002-shared-pty-sizing.md).
+A Tab has one PTY geometry at a time. The Server uses the maximum usable pane rows and columns independently among Clients attached to that Session, recomputing on attach, detach, and resize. It keeps the last size while no Clients are attached. Each Client renders the shared screen in its own viewport; smaller views may clip content and larger views may have unused cells. This is projection, not true scaling or per-client shell reflow. Client-only overlays, including configurable Drawers, never affect PTY dimensions. See [ADR 0002](../adr/0002-shared-pty-sizing.md).
 
 ## Workspace and picker interactions
 
-- The left Workspace Drawer is always visible as a one-character rail and expands by a configurable binding. Expanded, it shows full names and takes focus; arrows move a temporary highlight, Enter switches the shared active Workspace and collapses the Drawer, and Escape collapses without switching.
-- The Drawer highlights the active Workspace in the rail and overlays the terminal without resizing PTYs.
+- There is no built-in Workspace Drawer. Workspace navigation is exposed through Lua-bound Workspace commands; custom client-local UI may display and interact with Workspace data.
 - Workspace creation/editing uses a directory selector and optional name field. Tab moves to the name field; an empty name derives the basename. Creating a Workspace starts one Tab in the selected directory and activates it. Editing the directory changes only the Workspace default; existing shells keep their current directories.
 - The generic Fuzzy Picker accepts a supplied list, fuzzy-filters it, and invokes a Lua completion callback with the selected item or `nil` on Escape.
 - Key bindings use neovim-style key notation and Lua callbacks, with sequences after the configured prefix. `cmd.key.bind(sequence, callback, { desc = ... })` binds; `cmd.key.bind(sequence, nil)` unbinds. Sequence timeout defaults to 700 ms. A bottom-anchored full-width popup shows available continuations; unbound sequences and callback failures are shown briefly in yellow.

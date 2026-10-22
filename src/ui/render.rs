@@ -1,8 +1,8 @@
 //! Rendering primitives for zmux's terminal user interface.
 //!
 //! The UI is rendered in layers: [`layout`] reserves space for the top and
-//! bottom bars, the workspace drawer, and the PTY; [`draw`] then projects the
-//! Alacritty's terminal grid into a ratatui frame and paints overlays on top. It reads
+//! bottom bars and the PTY; [`draw`] then projects the Alacritty terminal grid
+//! into a ratatui frame and paints overlays on top. It reads
 //! the current terminal grid and writes it into the ratatui frame on every requested
 //! frame. Ratatui performs the final output diff against the previous frame.
 //!
@@ -16,12 +16,6 @@
 //!     active_tab: 0,
 //!     active_title: "shell",
 //!     active_exit_code: None,
-//!     workspace_drawer: WorkspaceDrawerRender {
-//!         expanded: false,
-//!         active_id: 1,
-//!         highlighted_id: 1,
-//!         items: &workspaces,
-//!     },
 //!     modal: None,
 //!     which_key: WhichKeyPopup::default(),
 //!     key_warning: None,
@@ -34,8 +28,8 @@
 //! ```
 //!
 //! Text is measured with Unicode display width rather than byte length. This
-//! matters for both wide characters and combining marks in bar, modal, and
-//! drawer content.
+//! matters for both wide characters and combining marks in bar and modal
+//! content.
 
 use std::time::Instant;
 
@@ -162,30 +156,6 @@ pub struct BarContents {
   pub bottom: BarParts,
 }
 
-/// One workspace entry shown by [`WorkspaceDrawerRender`].
-pub struct WorkspaceDrawerItem<'a> {
-  /// Stable workspace identifier used for active/highlight matching.
-  pub id: u64,
-  /// User-facing workspace name.
-  pub name: &'a str,
-}
-
-/// State and entries needed to paint the workspace drawer.
-///
-/// In collapsed mode only the first single-width grapheme of each name is
-/// displayed. In expanded mode the highlighted item follows keyboard
-/// navigation while `active_id` identifies the currently selected workspace.
-pub struct WorkspaceDrawerRender<'a> {
-  /// Whether to show full names instead of initials.
-  pub expanded: bool,
-  /// ID of the workspace currently in use.
-  pub active_id: u64,
-  /// ID selected by navigation while expanded.
-  pub highlighted_id: u64,
-  /// Workspaces to display in order.
-  pub items: &'a [WorkspaceDrawerItem<'a>],
-}
-
 /// A centered modal containing an optional query, selectable rows, and footer.
 ///
 /// Rows are vertically scrolled so `selected_row` remains visible. The modal
@@ -223,8 +193,6 @@ pub struct UiRender<'a> {
   pub active_title: &'a str,
   /// Exit code shown when the active terminal has exited.
   pub active_exit_code: Option<u32>,
-  /// Workspace drawer state.
-  pub workspace_drawer: WorkspaceDrawerRender<'a>,
   /// Optional modal drawn over the panel.
   pub modal: Option<ModalOverlay<'a>>,
   /// Which-key popup shown while leader input is active.
@@ -252,8 +220,6 @@ pub struct UiLayout {
   pub bottom_anchor: Rect,
   /// Area between the anchors.
   pub panel: Rect,
-  /// Rectangle available to the workspace drawer.
-  pub drawer: Rect,
   /// PTY rectangle, including its border.
   pub pty: Rect,
   /// PTY interior where terminal cells are rendered.
@@ -308,9 +274,9 @@ fn render_screen(buffer: &mut ratatui::buffer::Buffer, area: Rect, screen: &Grid
 
 /// Computes the rectangles used by the UI.
 ///
-/// Anchor heights are clamped to the available area. The collapsed drawer is
-/// one cell wide; the expanded drawer overlays the panel without changing the
-/// PTY geometry.
+/// Anchor heights are clamped to the available area. The PTY uses the full
+/// width between the top and bottom anchors; configurable Drawers are overlays
+/// and do not affect its geometry.
 ///
 /// ```
 /// # use zmux::ui::layout;
@@ -321,10 +287,10 @@ fn render_screen(buffer: &mut ratatui::buffer::Buffer, area: Rect, screen: &Grid
 ///     bottom: AnchorOptions { height: 1, visible: true },
 ///     ..UiOptions::default()
 /// };
-/// let parts = layout(Rect::new(0, 0, 80, 24), options, false);
-/// assert_eq!((parts.pane.width, parts.pane.height), (77, 21));
+/// let parts = layout(Rect::new(0, 0, 80, 24), options);
+/// assert_eq!((parts.pane.width, parts.pane.height), (78, 21));
 /// ```
-pub fn layout(area: Rect, options: UiOptions, drawer_expanded: bool) -> UiLayout {
+pub fn layout(area: Rect, options: UiOptions) -> UiLayout {
   let top_height = if options.top.visible {
     options.top.height.min(area.height)
   } else {
@@ -343,24 +309,12 @@ pub fn layout(area: Rect, options: UiOptions, drawer_expanded: bool) -> UiLayout
   let top_anchor = Rect::new(area.x, area.y, area.width, top_height);
   let bottom_anchor =
     Rect::new(area.x, area.y + top_height + panel_height, area.width, bottom_height);
-  let pty_drawer_width = drawer_width(panel.width, false);
-  let drawer = if drawer_expanded {
-    panel
-  } else {
-    Rect::new(panel.x, panel.y, pty_drawer_width, panel.height)
-  };
-  let pty = Rect::new(
-    panel.x.saturating_add(pty_drawer_width),
-    panel.y,
-    panel.width.saturating_sub(pty_drawer_width),
-    panel.height,
-  );
+  let pty = panel;
   let pane = Block::default().borders(Borders::ALL).inner(pty);
   UiLayout {
     top_anchor,
     bottom_anchor,
     panel,
-    drawer,
     pty,
     pane,
   }
@@ -369,42 +323,23 @@ pub fn layout(area: Rect, options: UiOptions, drawer_expanded: bool) -> UiLayout
 /// Returns the PTY's inner `(height, width)` for a terminal resize request.
 ///
 /// The order matches the common PTY resize API rather than [`ratatui::layout::Rect`].
-pub fn pane_size(width: u16, height: u16, options: UiOptions, drawer_expanded: bool) -> (u16, u16) {
-  let layout = layout(Rect::new(0, 0, width, height), options, drawer_expanded);
+pub fn pane_size(width: u16, height: u16, options: UiOptions) -> (u16, u16) {
+  let layout = layout(Rect::new(0, 0, width, height), options);
   (layout.pane.height, layout.pane.width)
-}
-
-/// Computes the drawer width used by [`layout`].
-///
-/// A collapsed drawer always reserves one column when possible. Expanded mode
-/// deliberately consumes the whole panel so the drawer can display a focused
-/// workspace list without a partially visible PTY behind it.
-fn drawer_width(inner_width: u16, expanded: bool) -> u16 {
-  if inner_width == 0 {
-    return 0;
-  }
-  if expanded {
-    // Two cells for the horizontal padding and one for the right border.
-    inner_width
-  } else {
-    // One cell for the collapsed initial. The PTY border provides the
-    // separation from the drawer.
-    1.min(inner_width)
-  }
 }
 
 /// Renders one complete UI frame.
 ///
 /// The sequence is significant: bars and the PTY are painted first, then the
-/// drawer and modal, and finally the which-key popup and cursor. Overlays can
-/// therefore obscure terminal content without changing the terminal model.
+/// modal and which-key popup. Overlays can therefore obscure terminal content
+/// without changing the terminal model.
 /// Lua-configured bar styles are applied before painting. A Lua error is
 /// returned to the caller so the event loop can decide whether it is
 /// recoverable.
 pub fn draw(frame: &mut Frame<'_>, view: &UiRender<'_>) -> mlua::Result<()> {
   let frame_started = Instant::now();
   let area = frame.area();
-  let layout = layout(area, view.options, view.workspace_drawer.expanded);
+  let layout = layout(area, view.options);
   let rect_detail = |rect: Option<Rect>| {
     rect.map_or_else(
       || "none".to_owned(),
@@ -412,10 +347,9 @@ pub fn draw(frame: &mut Frame<'_>, view: &UiRender<'_>) -> mlua::Result<()> {
     )
   };
   view.trace.mark(&format!(
-    "ui-frame-layout area={}x{} drawer_expanded={} pty={} pane={}",
+    "ui-frame-layout area={}x{} pty={} pane={}",
     area.width,
     area.height,
-    view.workspace_drawer.expanded,
     rect_detail(Some(layout.pty)),
     rect_detail(Some(layout.pane)),
   ));
@@ -466,7 +400,7 @@ pub fn draw(frame: &mut Frame<'_>, view: &UiRender<'_>) -> mlua::Result<()> {
       .borders(Borders::ALL)
       .render(layout.pty, buffer);
     render_screen(buffer, layout.pane, screen);
-    (&view.workspace_drawer).render(layout.drawer, buffer);
+    view.lua.render_ui_elements(layout.panel, buffer);
     if let Some(modal) = &view.modal {
       modal.render(layout.panel, buffer);
     }
@@ -481,8 +415,7 @@ pub fn draw(frame: &mut Frame<'_>, view: &UiRender<'_>) -> mlua::Result<()> {
   if which_key_visible {
     (&view.which_key).render(area, frame.buffer_mut());
   }
-  if !view.workspace_drawer.expanded
-    && view.modal.is_none()
+  if view.modal.is_none()
     && let Some((true, row, column)) = cursor
   {
     frame.set_cursor_position(Position::new(layout.pane.x + column, layout.pane.y + row));
@@ -594,108 +527,6 @@ impl Widget for &ModalOverlay<'_> {
         text: modal.footer.to_owned(),
         role: None,
         style: Some(Style::default().fg(Color::Gray).bg(Color::Black)),
-      }]);
-    }
-  }
-}
-
-impl Widget for &WorkspaceDrawerRender<'_> {
-  /// Paints the drawer and scrolls it so its active/highlighted entry stays
-  /// visible. Unicode grapheme boundaries are respected for collapsed initials.
-  fn render(self, pane: Rect, buffer: &mut ratatui::buffer::Buffer) {
-    let drawer = self;
-    if pane.is_empty() || drawer.items.is_empty() {
-      return;
-    }
-    let width = if drawer.expanded {
-      drawer
-        .items
-        .iter()
-        .map(|item| UnicodeWidthStr::width(item.name))
-        .max()
-        .unwrap_or(0)
-        .saturating_add(3)
-        .min(usize::from(pane.width)) as u16
-    } else {
-      1.min(pane.width)
-    };
-    if width == 0 {
-      return;
-    }
-    let area = Rect::new(pane.x, pane.y, width, pane.height);
-    let background = Style::default().bg(Color::Black);
-    for y in area.y..area.y.saturating_add(area.height) {
-      for x in area.x..area.x.saturating_add(area.width) {
-        buffer[(x, y)].set_symbol(" ").set_style(background);
-      }
-    }
-    let block = if drawer.expanded {
-      Block::default()
-        .borders(Borders::RIGHT)
-        .style(Style::default().fg(Color::Gray).bg(Color::Black))
-    } else {
-      Block::default().style(background)
-    };
-    let inner = block.inner(area);
-    block.render(area, buffer);
-
-    let highlight_id = if drawer.expanded {
-      drawer.highlighted_id
-    } else {
-      drawer.active_id
-    };
-    let highlight_index = drawer
-      .items
-      .iter()
-      .position(|item| item.id == highlight_id)
-      .unwrap_or_default();
-    let visible_rows = usize::from(inner.height);
-    let start = if drawer.items.len() > visible_rows {
-      highlight_index
-        .saturating_sub(visible_rows.saturating_sub(1))
-        .min(drawer.items.len() - visible_rows)
-    } else {
-      0
-    };
-
-    for (row, item) in drawer
-      .items
-      .iter()
-      .enumerate()
-      .skip(start)
-      .take(visible_rows)
-    {
-      let y = inner.y + (row - start) as u16;
-      let is_active = item.id == drawer.active_id;
-      let is_highlighted = drawer.expanded && item.id == drawer.highlighted_id;
-      let style = if is_highlighted {
-        Style::default()
-          .fg(Color::Black)
-          .bg(Color::Yellow)
-          .add_modifier(Modifier::BOLD)
-      } else if is_active {
-        Style::default()
-          .fg(Color::Black)
-          .bg(Color::Cyan)
-          .add_modifier(Modifier::BOLD)
-      } else {
-        Style::default().fg(Color::Gray).bg(Color::Black)
-      };
-      let text = if drawer.expanded {
-        format!(" {} ", item.name)
-      } else {
-        let initial = item
-          .name
-          .graphemes(true)
-          .next()
-          .filter(|grapheme| UnicodeWidthStr::width(*grapheme) == 1)
-          .unwrap_or(" ");
-        initial.to_owned()
-      };
-      draw_segments(buffer, inner, y, inner.x, &[BarSegment {
-        text,
-        role: None,
-        style: Some(style),
       }]);
     }
   }
@@ -938,18 +769,14 @@ fn _area(_: Rect) {
 #[cfg(test)]
 mod tests {
   use ratatui::{
-    Terminal,
-    backend::TestBackend,
     buffer::Buffer,
     layout::Rect,
-    widgets::Widget,
   };
 
   use super::{
     UiOptions,
-    WorkspaceDrawerItem,
-    WorkspaceDrawerRender,
     layout,
+    pane_size,
     render_screen,
   };
   use crate::{
@@ -959,7 +786,7 @@ mod tests {
 
   // Developer approved: do not remove.
   #[test]
-  fn anchors_reserve_rows_and_resize_the_terminal_workspace() {
+  fn anchors_reserve_rows_without_a_workspace_drawer() {
     let options = UiOptions {
       top: AnchorOptions {
         height: 2,
@@ -971,55 +798,18 @@ mod tests {
       },
       ..UiOptions::default()
     };
-    let collapsed = layout(Rect::new(0, 0, 100, 30), options, false);
-    assert_eq!(collapsed.top_anchor.height, 2);
-    assert_eq!(collapsed.bottom_anchor.height, 3);
-    assert_eq!(collapsed.drawer.width, 1);
-    assert_eq!(collapsed.pane.width, 97);
-    assert_eq!(collapsed.pane.height, 23);
-    let expanded = layout(Rect::new(0, 0, 100, 30), options, true);
-    assert_eq!(expanded.pane, collapsed.pane);
+    let parts = layout(Rect::new(0, 0, 100, 30), options);
+    assert_eq!(parts.top_anchor.height, 2);
+    assert_eq!(parts.bottom_anchor.height, 3);
+    assert_eq!(parts.pane.width, 98);
+    assert_eq!(parts.pane.height, 23);
   }
 
   // Developer approved: do not remove.
   #[test]
-  fn workspace_drawer_collapses_to_initials_and_expands_to_full_names() {
-    let area = Rect::new(0, 0, 30, 6);
-    let workspaces = [
-      WorkspaceDrawerItem {
-        id: 1,
-        name: "alpha",
-      },
-      WorkspaceDrawerItem {
-        id: 2,
-        name: "beta",
-      },
-    ];
-    let collapsed = WorkspaceDrawerRender {
-      expanded: false,
-      active_id: 2,
-      highlighted_id: 2,
-      items: &workspaces,
-    };
-    let mut buffer = Buffer::empty(area);
-    (&collapsed).render(area, &mut buffer);
-    assert_eq!(buffer[(0, 0)].symbol(), "a");
-    assert_eq!(buffer[(0, 1)].symbol(), "b");
-
-    let expanded = WorkspaceDrawerRender {
-      expanded: true,
-      active_id: 2,
-      highlighted_id: 1,
-      items: &workspaces,
-    };
-    let backend = TestBackend::new(area.width, area.height);
-    let mut terminal = Terminal::new(backend).expect("create test terminal");
-    terminal
-      .draw(|frame| frame.render_widget(&expanded, frame.area()))
-      .expect("render workspace drawer");
-    let buffer = terminal.backend().buffer();
-    assert_eq!(buffer[(1, 0)].symbol(), "a");
-    assert_eq!(buffer[(1, 1)].symbol(), "b");
+  fn drawer_overlays_do_not_reduce_the_pty_viewport() {
+    let options = UiOptions::default();
+    assert_eq!(pane_size(80, 24, options), (20, 78));
   }
 
   // Developer approved: do not remove.

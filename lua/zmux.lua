@@ -94,13 +94,63 @@
 ---@class ZmuxKeyApi
 ---@field bind fun(keys: string, callback: fun()|nil, opts?: ZmuxKeymapOptions) Bind a neovim-notation key sequence after the configured prefix; pass nil to unbind.
 
+---@alias ZmuxUiSize integer|"auto"|"fill"
+---@alias ZmuxDrawerSide "left"|"right"
+---@alias ZmuxDrawerWidth integer|"auto"
+---@alias ZmuxDrawerBorder "none"|"plain"|"rounded"|"double"|"thick"|"light_double_dashed"|"heavy_double_dashed"|"light_triple_dashed"|"heavy_triple_dashed"|"light_quadruple_dashed"|"heavy_quadruple_dashed"|"quadrant_inside"|"quadrant_outside"
+---@alias ZmuxDrawerProperty "side"|"width"|"title"|"border"|"border_style"|"keys"
+---@alias ZmuxDrawerPropertyValue ZmuxDrawerSide|ZmuxDrawerWidth|string|ZmuxDrawerBorder|ZmuxStyle|table<string, fun(element: ZmuxDrawerHandle, key: ZmuxUiKey)>
+---@alias ZmuxTextProperty "text"|"style"
+---@alias ZmuxLayoutProperty "children"
+
+---@class ZmuxUiKey
+---@field key string Neovim-notation key that triggered the binding.
+---@field ctrl boolean Whether Control was pressed.
+---@field alt boolean Whether Alt was pressed.
+---@field shift boolean Whether Shift was pressed.
+---@field is_repeat boolean Whether this is a repeated key event.
+
+---@class ZmuxUiNodeHandle
+---@field set fun(property: ZmuxTextProperty|ZmuxLayoutProperty, value: string|ZmuxStyle|ZmuxLayoutChild[]) Set a typed property; mutations automatically schedule a redraw.
+
+---@class ZmuxTextOptions
+---@field text string Initial text; newlines create additional unwrapped lines.
+---@field style? ZmuxStyle Initial text style.
+
+---@class ZmuxTextHandle: ZmuxUiNodeHandle
+---@field set fun(property: ZmuxTextProperty, value: string|ZmuxStyle) Set text or its style.
+
+---@alias ZmuxLayoutChild ZmuxUiNodeHandle|{node: ZmuxUiNodeHandle, size?: ZmuxUiSize}
+
+---@class ZmuxLayoutHandle: ZmuxUiNodeHandle
+---@field set fun(property: ZmuxLayoutProperty, value: ZmuxLayoutChild[]) Replace this Layout's children.
+
+---@class ZmuxDrawerOptions
+---@field type? "drawer" Element type; currently only drawers are supported.
+---@field side? ZmuxDrawerSide Edge to attach to. Defaults to "left".
+---@field width? ZmuxDrawerWidth Fixed cell width or content-sized "auto". Defaults to "auto".
+---@field title? string Optional border title.
+---@field border? ZmuxDrawerBorder Ratatui border preset. Defaults to "plain".
+---@field border_style? ZmuxStyle Border color and modifiers.
+---@field content ZmuxUiNodeHandle Nested content tree.
+---@field keys? table<string, fun(element: ZmuxDrawerHandle, key: ZmuxUiKey)> Direct bindings active while this Drawer is focused.
+---@field visible? boolean Initial visibility. Defaults to false.
+
+---@class ZmuxDrawerHandle
+---@field set fun(property: ZmuxDrawerProperty, value: ZmuxDrawerPropertyValue) Set a typed Drawer property; visual changes automatically schedule a redraw.
+---@field show fun() Show this Drawer without focusing it.
+---@field hide fun() Hide this Drawer and release its focus if needed.
+---@field toggle fun() Toggle visibility without implicitly taking focus.
+---@field focus fun() Focus this Drawer, showing it if necessary.
+---@field blur fun() Return keyboard focus to the terminal.
+
 ---@class ZmuxUiApi
 ---@field pick fun(items: ZmuxPickerItem[], callback: fun(item: any|nil)) Open a generic fuzzy picker from a key or event callback and later call back with the chosen item or nil on Escape.
 ---@field redraw fun() Request a client redraw.
----@field workspace_drawer ZmuxWorkspaceDrawerApi
-
----@class ZmuxWorkspaceDrawerApi
----@field toggle fun() Expand or collapse the local Workspace Drawer.
+---@field create fun(options: ZmuxDrawerOptions): ZmuxDrawerHandle Create a retained UI element while loading configuration.
+---@field text fun(options: ZmuxTextOptions): ZmuxTextHandle Create a Text node.
+---@field row fun(children: ZmuxLayoutChild[]): ZmuxLayoutHandle Create a horizontal Layout.
+---@field column fun(children: ZmuxLayoutChild[]): ZmuxLayoutHandle Create a vertical Layout.
 
 ---@class ZmuxClientApi
 ---@field detach fun() Detach the Client while preserving its Session.

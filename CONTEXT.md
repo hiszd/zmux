@@ -49,8 +49,20 @@ Shutting down the Server and all its Sessions, causing every attached Client to 
 _Avoid_: Detach or Kill Session (which affect a Client or one Session)
 
 **UI Anchor**:
-A region attached to an edge of the interface that reserves space for interface content. The initial anchors are top and bottom; side anchors, if added later, behave as drawers.
+A top- or bottom-attached region that reserves space for interface content. A side-attached Drawer overlays the terminal view rather than reserving space.
 _Avoid_: Bar (when referring to the reserved region)
+
+**UI Element**:
+A user-configurable, Client-local interface region that displays information and can receive configured keyboard input. Its visibility and focus belong to the Client, while its callbacks may request Application Commands.
+_Avoid_: Widget (when referring to a configurable interface region)
+
+**Drawer**:
+A UI Element attached to the left or right edge that overlays the terminal view and may receive keyboard focus without changing shared PTY geometry.
+_Avoid_: Workspace Drawer (the built-in Workspace-specific UI is removed)
+
+**Layout**:
+A nested arrangement of UI content that allocates available space among its children and may contain other Layouts or display primitives.
+_Avoid_: Screen layout (when referring to content inside a UI Element)
 
 **Bar**:
 The rendered content placed in a UI Anchor. A bar can contain user-configurable content and styling.
@@ -61,7 +73,7 @@ A distinct content position within a bar: left, center, or right.
 _Avoid_: Widget (when referring to configurable bar content)
 
 **UI State**:
-Current application values that describe interface conditions, such as the active Workspace, active Tab, leader mode, and terminal status. Session-level selections, including the active Workspace and Tab, are server-authoritative and shared across Clients; client-local presentation state, such as whether a Drawer is expanded, belongs to that Client.
+Current application values that describe interface conditions, such as the active Workspace, active Tab, leader mode, and terminal status. Session-level selections, including the active Workspace and Tab, are server-authoritative and shared across Clients; client-local presentation state, such as UI Element visibility and focus, belongs to that Client.
 _Avoid_: Session state (when referring to visible interface state)
 
 **UI Event**:
@@ -83,7 +95,3 @@ _Avoid_: Theme (when referring to the style resolved for a particular bar part)
 **Fuzzy Picker**:
 A generic focus-taking overlay that fuzzy-filters a supplied list of items and invokes its completion callback with the selected item on Enter, or no item on Escape.
 _Avoid_: Bar (a Fuzzy Picker temporarily owns keyboard focus)
-
-**Workspace Drawer**:
-A collapsible left-side overlay listing the current Session's Workspaces. Expanded, it shows full names and takes keyboard focus; arrows move a temporary highlight, Enter switches the Session's active Workspace for all Clients and collapses the Drawer to its one-character-wide rail, and Escape collapses it without switching. The collapsed rail shows each Workspace's initial and highlights the active Workspace. Opening or collapsing the Drawer does not resize PTYs.
-_Avoid_: Fuzzy Picker (the Drawer is a persistent navigation element, not a temporary filtered selection dialog)

@@ -224,6 +224,32 @@ pub fn key_seq_to_string(sequence: &[KeyStroke]) -> String {
   sequence.iter().map(key_stroke_to_string).collect()
 }
 
+fn shifted_character(character: char) -> char {
+  match character {
+    '1' => '!',
+    '2' => '@',
+    '3' => '#',
+    '4' => '$',
+    '5' => '%',
+    '6' => '^',
+    '7' => '&',
+    '8' => '*',
+    '9' => '(',
+    '0' => ')',
+    '-' => '_',
+    '=' => '+',
+    '[' => '{',
+    ']' => '}',
+    '\\' => '|',
+    ';' => ':',
+    '\'' => '"',
+    ',' => '<',
+    '.' => '>',
+    '/' => '?',
+    character => character.to_ascii_uppercase(),
+  }
+}
+
 pub fn encode_key(event: CrosstermKeyEvent) -> Option<Vec<u8>> {
   let bytes = match (event.code, event.modifiers) {
     (KeyCode::Char(character), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
@@ -243,7 +269,7 @@ pub fn encode_key(event: CrosstermKeyEvent) -> Option<Vec<u8>> {
     }
     (KeyCode::Char(character), modifiers) => {
       let character = if modifiers.contains(KeyModifiers::SHIFT) {
-        character.to_ascii_uppercase()
+        shifted_character(character)
       } else {
         character
       };
