@@ -9,6 +9,10 @@ use std::{
   },
   path::PathBuf,
   rc::Rc,
+  sync::mpsc::{
+    Receiver,
+    Sender,
+  },
   time::Duration,
 };
 
@@ -18,6 +22,7 @@ use mlua::{
   Lua,
   Result as LuaResult,
   Table,
+  UserData,
   Value,
 };
 use ratatui::style::{
@@ -210,6 +215,41 @@ struct PendingPicker {
   callback: Function,
 }
 
+#[derive(Clone, Copy)]
+enum UiHandleKind {
+  Node,
+  Element,
+}
+
+#[derive(Clone, Copy)]
+struct UiHandleRelease {
+  kind: UiHandleKind,
+  id: u64,
+}
+
+struct UiHandleLease {
+  release: UiHandleRelease,
+  sender: Sender<UiHandleRelease>,
+}
+
+impl UserData for UiHandleLease {
+}
+
+impl Drop for UiHandleLease {
+  fn drop(&mut self) { let _ = self.sender.send(self.release); }
+}
+
+#[derive(Clone)]
+struct UiApiContext {
+  tree: Rc<RefCell<UiTree>>,
+  handles: Table,
+  leases: Table,
+  release_sender: Sender<UiHandleRelease>,
+  commands: Rc<RefCell<VecDeque<RuntimeCommand>>>,
+  config_loading: Rc<Cell<bool>>,
+  in_callback: Rc<Cell<bool>>,
+}
+
 pub struct LuaConfig {
   lua: Lua,
   options: Table,
@@ -220,7 +260,9 @@ pub struct LuaConfig {
   in_event_callback: Rc<Cell<bool>>,
   pending_pickers: Rc<RefCell<HashMap<u64, PendingPicker>>>,
   ui_tree: Rc<RefCell<UiTree>>,
-  ui_handles: Rc<RefCell<HashMap<u64, Table>>>,
+  ui_handles: Table,
+  _ui_leases: Table,
+  ui_releases: RefCell<Receiver<UiHandleRelease>>,
   launch: Table,
 }
 
@@ -353,32 +395,61 @@ impl LuaConfig {
     area: ratatui::layout::Rect,
     buffer: &mut ratatui::buffer::Buffer,
   ) {
+    self.reap_ui_releases();
     self.ui_tree.borrow_mut().render(area, buffer);
   }
 
-  pub fn focused_ui(&self) -> Option<u64> { self.ui_tree.borrow().focused_element() }
+  pub fn focused_ui(&self) -> Option<u64> {
+    self.reap_ui_releases();
+    self.ui_tree.borrow().focused_element()
+  }
 
   pub fn focused_ui_captures_input(&self) -> bool {
+    self.reap_ui_releases();
     self.ui_tree.borrow().focused_element_captures_input()
   }
 
   pub fn expire_ui_toasts(&self, now: std::time::Instant) -> bool {
+    self.reap_ui_releases();
     self.ui_tree.borrow_mut().expire_toasts(now)
   }
 
   pub fn focused_ui_binding(&self, key: KeyStroke) -> Option<(u64, Function, Table)> {
+    self.reap_ui_releases();
     let id = self.ui_tree.borrow().focused_element()?;
-    let handles = self.ui_handles.borrow();
-    let handle = handles.get(&id)?.clone();
+    let handle = self.ui_handles.get::<Option<Table>>(id).ok().flatten()?;
     let keys = handle.get::<Table>("__zmux_ui_keys").ok()?;
     let key_name = crate::input::key_notation::key_stroke_to_string(&key);
     let callback = keys.get::<Option<Function>>(key_name).ok().flatten()?;
     Some((id, callback, handle))
   }
 
-  pub fn blur_focused_ui(&self) -> bool { self.ui_tree.borrow_mut().blur_focused() }
+  pub fn blur_focused_ui(&self) -> bool {
+    self.reap_ui_releases();
+    self.ui_tree.borrow_mut().blur_focused()
+  }
 
-  pub fn dismiss_focused_ui(&self) -> bool { self.ui_tree.borrow_mut().dismiss_focused_element() }
+  pub fn dismiss_focused_ui(&self) -> bool {
+    self.reap_ui_releases();
+    self.ui_tree.borrow_mut().dismiss_focused_element()
+  }
+
+  fn reap_ui_releases(&self) -> bool {
+    let releases: Vec<_> = self.ui_releases.borrow().try_iter().collect();
+    if releases.is_empty() {
+      return false;
+    }
+    let mut tree = self.ui_tree.borrow_mut();
+    let mut changed = false;
+    for release in releases {
+      let released = match release.kind {
+        UiHandleKind::Node => tree.release_node_handle(release.id),
+        UiHandleKind::Element => tree.remove_element(release.id),
+      };
+      changed |= released;
+    }
+    changed
+  }
 
   pub fn invoke_ui_key_callback(
     &self,
@@ -426,11 +497,18 @@ impl LuaConfig {
     callback: &Function,
     args: A,
   ) -> LuaResult<Vec<RuntimeCommand>> {
+    if self.reap_ui_releases() {
+      self.commands.borrow_mut().push_back(RuntimeCommand::Redraw);
+    }
     self.in_event_callback.set(true);
     let result = callback.call::<()>(args);
     self.in_event_callback.set(false);
     if result.is_err() {
       self.commands.borrow_mut().clear();
+    }
+    let released = self.reap_ui_releases();
+    if released && result.is_ok() {
+      self.commands.borrow_mut().push_back(RuntimeCommand::Redraw);
     }
     result?;
     Ok(self.commands.borrow_mut().drain(..).collect())
@@ -457,14 +535,18 @@ impl LuaConfig {
     let value = selected_index
       .and_then(|index| picker.values.get(index).cloned())
       .unwrap_or(Value::Nil);
-    self.in_event_callback.set(true);
-    let result = picker.callback.call::<()>(value);
-    self.in_event_callback.set(false);
-    if result.is_err() {
-      self.commands.borrow_mut().clear();
+    let result = self.invoke_callback(&picker.callback, value);
+    drop(picker);
+    let released = self.reap_ui_releases();
+    match result {
+      Ok(mut commands) => {
+        if released {
+          commands.push(RuntimeCommand::Redraw);
+        }
+        Ok(commands)
+      }
+      Err(error) => Err(error),
     }
-    result?;
-    Ok(self.commands.borrow_mut().drain(..).collect())
   }
 
   pub fn sync_options(&self) -> LuaResult<UiOptions> {
@@ -787,6 +869,14 @@ pub fn load_config(source: &str) -> LuaResult<AppConfig> {
   load_config_with_context(source, &[], LaunchState::default())
 }
 
+fn create_weak_table(lua: &Lua, mode: &str) -> LuaResult<Table> {
+  let table = lua.create_table()?;
+  let metatable = lua.create_table()?;
+  metatable.set("__mode", mode)?;
+  table.set_metatable(Some(metatable))?;
+  Ok(table)
+}
+
 pub fn load_config_with_context(
   source: &str,
   arguments: &[String],
@@ -799,7 +889,9 @@ pub fn load_config_with_context(
   let in_event_callback = Rc::new(Cell::new(false));
   let pending_pickers = Rc::new(RefCell::new(HashMap::<u64, PendingPicker>::new()));
   let ui_tree = Rc::new(RefCell::new(UiTree::default()));
-  let ui_handles = Rc::new(RefCell::new(HashMap::<u64, Table>::new()));
+  let ui_handles = create_weak_table(&lua, "v")?;
+  let ui_leases = create_weak_table(&lua, "k")?;
+  let (ui_release_sender, ui_releases) = std::sync::mpsc::channel();
   let next_picker_id = Rc::new(Cell::new(1_u64));
   let config_loading = Rc::new(Cell::new(true));
   let globals = lua.create_table()?;
@@ -937,15 +1029,16 @@ pub fn load_config_with_context(
       })?,
     )?;
   }
-  register_ui_api(
-    &lua,
-    &ui,
-    &ui_tree,
-    &ui_handles,
-    &commands,
-    &config_loading,
-    &in_event_callback,
-  )?;
+  let ui_api = UiApiContext {
+    tree: Rc::clone(&ui_tree),
+    handles: ui_handles.clone(),
+    leases: ui_leases.clone(),
+    release_sender: ui_release_sender,
+    commands: Rc::clone(&commands),
+    config_loading: Rc::clone(&config_loading),
+    in_callback: Rc::clone(&in_event_callback),
+  };
+  register_ui_api(&lua, &ui, &ui_api)?;
   register_command(&lua, &ui, &commands, &in_event_callback, "redraw", RuntimeCommand::Redraw)?;
   register_command(&lua, &client, &commands, &in_event_callback, "detach", RuntimeCommand::Detach)?;
   register_command(
@@ -1122,27 +1215,18 @@ pub fn load_config_with_context(
       pending_pickers,
       ui_tree,
       ui_handles,
+      _ui_leases: ui_leases,
+      ui_releases: RefCell::new(ui_releases),
       launch,
     },
   })
 }
 
-fn register_ui_api(
-  lua: &Lua,
-  ui: &Table,
-  tree: &Rc<RefCell<UiTree>>,
-  handles: &Rc<RefCell<HashMap<u64, Table>>>,
-  commands: &Rc<RefCell<VecDeque<RuntimeCommand>>>,
-  config_loading: &Rc<Cell<bool>>,
-  in_callback: &Rc<Cell<bool>>,
-) -> LuaResult<()> {
+fn register_ui_api(lua: &Lua, ui: &Table, context: &UiApiContext) -> LuaResult<()> {
   let text = {
-    let tree = Rc::clone(tree);
-    let commands = Rc::clone(commands);
-    let config_loading = Rc::clone(config_loading);
-    let in_callback = Rc::clone(in_callback);
+    let context = context.clone();
     lua.create_function(move |lua, options: Table| {
-      ensure_ui_creation_context(&config_loading)?;
+      ensure_ui_mutation_context(&context.config_loading, &context.in_callback)?;
       let text = options
         .get::<Option<String>>("text")?
         .ok_or_else(|| mlua::Error::external("Text nodes require a 'text' string"))?;
@@ -1150,42 +1234,20 @@ fn register_ui_api(
         .get::<Value>("style")
         .and_then(parse_optional_style)?
         .unwrap_or_default();
-      make_text_handle(lua, &tree, text, style, &commands, &config_loading, &in_callback)
+      let handle = make_text_handle(lua, &context, text, style)?;
+      finish_ui_mutation(true, &context.config_loading, &context.commands);
+      Ok(handle)
     })?
   };
-  let row = create_layout_constructor(
-    lua,
-    tree,
-    commands,
-    config_loading,
-    in_callback,
-    LayoutAxis::Horizontal,
-  )?;
-  let column = create_layout_constructor(
-    lua,
-    tree,
-    commands,
-    config_loading,
-    in_callback,
-    LayoutAxis::Vertical,
-  )?;
+  let row = create_layout_constructor(lua, context, LayoutAxis::Horizontal)?;
+  let column = create_layout_constructor(lua, context, LayoutAxis::Vertical)?;
   let create = {
-    let tree = Rc::clone(tree);
-    let handles = Rc::clone(handles);
-    let commands = Rc::clone(commands);
-    let config_loading = Rc::clone(config_loading);
-    let in_callback = Rc::clone(in_callback);
+    let context = context.clone();
     lua.create_function(move |lua, options: Table| {
-      ensure_ui_creation_context(&config_loading)?;
-      create_ui_element_handle(
-        lua,
-        &tree,
-        &handles,
-        options,
-        &commands,
-        &config_loading,
-        &in_callback,
-      )
+      ensure_ui_mutation_context(&context.config_loading, &context.in_callback)?;
+      let handle = create_ui_element_handle(lua, &context, options)?;
+      finish_ui_mutation(true, &context.config_loading, &context.commands);
+      Ok(handle)
     })?
   };
   ui.set("text", text)?;
@@ -1193,14 +1255,6 @@ fn register_ui_api(
   ui.set("column", column)?;
   ui.set("create", create)?;
   Ok(())
-}
-
-fn ensure_ui_creation_context(config_loading: &Cell<bool>) -> LuaResult<()> {
-  if config_loading.get() {
-    Ok(())
-  } else {
-    Err(mlua::Error::external("cmd.ui constructors may only be used while loading configuration"))
-  }
 }
 
 fn ensure_ui_mutation_context(
@@ -1225,6 +1279,21 @@ fn finish_ui_mutation(
 }
 
 fn parse_optional_style(value: Value) -> LuaResult<Option<Style>> { parse_style(value) }
+
+fn track_ui_handle(
+  lua: &Lua,
+  leases: &Table,
+  sender: &Sender<UiHandleRelease>,
+  handle: &Table,
+  kind: UiHandleKind,
+  id: u64,
+) -> LuaResult<()> {
+  let lease = lua.create_userdata(UiHandleLease {
+    release: UiHandleRelease { kind, id },
+    sender: sender.clone(),
+  })?;
+  leases.set(handle.clone(), lease)
+}
 
 fn ui_node_id(handle: &Table) -> LuaResult<u64> {
   handle
@@ -1370,24 +1439,22 @@ fn parse_drawer_border(value: Value) -> LuaResult<DrawerBorder> {
 
 fn make_text_handle(
   lua: &Lua,
-  tree: &Rc<RefCell<UiTree>>,
+  context: &UiApiContext,
   text: String,
   style: Style,
-  commands: &Rc<RefCell<VecDeque<RuntimeCommand>>>,
-  config_loading: &Rc<Cell<bool>>,
-  in_callback: &Rc<Cell<bool>>,
 ) -> LuaResult<Table> {
-  let id = tree
+  let id = context
+    .tree
     .borrow_mut()
     .create_text(text, style)
     .map_err(mlua::Error::external)?;
   let handle = lua.create_table()?;
   handle.set("__zmux_ui_node", id)?;
   let set = {
-    let tree = Rc::clone(tree);
-    let commands = Rc::clone(commands);
-    let config_loading = Rc::clone(config_loading);
-    let in_callback = Rc::clone(in_callback);
+    let tree = Rc::clone(&context.tree);
+    let commands = Rc::clone(&context.commands);
+    let config_loading = Rc::clone(&context.config_loading);
+    let in_callback = Rc::clone(&context.in_callback);
     lua.create_function(move |_, (property, value): (String, Value)| {
       ensure_ui_mutation_context(&config_loading, &in_callback)?;
       let changed = match property.as_str() {
@@ -1414,35 +1481,31 @@ fn make_text_handle(
     })?
   };
   handle.set("set", set)?;
+  track_ui_handle(lua, &context.leases, &context.release_sender, &handle, UiHandleKind::Node, id)?;
   Ok(handle)
 }
 
 fn create_layout_constructor(
   lua: &Lua,
-  tree: &Rc<RefCell<UiTree>>,
-  commands: &Rc<RefCell<VecDeque<RuntimeCommand>>>,
-  config_loading: &Rc<Cell<bool>>,
-  in_callback: &Rc<Cell<bool>>,
+  context: &UiApiContext,
   axis: LayoutAxis,
 ) -> LuaResult<Function> {
-  let tree = Rc::clone(tree);
-  let commands = Rc::clone(commands);
-  let config_loading = Rc::clone(config_loading);
-  let in_callback = Rc::clone(in_callback);
+  let context = context.clone();
   lua.create_function(move |lua, children: Table| {
-    ensure_ui_creation_context(&config_loading)?;
+    ensure_ui_mutation_context(&context.config_loading, &context.in_callback)?;
     let children = parse_ui_children(&children)?;
-    let id = tree
+    let id = context
+      .tree
       .borrow_mut()
       .create_layout(axis, children)
       .map_err(mlua::Error::external)?;
     let handle = lua.create_table()?;
     handle.set("__zmux_ui_node", id)?;
     let set = {
-      let tree = Rc::clone(&tree);
-      let commands = Rc::clone(&commands);
-      let config_loading = Rc::clone(&config_loading);
-      let in_callback = Rc::clone(&in_callback);
+      let tree = Rc::clone(&context.tree);
+      let commands = Rc::clone(&context.commands);
+      let config_loading = Rc::clone(&context.config_loading);
+      let in_callback = Rc::clone(&context.in_callback);
       lua.create_function(move |_, (property, value): (String, Value)| {
         ensure_ui_mutation_context(&config_loading, &in_callback)?;
         if property != "children" {
@@ -1461,19 +1524,20 @@ fn create_layout_constructor(
       })?
     };
     handle.set("set", set)?;
+    track_ui_handle(
+      lua,
+      &context.leases,
+      &context.release_sender,
+      &handle,
+      UiHandleKind::Node,
+      id,
+    )?;
+    finish_ui_mutation(true, &context.config_loading, &context.commands);
     Ok(handle)
   })
 }
 
-fn create_ui_element_handle(
-  lua: &Lua,
-  tree: &Rc<RefCell<UiTree>>,
-  handles: &Rc<RefCell<HashMap<u64, Table>>>,
-  options: Table,
-  commands: &Rc<RefCell<VecDeque<RuntimeCommand>>>,
-  config_loading: &Rc<Cell<bool>>,
-  in_callback: &Rc<Cell<bool>>,
-) -> LuaResult<Table> {
+fn create_ui_element_handle(lua: &Lua, context: &UiApiContext, options: Table) -> LuaResult<Table> {
   let type_name = options
     .get::<Option<String>>("type")?
     .unwrap_or_else(|| "drawer".to_owned());
@@ -1537,16 +1601,9 @@ fn create_ui_element_handle(
   }
   let is_toast = matches!(element_type, UiElementType::Toast { .. });
   let id = Rc::new(Cell::new(0_u64));
-  let handle = make_ui_element_handle(
-    lua,
-    tree,
-    Rc::clone(&id),
-    commands,
-    config_loading,
-    in_callback,
-    is_toast,
-  )?;
-  let element_id = tree
+  let handle = make_ui_element_handle(lua, context, Rc::clone(&id), is_toast)?;
+  let element_id = context
+    .tree
     .borrow_mut()
     .create_element(UiElementOptions {
       element_type,
@@ -1560,26 +1617,32 @@ fn create_ui_element_handle(
   id.set(element_id);
   handle.set("__zmux_ui_element", element_id)?;
   handle.set("__zmux_ui_keys", ui_keymap_table(lua, &keys)?)?;
-  handles.borrow_mut().insert(element_id, handle.clone());
+  context.handles.set(element_id, handle.clone())?;
+  track_ui_handle(
+    lua,
+    &context.leases,
+    &context.release_sender,
+    &handle,
+    UiHandleKind::Element,
+    element_id,
+  )?;
   Ok(handle)
 }
 
 fn make_ui_element_handle(
   lua: &Lua,
-  tree: &Rc<RefCell<UiTree>>,
+  context: &UiApiContext,
   id: Rc<Cell<u64>>,
-  commands: &Rc<RefCell<VecDeque<RuntimeCommand>>>,
-  config_loading: &Rc<Cell<bool>>,
-  in_callback: &Rc<Cell<bool>>,
   is_toast: bool,
 ) -> LuaResult<Table> {
   let handle = lua.create_table()?;
   let set = {
-    let tree = Rc::clone(tree);
-    let handle_for_keys = handle.clone();
-    let commands = Rc::clone(commands);
-    let config_loading = Rc::clone(config_loading);
-    let in_callback = Rc::clone(in_callback);
+    let tree = Rc::clone(&context.tree);
+    let handles = context.handles.clone();
+    let id_for_keys = Rc::clone(&id);
+    let commands = Rc::clone(&context.commands);
+    let config_loading = Rc::clone(&context.config_loading);
+    let in_callback = Rc::clone(&context.in_callback);
     let id = Rc::clone(&id);
     lua.create_function(move |lua, (property, value): (String, Value)| {
       ensure_ui_mutation_context(&config_loading, &in_callback)?;
@@ -1591,7 +1654,10 @@ fn make_ui_element_handle(
           return Err(mlua::Error::external("UI element 'keys' property must be a table"));
         };
         let keys = parse_ui_keys(&keys)?;
-        handle_for_keys.set("__zmux_ui_keys", ui_keymap_table(lua, &keys)?)?;
+        let handle = handles
+          .get::<Option<Table>>(id_for_keys.get())?
+          .ok_or_else(|| mlua::Error::external("UI element handle is no longer reachable"))?;
+        handle.set("__zmux_ui_keys", ui_keymap_table(lua, &keys)?)?;
         return Ok(());
       }
       let (property_kind, value) = match property.as_str() {
@@ -1658,10 +1724,10 @@ fn make_ui_element_handle(
   };
   handle.set("set", set)?;
   for action in ["show", "hide", "toggle", "focus", "blur"] {
-    let tree = Rc::clone(tree);
-    let commands = Rc::clone(commands);
-    let config_loading = Rc::clone(config_loading);
-    let in_callback = Rc::clone(in_callback);
+    let tree = Rc::clone(&context.tree);
+    let commands = Rc::clone(&context.commands);
+    let config_loading = Rc::clone(&context.config_loading);
+    let in_callback = Rc::clone(&context.in_callback);
     let id = Rc::clone(&id);
     let action_name = action;
     handle.set(
@@ -2306,6 +2372,125 @@ mod tests {
   }
 
   #[test]
+  fn runtime_callbacks_can_construct_and_render_ui_elements() {
+    use ratatui::{
+      buffer::Buffer,
+      layout::Rect,
+    };
+
+    let config = load_config(
+      r#"
+        local dialog
+        cmd.event.on("tab_selected", function()
+          if dialog then
+            collectgarbage("collect")
+            collectgarbage("collect")
+          else
+            local text = cmd.ui.text({ text = "Runtime" })
+            local row = cmd.ui.row({ text })
+            local content = cmd.ui.column({ row })
+            dialog = cmd.ui.create({ type = "modal", content = content, visible = true })
+            dialog.set("keys", { x = function(element) element.hide() end })
+          end
+        end)
+      "#,
+    )
+    .expect("config with runtime UI callback");
+    let callback = config.lua.event_handlers("tab_selected").remove(0);
+    let commands = config
+      .lua
+      .invoke_event_handler(&callback, &AppEvent::default())
+      .expect("construct UI in runtime callback");
+    config
+      .lua
+      .invoke_event_handler(&callback, &AppEvent::default())
+      .expect("collect unreferenced child handles while the Element owns them");
+    assert!(
+      commands
+        .iter()
+        .any(|command| *command == RuntimeCommand::Redraw)
+    );
+    assert!(config.lua.focused_ui_captures_input());
+    let key = parse_key_notation("x").expect("direct UI key")[0];
+    assert!(config.lua.focused_ui_binding(key).is_some());
+
+    let area = Rect::new(0, 0, 40, 12);
+    let mut buffer = Buffer::empty(area);
+    config.lua.render_ui_elements(area, &mut buffer);
+    assert!(buffer.content.iter().any(|cell| cell.symbol() == "R"));
+  }
+
+  #[test]
+  fn ui_constructors_are_rejected_from_bar_render_providers() {
+    let config = load_config(
+      r#"
+        opt.ui.bars.top.left = function()
+          cmd.ui.text({ text = "not during rendering" })
+          return "bar"
+        end
+      "#,
+    )
+    .expect("config with a render-time constructor attempt");
+
+    assert!(config.lua.render_bar_part("top", "left").is_err());
+  }
+
+  #[test]
+  fn unreferenced_runtime_ui_elements_are_reclaimed_after_lua_collection() {
+    use ratatui::{
+      buffer::Buffer,
+      layout::Rect,
+    };
+
+    let config = load_config(
+      r#"
+        local saved_text
+        local collection_requested = false
+        local reused_dialog
+        cmd.event.on("tab_selected", function()
+          if saved_text == nil then
+            saved_text = cmd.ui.text({ text = "Kept" })
+            local content = cmd.ui.column({ saved_text })
+            cmd.ui.create({ type = "modal", content = content, visible = true })
+          elseif not collection_requested then
+            collectgarbage("collect")
+            collectgarbage("collect")
+            collection_requested = true
+          else
+            saved_text.set("text", "Reused")
+            reused_dialog = cmd.ui.create({ type = "modal", content = saved_text, visible = true })
+          end
+        end)
+      "#,
+    )
+    .expect("config with transient runtime UI");
+    let callback = config.lua.event_handlers("tab_selected").remove(0);
+    config
+      .lua
+      .invoke_event_handler(&callback, &AppEvent::default())
+      .expect("create transient UI around a retained text node");
+    config
+      .lua
+      .invoke_event_handler(&callback, &AppEvent::default())
+      .expect("collect an Element after its handle becomes unreachable");
+    assert_eq!(config.lua.focused_ui(), None);
+
+    let area = Rect::new(0, 0, 40, 12);
+    let mut buffer = Buffer::empty(area);
+    config.lua.render_ui_elements(area, &mut buffer);
+    assert!(!buffer.content.iter().any(|cell| cell.symbol() == "K"));
+
+    config
+      .lua
+      .invoke_event_handler(&callback, &AppEvent::default())
+      .expect("reuse a still-referenced node after its element is collected");
+    assert!(config.lua.focused_ui().is_some());
+    let mut buffer = Buffer::empty(area);
+    config.lua.render_ui_elements(area, &mut buffer);
+    assert!(buffer.content.iter().any(|cell| cell.symbol() == "R"));
+  }
+
+  #[test]
   fn ui_create_renders_modal_popover_bottom_panel_and_toast_elements() {
     use ratatui::{
       buffer::Buffer,
@@ -2321,7 +2506,7 @@ mod tests {
 
     for (element_type, text, options, expected) in cases {
       let source = format!(
-        "local content = cmd.ui.text({{ text = '{text}' }})\nlocal element = cmd.ui.create({{ type = '{element_type}', {options}, content = content }})\nelement.show()"
+        "local content = cmd.ui.text({{ text = '{text}' }})\nlocal element = cmd.ui.create({{ type = '{element_type}', {options}, content = content }})\nelement.show()\nkeep_element = element"
       );
       let config =
         load_config(&source).unwrap_or_else(|error| panic!("create {element_type}: {error}"));
@@ -2354,7 +2539,7 @@ mod tests {
       "type = 'popover', x = 500, y = 300, width = 50, height = 30",
     ] {
       let source = format!(
-        "local content = cmd.ui.text({{ text = 'X' }})\ncmd.ui.create({{ {specification}, border = 'none', visible = true, content = content }})"
+        "local content = cmd.ui.text({{ text = 'X' }})\nlocal element = cmd.ui.create({{ {specification}, border = 'none', visible = true, content = content }})\nkeep_element = element"
       );
       let config = load_config(&source).expect("small-area overlay config");
       assert!(config.lua.focused_ui().is_some());
@@ -2380,6 +2565,7 @@ mod tests {
         local toast_content = cmd.ui.text({ text = "Transient" })
         local toast = cmd.ui.create({ type = "toast", duration = 10, content = toast_content })
         toast.show()
+        keep_elements = { modal, toast }
       "#,
     )
     .expect("modal and toast elements");
@@ -2421,7 +2607,10 @@ mod tests {
         drawer.focus()
         local modal_content = cmd.ui.text({ text = "Dialog" })
         local modal = cmd.ui.create({ type = "modal", content = modal_content })
-        cmd.event.on("ClientLoaded", function() modal.show() end)
+        cmd.event.on("ClientLoaded", function()
+          drawer.focus()
+          modal.show()
+        end)
       "#,
     )
     .expect("nested focus config");

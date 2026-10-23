@@ -114,7 +114,7 @@
 ---@field shift boolean Whether Shift was pressed.
 ---@field is_repeat boolean Whether this is a repeated key event.
 
----@class ZmuxUiNodeHandle
+---@class ZmuxUiNodeHandle Lua keeps detached nodes alive while this handle is reachable; a parent Layout or Element owns attached nodes.
 ---@field set fun(property: ZmuxTextProperty|ZmuxLayoutProperty, value: string|ZmuxStyle|ZmuxLayoutChild[]) Set a typed property; mutations automatically schedule a redraw.
 
 ---@class ZmuxTextOptions
@@ -186,7 +186,7 @@
 
 ---@alias ZmuxUiElementOptions ZmuxDrawerOptions|ZmuxModalOptions|ZmuxPopoverOptions|ZmuxBottomPanelOptions|ZmuxToastOptions
 
----@class ZmuxUiElementHandle
+---@class ZmuxUiElementHandle This Element is disposed after its handle becomes unreachable and Lua collects it; hiding it does not release it.
 ---@field set fun(property: ZmuxUiElementProperty, value: ZmuxUiElementPropertyValue) Set a typed property; visual changes automatically schedule a redraw.
 ---@field show fun() Show this element; Modal and Popover are focused automatically.
 ---@field hide fun() Hide this element and release its focus if needed.
@@ -196,10 +196,10 @@
 
 ---@alias ZmuxDrawerHandle ZmuxUiElementHandle
 
----@class ZmuxUiApi
+---@class ZmuxUiApi Constructors are available during config loading and mutation-safe callbacks, but not bar or style render providers.
 ---@field pick fun(items: ZmuxPickerItem[], callback: fun(item: any|nil)) Open a generic fuzzy picker from a key or event callback and later call back with the chosen item or nil on Escape.
 ---@field redraw fun() Request a client redraw.
----@field create fun(options: ZmuxUiElementOptions): ZmuxUiElementHandle Create a retained Drawer, Modal, Popover, Bottom Panel, or Toast while loading configuration.
+---@field create fun(options: ZmuxUiElementOptions): ZmuxUiElementHandle Create a Drawer, Modal, Popover, Bottom Panel, or Toast.
 ---@field text fun(options: ZmuxTextOptions): ZmuxTextHandle Create a Text node.
 ---@field row fun(children: ZmuxLayoutChild[]): ZmuxLayoutHandle Create a horizontal Layout.
 ---@field column fun(children: ZmuxLayoutChild[]): ZmuxLayoutHandle Create a vertical Layout.

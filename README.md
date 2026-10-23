@@ -103,7 +103,7 @@ Key bindings use neovim-style notation and Lua callbacks: `cmd.key.bind('tw', fu
 
 ### Configurable UI Elements
 
-UI elements are created during config loading and retain a nested tree of `Text`, `row`, and `column` nodes. The built-in Workspace Drawer has been removed; this minimal example creates a custom informational drawer:
+UI elements and `Text`/`row`/`column` nodes can be created while loading config or inside runtime event, key, picker-completion, and focused-UI key callbacks. Render-time bar and style providers are not mutation contexts. UI handles follow Lua reachability: an Element is disposed after its handle becomes unreachable and Lua collects it; hiding an Element does not release it. Layouts and Elements keep their attached child nodes alive, while a detached node remains reusable as long as Lua retains its handle. Keep a handle in a Lua variable or table for as long as you intend to use it. The built-in Workspace Drawer has been removed; this minimal example creates a custom informational drawer:
 
 ```lua
 local ui = cmd.ui
@@ -129,6 +129,23 @@ cmd.key.bind("ui", function()
     drawer.show()
     drawer.focus()
 end, { desc = "Show status drawer" })
+```
+
+Runtime-created Elements need a retained Lua handle for as long as they should remain available. Assigning a replacement or `nil` makes the old handle eligible for Lua garbage collection; hiding an Element alone keeps it alive.
+
+```lua
+local active_dialog
+cmd.event.on("workspace_selected", function()
+    if active_dialog then
+        active_dialog.hide()
+        active_dialog = nil
+    end
+    active_dialog = cmd.ui.create({
+        type = "modal",
+        content = cmd.ui.text({ text = g.active_workspace.name }),
+        visible = true,
+    })
+end)
 ```
 
 `Text`, `row`, and `column` constructors return handles. Layout children may be auto-sized, fixed in terminal cells, or set to `"fill"` to share remaining space equally. `ui.create` also supports `modal`, `popover`, `bottom_panel`, and `toast` alongside `drawer`. Modals center over the terminal panel, dim its background, take focus when shown, and capture keys until Escape or `hide()`; a Popover is positioned by `x` and `y` cell offsets in that panel, clamps to fit, and also captures keys. A Bottom Panel overlays the bottom of the panel rather than reserving rows. Toasts are non-focusable and dismiss automatically after `duration` milliseconds (default 3000); positions are `top_right`, `top_center`, `bottom_right`, or `bottom_center`. All accept nested retained content, title, border, and border style.

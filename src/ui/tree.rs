@@ -195,6 +195,7 @@ pub(crate) struct UiNode {
   pub kind: UiNodeKind,
   parent: Option<u64>,
   element_root: Option<u64>,
+  lua_handle_alive: bool,
 }
 
 pub(crate) struct UiElementOptions {
@@ -283,6 +284,7 @@ impl UiTree {
       kind: UiNodeKind::Text { text, style },
       parent: None,
       element_root: None,
+      lua_handle_alive: true,
     });
     self.layout_dirty = true;
     Ok(id)
@@ -306,6 +308,7 @@ impl UiTree {
       kind: UiNodeKind::Layout { axis, children },
       parent: None,
       element_root: None,
+      lua_handle_alive: true,
     });
     self.layout_dirty = true;
     Ok(id)
@@ -348,6 +351,73 @@ impl UiTree {
     }
     self.layout_dirty = true;
     Ok(id)
+  }
+
+  pub(crate) fn release_node_handle(&mut self, id: u64) -> bool {
+    let Some(node) = self.nodes.get_mut(&id) else {
+      return false;
+    };
+    if !node.lua_handle_alive {
+      return false;
+    }
+    node.lua_handle_alive = false;
+    self.prune_unowned_node(id)
+  }
+
+  pub(crate) fn remove_element(&mut self, id: u64) -> bool {
+    let Some(index) = self.elements.iter().position(|element| element.id == id) else {
+      return false;
+    };
+    let element = self.elements.remove(index);
+    let fallback_focus = element.previous_focus.filter(|focused_id| {
+      self
+        .elements
+        .iter()
+        .any(|candidate| candidate.id == *focused_id && candidate.visible)
+    });
+    for candidate in &mut self.elements {
+      if candidate.previous_focus == Some(id) {
+        candidate.previous_focus = fallback_focus;
+      }
+    }
+    if self.focused_element == Some(id) {
+      self.focused_element = fallback_focus;
+    }
+    self.element_rects.remove(&id);
+    if let Some(content) = self.nodes.get_mut(&element.content_id)
+      && content.element_root == Some(id)
+    {
+      content.element_root = None;
+    }
+    self.layout_dirty = true;
+    self.prune_unowned_node(element.content_id);
+    true
+  }
+
+  fn prune_unowned_node(&mut self, id: u64) -> bool {
+    let is_unowned = self.nodes.get(&id).is_some_and(|node| {
+      !node.lua_handle_alive && node.parent.is_none() && node.element_root.is_none()
+    });
+    if !is_unowned {
+      return false;
+    }
+    let Some(node) = self.nodes.remove(&id) else {
+      return false;
+    };
+    self.intrinsic_cache.remove(&id);
+    self.node_rects.remove(&id);
+    if let UiNodeKind::Layout { children, .. } = node.kind {
+      for child in children {
+        if let Some(node) = self.nodes.get_mut(&child.node_id)
+          && node.parent == Some(id)
+        {
+          node.parent = None;
+        }
+        self.prune_unowned_node(child.node_id);
+      }
+    }
+    self.layout_dirty = true;
+    true
   }
 
   fn validate_children(&self, parent_id: u64, children: &[UiChild]) -> Result<(), String> {
@@ -443,10 +513,13 @@ impl UiTree {
       }
     }
 
-    for old_id in old_children {
-      if !new_children.contains(&old_id)
-        && let Some(node) = self.nodes.get_mut(&old_id)
-      {
+    let detached: Vec<_> = old_children
+      .iter()
+      .copied()
+      .filter(|old_id| !new_children.contains(old_id))
+      .collect();
+    for old_id in &detached {
+      if let Some(node) = self.nodes.get_mut(old_id) {
         node.parent = None;
       }
     }
@@ -469,6 +542,9 @@ impl UiTree {
     };
     *current = children;
     self.invalidate_node(parent_id);
+    for detached_id in detached {
+      self.prune_unowned_node(detached_id);
+    }
     Ok(true)
   }
 
