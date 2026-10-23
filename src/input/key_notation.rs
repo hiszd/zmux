@@ -424,7 +424,7 @@ mod tests {
     assert_eq!(parse_key_notation("tw").expect("keys").len(), 2);
     assert_eq!(parse_key_notation("<C-c>aa").expect("keys").len(), 3);
     assert_eq!(parse_key_notation("<C-Space>").expect("key")[0].key, Key::Space);
-    assert_eq!(parse_key_notation("<M-w>").expect("key")[0].alt, true);
+    assert!(parse_key_notation("<M-w>").expect("key")[0].alt);
     assert_eq!(parse_key_notation("<S-Up>").expect("key")[0].key, Key::Up);
     assert_eq!(parse_key_notation("<F12>").expect("key")[0].key, Key::F(12));
     assert_eq!(parse_key_notation("<C-->").expect("key")[0].key, Key::Char('-'));

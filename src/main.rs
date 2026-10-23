@@ -11,8 +11,16 @@ mod trace;
 mod ui;
 
 use std::{
-  io,
-  path::PathBuf,
+  fs,
+  io::{
+    self,
+    IsTerminal,
+    Write,
+  },
+  path::{
+    Path,
+    PathBuf,
+  },
   process::{
     Command as ProcessCommand,
     Stdio,
@@ -58,6 +66,13 @@ enum Command {
   Keybinds {
     json: bool,
   },
+  Config(ConfigCommand),
+}
+
+#[derive(Clone, Copy)]
+enum ConfigCommand {
+  Init { replace: bool },
+  Check,
 }
 
 struct CliOptions {
@@ -142,6 +157,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = keybinds_configuration(&arguments)?;
     return print_keybinds(&config, *json);
   }
+  if let Command::Config(command) = &options.command {
+    return run_config_command(*command, &arguments);
+  }
   let endpoint = Endpoint::new(Some(&options.socket_instance))?;
 
   match options.command {
@@ -195,7 +213,7 @@ fn parse_args(mut arguments: impl Iterator<Item = String>) -> Result<CliOptions,
   let Some(command) = arguments.next() else {
     return Err(io::Error::new(
       io::ErrorKind::InvalidInput,
-      "a command is required: use 'new', 'attach', 'list', 'kill', or 'server'",
+      "a command is required; use 'zmux --help' to see available commands",
     ));
   };
   if command == "--_server" {
@@ -232,6 +250,38 @@ fn parse_args(mut arguments: impl Iterator<Item = String>) -> Result<CliOptions,
         }
       }
       Command::Keybinds { json }
+    }
+    "config" => {
+      let subcommand = arguments.next().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "config requires init or check")
+      })?;
+      match subcommand.as_str() {
+        "init" => {
+          let mut replace = false;
+          for argument in arguments {
+            match argument.as_str() {
+              "--replace" => replace = true,
+              "--help" | "-h" => {
+                print_help();
+                std::process::exit(0);
+              }
+              other => return Err(invalid_argument(other)),
+            }
+          }
+          Command::Config(ConfigCommand::Init { replace })
+        }
+        "check" => {
+          if let Some(argument) = arguments.next() {
+            return Err(invalid_argument(&argument));
+          }
+          Command::Config(ConfigCommand::Check)
+        }
+        "--help" | "-h" => {
+          print_help();
+          std::process::exit(0);
+        }
+        other => return Err(invalid_argument(other)),
+      }
     }
     "run" => {
       let mut path = None;
@@ -430,6 +480,8 @@ fn print_help() {
   println!("  zmux server stop [--socket NAME]");
   println!("  zmux server status [--socket NAME]");
   println!("  zmux keybinds [--json]");
+  println!("  zmux config init [--replace]");
+  println!("  zmux config check");
   println!(
     "  zmux run [--socket NAME] [--path DIRECTORY] [SCRIPT.lua | --string SOURCE] [SCRIPT_ARGS...]"
   );
@@ -438,6 +490,10 @@ fn print_help() {
   println!("attach requires SESSION to already exist.");
   println!("run accepts a positional Lua file or inline source with --string.");
   println!("keybinds lists the configured key sequences; --json emits pretty JSON.");
+  println!(
+    "config init installs LuaLS support files and a sample config in the default config directory."
+  );
+  println!("config check validates the effective Lua config without starting the Server.");
 }
 
 fn run_admin_command(
@@ -450,9 +506,11 @@ fn run_admin_command(
     Command::Kill(name) => AdminRequest::KillSession(name),
     Command::ServerStop => AdminRequest::StopServer,
     Command::ServerStatus => AdminRequest::Status,
-    Command::New { .. } | Command::Attach(_) | Command::Run { .. } | Command::Keybinds { .. } => {
-      unreachable!()
-    }
+    Command::New { .. }
+    | Command::Attach(_)
+    | Command::Run { .. }
+    | Command::Keybinds { .. }
+    | Command::Config(_) => unreachable!(),
   };
   let mut stream = match transport::connect(&endpoint) {
     Ok(stream) => stream,
@@ -604,15 +662,23 @@ fn configuration(
   arguments: &[String],
   launch: lua::LaunchState,
 ) -> Result<lua::AppConfig, Box<dyn std::error::Error>> {
+  configuration_with_source(arguments, launch).map(|(config, _)| config)
+}
+
+fn configuration_with_source(
+  arguments: &[String],
+  launch: lua::LaunchState,
+) -> Result<(lua::AppConfig, Option<PathBuf>), Box<dyn std::error::Error>> {
   let explicit_path = std::env::var_os("ZMUX_CONFIG").map(PathBuf::from);
   let path = resolve_config_path(explicit_path.clone(), default_config_path());
   if let Some(path) = path {
-    match std::fs::metadata(&path) {
+    match fs::metadata(&path) {
       Ok(_) => {
-        return lua::load_file_with_context(&path, arguments, launch)
-          .map_err(|error| format!("could not load {}: {error}", path.display()).into());
+        let config = lua::load_file_with_context(&path, arguments, launch)
+          .map_err(|error| format!("could not load {}: {error}", path.display()))?;
+        return Ok((config, Some(path)));
       }
-      Err(error) if error.kind() == std::io::ErrorKind::NotFound && explicit_path.is_none() => {}
+      Err(error) if error.kind() == io::ErrorKind::NotFound && explicit_path.is_none() => {}
       Err(error) => {
         return Err(format!("could not load {}: {error}", path.display()).into());
       }
@@ -621,7 +687,204 @@ fn configuration(
       return Err(format!("could not load {}: file does not exist", path.display()).into());
     }
   }
-  lua::load_config_with_context(lua::DEFAULT_CONFIG_SOURCE, arguments, launch).map_err(Into::into)
+  let config = lua::load_config_with_context(lua::DEFAULT_CONFIG_SOURCE, arguments, launch)?;
+  Ok((config, None))
+}
+
+const LUA_LS_DEFINITIONS: &str = include_str!("../lua/zmux.lua");
+const LUA_LS_CONFIG: &str = include_str!("../assets/luarc.json");
+const CONFIG_EXAMPLE: &str = include_str!("../assets/zmux.lua.example");
+
+fn run_config_command(
+  command: ConfigCommand,
+  arguments: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+  match command {
+    ConfigCommand::Init { replace } => {
+      let config_path = default_config_path()
+        .ok_or("could not determine the default config directory; set HOME or XDG_CONFIG_HOME")?;
+      let directory = config_path
+        .parent()
+        .ok_or("default config path has no parent directory")?;
+      initialize_config_files(directory, replace)?;
+    }
+    ConfigCommand::Check => {
+      let launch = lua::LaunchState {
+        command: "config check".to_owned(),
+        working_directory: std::env::current_dir()?,
+        ..lua::LaunchState::default()
+      };
+      let (config, source) = configuration_with_source(arguments, launch)?;
+      let version = config.config_api_version.unwrap_or(lua::CONFIG_API_VERSION);
+      if let Some(source) = source {
+        println!("Configuration is valid (API version {version}): {}", source.display());
+      } else {
+        println!("Configuration is valid (API version {version}); using built-in defaults.");
+      }
+    }
+  }
+  Ok(())
+}
+
+fn initialize_config_files(
+  directory: &Path,
+  replace: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+  fs::create_dir_all(directory)
+    .map_err(|error| format!("could not create {}: {error}", directory.display()))?;
+
+  let definitions_path = directory.join("defs.lua");
+  let current_definitions = match fs::read(&definitions_path) {
+    Ok(contents) => Some(contents),
+    Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+    Err(error) => {
+      return Err(format!("could not read {}: {error}", definitions_path.display()).into());
+    }
+  };
+
+  match current_definitions.as_deref() {
+    Some(contents) if contents == LUA_LS_DEFINITIONS.as_bytes() => {
+      set_read_only(&definitions_path, true)?;
+      println!("LuaLS definitions are up to date: {}", definitions_path.display());
+    }
+    Some(contents) => {
+      let confirmed = if replace {
+        true
+      } else if !io::stdin().is_terminal() {
+        return Err(
+          format!(
+            "{} contains different definitions; rerun with --replace to update it",
+            definitions_path.display()
+          )
+          .into(),
+        );
+      } else {
+        confirm_definition_replacement(&definitions_path)?
+      };
+      if confirmed {
+        replace_definitions(directory, &definitions_path, contents)?;
+        println!("Updated LuaLS definitions; previous version saved as defs.old.");
+      } else {
+        println!("Kept existing definitions: {}", definitions_path.display());
+      }
+    }
+    None => {
+      install_managed_definitions(&definitions_path)?;
+      println!("Installed LuaLS definitions: {}", definitions_path.display());
+    }
+  }
+
+  install_file_if_missing(directory, ".luarc.json", LUA_LS_CONFIG.as_bytes())?;
+  install_file_if_missing(directory, "zmux.lua.example", CONFIG_EXAMPLE.as_bytes())?;
+  Ok(())
+}
+
+fn confirm_definition_replacement(path: &Path) -> io::Result<bool> {
+  eprint!("Replace {}? The current file will be saved as defs.old [y/N] ", path.display());
+  io::stderr().flush()?;
+  let mut response = String::new();
+  io::stdin().read_line(&mut response)?;
+  Ok(matches!(response.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+}
+
+fn install_managed_definitions(path: &Path) -> io::Result<()> {
+  let staged = stage_file(path, LUA_LS_DEFINITIONS.as_bytes())?;
+  if let Err(error) = replace_staged_file(&staged, path) {
+    let _ = fs::remove_file(&staged);
+    return Err(error);
+  }
+  set_read_only(path, true)
+}
+
+fn replace_definitions(directory: &Path, path: &Path, current_contents: &[u8]) -> io::Result<()> {
+  let staged_definitions = stage_file(path, LUA_LS_DEFINITIONS.as_bytes())?;
+  let backup_path = directory.join("defs.old");
+  let staged_backup = match stage_file(&backup_path, current_contents) {
+    Ok(path) => path,
+    Err(error) => {
+      let _ = fs::remove_file(&staged_definitions);
+      return Err(error);
+    }
+  };
+
+  if let Err(error) = replace_staged_file(&staged_backup, &backup_path) {
+    let _ = fs::remove_file(&staged_backup);
+    let _ = fs::remove_file(&staged_definitions);
+    return Err(error);
+  }
+  if let Err(error) = replace_staged_file(&staged_definitions, path) {
+    let _ = fs::remove_file(&staged_definitions);
+    return Err(error);
+  }
+  set_read_only(path, true)
+}
+
+fn install_file_if_missing(directory: &Path, name: &str, contents: &[u8]) -> io::Result<()> {
+  let path = directory.join(name);
+  let mut file = match fs::OpenOptions::new()
+    .write(true)
+    .create_new(true)
+    .open(&path)
+  {
+    Ok(file) => file,
+    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+      println!("Preserved existing file: {}", path.display());
+      return Ok(());
+    }
+    Err(error) => return Err(error),
+  };
+  if let Err(error) = file.write_all(contents).and_then(|()| file.sync_all()) {
+    drop(file);
+    let _ = fs::remove_file(&path);
+    return Err(error);
+  }
+  println!("Installed: {}", path.display());
+  Ok(())
+}
+
+fn stage_file(destination: &Path, contents: &[u8]) -> io::Result<PathBuf> {
+  for sequence in 0..100 {
+    let file_name = destination
+      .file_name()
+      .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "destination has no filename"))?;
+    let staged_name =
+      format!(".{}.{}.{}.tmp", file_name.to_string_lossy(), std::process::id(), sequence);
+    let staged = destination
+      .parent()
+      .unwrap_or_else(|| Path::new("."))
+      .join(staged_name);
+    let mut file = match fs::OpenOptions::new()
+      .write(true)
+      .create_new(true)
+      .open(&staged)
+    {
+      Ok(file) => file,
+      Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+      Err(error) => return Err(error),
+    };
+    if let Err(error) = file.write_all(contents).and_then(|()| file.sync_all()) {
+      drop(file);
+      let _ = fs::remove_file(&staged);
+      return Err(error);
+    }
+    return Ok(staged);
+  }
+  Err(io::Error::new(io::ErrorKind::AlreadyExists, "could not allocate a temporary config file"))
+}
+
+fn replace_staged_file(staged: &Path, destination: &Path) -> io::Result<()> {
+  #[cfg(windows)]
+  if destination.exists() {
+    set_read_only(destination, false)?;
+    fs::remove_file(destination)?;
+  }
+  fs::rename(staged, destination)
+}
+
+fn set_read_only(path: &Path, read_only: bool) -> io::Result<()> {
+  let mut permissions = fs::metadata(path)?.permissions();
+  permissions.set_readonly(read_only);
+  fs::set_permissions(path, permissions)
 }
 
 #[cfg(test)]
@@ -705,11 +968,7 @@ mod tests {
 
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     assert!(error.to_string().contains("a command is required"));
-    assert!(
-      error
-        .to_string()
-        .contains("'new', 'attach', 'list', 'kill', or 'server'")
-    );
+    assert!(error.to_string().contains("zmux --help"));
   }
 
   // Developer approved: do not remove.

@@ -1,0 +1,15 @@
+-- User configuration for zmux.
+-- `opt.config_version` must be the first executable statement.
+-- Run `zmux config init` to install LuaLS definitions as `defs.lua`.
+opt.config_version = 1
+
+-- Uncomment to customize the prefix key, sequence timeout, or default shell.
+-- opt.prefix_key = "<C-Space>"
+-- opt.sequence_timeout_ms = 700
+-- opt.default_shell = "/bin/bash"
+
+-- Add bindings after the configured prefix. LuaLS completions are available
+-- when this directory is opened as a workspace in your editor.
+-- cmd.key.bind("tc", function()
+--     cmd.tab.create()
+-- end, { desc = "Create a tab" })

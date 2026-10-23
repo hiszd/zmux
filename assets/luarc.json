@@ -1,0 +1,17 @@
+{
+  "runtime.version": "LuaJIT",
+  "workspace.library": [
+    "${workspaceFolder}"
+  ],
+  "diagnostics.globals": [
+    "cmd",
+    "opt",
+    "g",
+    "global",
+    "args",
+    "launch",
+    "inf",
+    "zmux"
+  ],
+  "workspace.checkThirdParty": false
+}
