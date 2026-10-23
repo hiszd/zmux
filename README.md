@@ -38,9 +38,16 @@ A named socket instance runs an independent Server and Session set:
 cargo run -- new --socket project
 cargo run -- attach project --socket project
 cargo run -- list --socket project
+cargo run -- workspace list project --socket project
 cargo run -- kill project --socket project
 cargo run -- server status --socket project
 cargo run -- server stop --socket project
+```
+
+List the Workspaces in a Session, including the active Workspace and each working directory:
+
+```sh
+cargo run -- workspace list project
 ```
 
 Run Lua against the Server without opening a TUI Client. Choose either a positional file path or inline source with `--string`. Options precede the source; arguments after it are available in Lua as `args[1]`, `args[2]`, and so on. `--path` supplies the launch directory used when a script creates a Session:
