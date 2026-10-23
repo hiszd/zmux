@@ -339,31 +339,115 @@ mod tests {
     );
     let now = Instant::now();
     let cases = [
-      (KeyCode::Char('v'), KeyModifiers::SHIFT, &b"V"[..]),
+      (KeyCode::Char('`'), KeyModifiers::SHIFT, &b"~"[..]),
+      (KeyCode::Char('1'), KeyModifiers::SHIFT, &b"!"[..]),
+      (KeyCode::Char('2'), KeyModifiers::SHIFT, &b"@"[..]),
+      (KeyCode::Char('3'), KeyModifiers::SHIFT, &b"#"[..]),
+      (KeyCode::Char('4'), KeyModifiers::SHIFT, &b"$"[..]),
+      (KeyCode::Char('5'), KeyModifiers::SHIFT, &b"%"[..]),
+      (KeyCode::Char('6'), KeyModifiers::SHIFT, &b"^"[..]),
+      (KeyCode::Char('7'), KeyModifiers::SHIFT, &b"&"[..]),
+      (KeyCode::Char('8'), KeyModifiers::SHIFT, &b"*"[..]),
+      (KeyCode::Char('9'), KeyModifiers::SHIFT, &b"("[..]),
+      (KeyCode::Char('0'), KeyModifiers::SHIFT, &b")"[..]),
+      (KeyCode::Char('-'), KeyModifiers::SHIFT, &b"_"[..]),
+      (KeyCode::Char('='), KeyModifiers::SHIFT, &b"+"[..]),
+      (KeyCode::Char('['), KeyModifiers::SHIFT, &b"{"[..]),
+      (KeyCode::Char(']'), KeyModifiers::SHIFT, &b"}"[..]),
+      (KeyCode::Char('\\'), KeyModifiers::SHIFT, &b"|"[..]),
       (KeyCode::Char(';'), KeyModifiers::SHIFT, &b":"[..]),
+      (KeyCode::Char('\''), KeyModifiers::SHIFT, &[b'"'][..]),
+      (KeyCode::Char(','), KeyModifiers::SHIFT, &b"<"[..]),
+      (KeyCode::Char('.'), KeyModifiers::SHIFT, &b">"[..]),
+      (KeyCode::Char('/'), KeyModifiers::SHIFT, &b"?"[..]),
+      (KeyCode::Char('v'), KeyModifiers::SHIFT, &b"V"[..]),
+      (KeyCode::Char('A'), KeyModifiers::NONE, &b"A"[..]),
+      (KeyCode::Char('`'), KeyModifiers::ALT | KeyModifiers::SHIFT, &b"\x1b~"[..]),
       (KeyCode::Char('x'), KeyModifiers::ALT, &b"\x1bx"[..]),
       (KeyCode::Char(' '), KeyModifiers::CONTROL, &b"\0"[..]),
       (KeyCode::Char('c'), KeyModifiers::CONTROL, &b"\x03"[..]),
+      (KeyCode::Char('@'), KeyModifiers::CONTROL, &b"\0"[..]),
+      (KeyCode::Char('['), KeyModifiers::CONTROL, &b"\x1b"[..]),
+      (KeyCode::Char('\\'), KeyModifiers::CONTROL, &b"\x1c"[..]),
+      (KeyCode::Char(']'), KeyModifiers::CONTROL, &b"\x1d"[..]),
+      (KeyCode::Char('^'), KeyModifiers::CONTROL, &b"\x1e"[..]),
+      (KeyCode::Char('_'), KeyModifiers::CONTROL, &b"\x1f"[..]),
+      (KeyCode::Char('?'), KeyModifiers::CONTROL, &b"\x7f"[..]),
+      (KeyCode::Char('2'), KeyModifiers::CONTROL | KeyModifiers::SHIFT, &b"\0"[..]),
+      (KeyCode::Char('c'), KeyModifiers::CONTROL | KeyModifiers::ALT, &b"\x1b\x03"[..]),
       (KeyCode::Char('界'), KeyModifiers::NONE, "界".as_bytes()),
+      (KeyCode::Null, KeyModifiers::NONE, &b"\0"[..]),
+      (KeyCode::Null, KeyModifiers::ALT, &b"\x1b\0"[..]),
       (KeyCode::Enter, KeyModifiers::NONE, &b"\r"[..]),
+      (KeyCode::Enter, KeyModifiers::ALT, &b"\x1b\r"[..]),
       (KeyCode::Esc, KeyModifiers::NONE, &b"\x1b"[..]),
+      (KeyCode::Esc, KeyModifiers::ALT, &b"\x1b\x1b"[..]),
       (KeyCode::Backspace, KeyModifiers::NONE, &b"\x7f"[..]),
+      (KeyCode::Backspace, KeyModifiers::CONTROL, &b"\x08"[..]),
+      (KeyCode::Backspace, KeyModifiers::ALT, &b"\x1b\x7f"[..]),
       (KeyCode::Tab, KeyModifiers::NONE, &b"\t"[..]),
+      (KeyCode::Tab, KeyModifiers::SHIFT, &b"\x1b[Z"[..]),
+      (KeyCode::Tab, KeyModifiers::SHIFT | KeyModifiers::CONTROL, &b"\x1b[1;6Z"[..]),
+      (KeyCode::Tab, KeyModifiers::SHIFT | KeyModifiers::ALT, &b"\x1b[1;4Z"[..]),
+      (
+        KeyCode::Tab,
+        KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL,
+        &b"\x1b[1;8Z"[..],
+      ),
+      (KeyCode::Tab, KeyModifiers::ALT | KeyModifiers::CONTROL, &b"\x1b[1;7I"[..]),
+      (KeyCode::BackTab, KeyModifiers::NONE, &b"\x1b[Z"[..]),
+      (KeyCode::Insert, KeyModifiers::NONE, &b"\x1b[2~"[..]),
+      (KeyCode::F(1), KeyModifiers::NONE, &b"\x1bOP"[..]),
+      (KeyCode::F(2), KeyModifiers::NONE, &b"\x1bOQ"[..]),
+      (KeyCode::F(3), KeyModifiers::NONE, &b"\x1bOR"[..]),
+      (KeyCode::F(4), KeyModifiers::NONE, &b"\x1bOS"[..]),
+      (KeyCode::F(5), KeyModifiers::NONE, &b"\x1b[15~"[..]),
+      (KeyCode::F(6), KeyModifiers::NONE, &b"\x1b[17~"[..]),
+      (KeyCode::F(7), KeyModifiers::NONE, &b"\x1b[18~"[..]),
+      (KeyCode::F(8), KeyModifiers::NONE, &b"\x1b[19~"[..]),
+      (KeyCode::F(9), KeyModifiers::NONE, &b"\x1b[20~"[..]),
+      (KeyCode::F(10), KeyModifiers::NONE, &b"\x1b[21~"[..]),
+      (KeyCode::F(11), KeyModifiers::NONE, &b"\x1b[23~"[..]),
+      (KeyCode::F(12), KeyModifiers::NONE, &b"\x1b[24~"[..]),
       (KeyCode::Left, KeyModifiers::NONE, &b"\x1b[D"[..]),
+      (KeyCode::Left, KeyModifiers::CONTROL, &b"\x1b[1;5D"[..]),
       (KeyCode::Right, KeyModifiers::NONE, &b"\x1b[C"[..]),
+      (
+        KeyCode::Right,
+        KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL,
+        &b"\x1b[1;8C"[..],
+      ),
       (KeyCode::Up, KeyModifiers::NONE, &b"\x1b[A"[..]),
+      (KeyCode::Up, KeyModifiers::SHIFT, &b"\x1b[1;2A"[..]),
       (KeyCode::Down, KeyModifiers::NONE, &b"\x1b[B"[..]),
       (KeyCode::Home, KeyModifiers::NONE, &b"\x1b[H"[..]),
+      (KeyCode::Home, KeyModifiers::SHIFT, &b"\x1b[1;2H"[..]),
       (KeyCode::End, KeyModifiers::NONE, &b"\x1b[F"[..]),
       (KeyCode::Delete, KeyModifiers::NONE, &b"\x1b[3~"[..]),
+      (KeyCode::Delete, KeyModifiers::CONTROL, &b"\x1b[3;5~"[..]),
+      (KeyCode::Insert, KeyModifiers::ALT, &b"\x1b[2;3~"[..]),
       (KeyCode::PageUp, KeyModifiers::NONE, &b"\x1b[5~"[..]),
+      (KeyCode::PageUp, KeyModifiers::ALT, &b"\x1b[5;3~"[..]),
       (KeyCode::PageDown, KeyModifiers::NONE, &b"\x1b[6~"[..]),
+      (KeyCode::Tab, KeyModifiers::CONTROL, &b"\x1b[1;5I"[..]),
+      (KeyCode::BackTab, KeyModifiers::CONTROL, &b"\x1b[1;6Z"[..]),
+      (KeyCode::BackTab, KeyModifiers::ALT | KeyModifiers::CONTROL, &b"\x1b[1;8Z"[..]),
+      (KeyCode::F(1), KeyModifiers::SHIFT, &b"\x1b[1;2P"[..]),
+      (KeyCode::F(5), KeyModifiers::CONTROL, &b"\x1b[15;5~"[..]),
     ];
     for (code, modifiers, expected) in cases {
       let KeyOutcome::Forward(bytes) = dispatcher.handle_event(key(code, modifiers), now) else {
         panic!("{code:?} with {modifiers:?} should be forwarded to the PTY");
       };
       assert_eq!(bytes.as_slice(), expected, "{code:?} with {modifiers:?}");
+    }
+    for letter in b'a'..=b'z' {
+      let code = KeyCode::Char(char::from(letter));
+      let KeyOutcome::Forward(bytes) = dispatcher.handle_event(key(code, KeyModifiers::SHIFT), now)
+      else {
+        panic!("Shift+{code:?} should be forwarded to the PTY");
+      };
+      assert_eq!(bytes, [letter.to_ascii_uppercase()], "Shift+{code:?}");
     }
 
     let mut release = key(KeyCode::Char('r'), KeyModifiers::NONE);
@@ -376,6 +460,209 @@ mod tests {
       panic!("repeated keys should be forwarded to the PTY");
     };
     assert_eq!(bytes, b"r");
+  }
+
+  #[test]
+  fn unsupported_modifiers_are_not_misrouted_as_plain_keys() {
+    let mut dispatcher = KeyDispatcher::new(
+      normalize_prefix_key("<C-Space>").expect("prefix key"),
+      Duration::from_millis(700),
+      KeyMap::default(),
+    );
+    let now = Instant::now();
+
+    for modifiers in [KeyModifiers::SUPER, KeyModifiers::HYPER, KeyModifiers::META] {
+      assert!(matches!(
+        dispatcher.handle_event(key(KeyCode::Char('x'), modifiers), now),
+        KeyOutcome::Ignored
+      ));
+    }
+  }
+
+  #[test]
+  fn cursor_keys_preserve_all_ctrl_alt_and_shift_combinations() {
+    let mut dispatcher = KeyDispatcher::new(
+      normalize_prefix_key("<C-Space>").expect("prefix key"),
+      Duration::from_millis(700),
+      KeyMap::default(),
+    );
+    let now = Instant::now();
+    let modifiers = [
+      (KeyModifiers::SHIFT, 2),
+      (KeyModifiers::ALT, 3),
+      (KeyModifiers::SHIFT | KeyModifiers::ALT, 4),
+      (KeyModifiers::CONTROL, 5),
+      (KeyModifiers::SHIFT | KeyModifiers::CONTROL, 6),
+      (KeyModifiers::ALT | KeyModifiers::CONTROL, 7),
+      (KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL, 8),
+    ];
+    let cursor_keys = [
+      (KeyCode::Left, 'D'),
+      (KeyCode::Right, 'C'),
+      (KeyCode::Up, 'A'),
+      (KeyCode::Down, 'B'),
+      (KeyCode::Home, 'H'),
+      (KeyCode::End, 'F'),
+    ];
+
+    for (code, final_character) in cursor_keys {
+      for (modifiers, parameter) in modifiers {
+        let expected = format!("\x1b[1;{parameter}{final_character}").into_bytes();
+        let KeyOutcome::Forward(bytes) = dispatcher.handle_event(key(code, modifiers), now) else {
+          panic!("{code:?} with {modifiers:?} should be forwarded to the PTY");
+        };
+        assert_eq!(bytes, expected, "{code:?} with {modifiers:?}");
+      }
+    }
+  }
+
+  #[test]
+  fn function_and_tilde_keys_preserve_all_ctrl_alt_and_shift_combinations() {
+    let mut dispatcher = KeyDispatcher::new(
+      normalize_prefix_key("<C-Space>").expect("prefix key"),
+      Duration::from_millis(700),
+      KeyMap::default(),
+    );
+    let now = Instant::now();
+    let modifiers = [
+      (KeyModifiers::SHIFT, 2),
+      (KeyModifiers::ALT, 3),
+      (KeyModifiers::SHIFT | KeyModifiers::ALT, 4),
+      (KeyModifiers::CONTROL, 5),
+      (KeyModifiers::SHIFT | KeyModifiers::CONTROL, 6),
+      (KeyModifiers::ALT | KeyModifiers::CONTROL, 7),
+      (KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL, 8),
+    ];
+    let function_keys = [
+      (KeyCode::F(1), Some('P'), None),
+      (KeyCode::F(2), Some('Q'), None),
+      (KeyCode::F(3), Some('R'), None),
+      (KeyCode::F(4), Some('S'), None),
+      (KeyCode::F(5), None, Some(15)),
+      (KeyCode::F(6), None, Some(17)),
+      (KeyCode::F(7), None, Some(18)),
+      (KeyCode::F(8), None, Some(19)),
+      (KeyCode::F(9), None, Some(20)),
+      (KeyCode::F(10), None, Some(21)),
+      (KeyCode::F(11), None, Some(23)),
+      (KeyCode::F(12), None, Some(24)),
+    ];
+    for (code, final_character, tilde_code) in function_keys {
+      for (modifiers, parameter) in modifiers {
+        let expected = if let Some(final_character) = final_character {
+          format!("\x1b[1;{parameter}{final_character}")
+        } else {
+          format!("\x1b[{};{parameter}~", tilde_code.expect("tilde function key"))
+        }
+        .into_bytes();
+        let KeyOutcome::Forward(bytes) = dispatcher.handle_event(key(code, modifiers), now) else {
+          panic!("{code:?} with {modifiers:?} should be forwarded to the PTY");
+        };
+        assert_eq!(bytes, expected, "{code:?} with {modifiers:?}");
+      }
+    }
+
+    for (code, tilde_code) in
+      [(KeyCode::Insert, 2), (KeyCode::Delete, 3), (KeyCode::PageUp, 5), (KeyCode::PageDown, 6)]
+    {
+      for (modifiers, parameter) in modifiers {
+        let expected = format!("\x1b[{tilde_code};{parameter}~").into_bytes();
+        let KeyOutcome::Forward(bytes) = dispatcher.handle_event(key(code, modifiers), now) else {
+          panic!("{code:?} with {modifiers:?} should be forwarded to the PTY");
+        };
+        assert_eq!(bytes, expected, "{code:?} with {modifiers:?}");
+      }
+    }
+  }
+
+  #[test]
+  fn shifted_and_null_key_events_match_their_key_notation_bindings() {
+    let (lua, mut dispatcher) = dispatcher(&[
+      ("<S-Tab>", "shift-tab"),
+      ("<C-Space>", "control-space"),
+      ("<S-`>", "shift-grave"),
+    ]);
+    let now = Instant::now();
+
+    for (code, modifiers, expected) in [
+      (KeyCode::BackTab, KeyModifiers::NONE, "shift-tab"),
+      (KeyCode::Tab, KeyModifiers::SHIFT, "shift-tab"),
+      (KeyCode::Null, KeyModifiers::NONE, "control-space"),
+      (KeyCode::Char('`'), KeyModifiers::SHIFT, "shift-grave"),
+    ] {
+      press_prefix(&mut dispatcher, now);
+      let KeyOutcome::Execute(callback) = dispatcher.handle_event(key(code, modifiers), now) else {
+        panic!("{code:?} with {modifiers:?} should match its key binding");
+      };
+      callback.call::<()>(()).expect("invoke key binding");
+      assert_eq!(lua.globals().get::<String>("called").expect("callback ran"), expected);
+    }
+  }
+
+  #[test]
+  fn control_letter_keys_map_to_their_terminal_control_bytes() {
+    let mut dispatcher = KeyDispatcher::new(
+      normalize_prefix_key("<C-Space>").expect("prefix key"),
+      Duration::from_millis(700),
+      KeyMap::default(),
+    );
+    let now = Instant::now();
+
+    for (letter, expected) in (b'a'..=b'z').zip(1u8..=26) {
+      let code = KeyCode::Char(char::from(letter));
+      let KeyOutcome::Forward(bytes) =
+        dispatcher.handle_event(key(code, KeyModifiers::CONTROL), now)
+      else {
+        panic!("Ctrl+{code:?} should be forwarded to the PTY");
+      };
+      assert_eq!(bytes, [expected], "Ctrl+{code:?}");
+
+      let uppercase = KeyCode::Char(char::from(letter.to_ascii_uppercase()));
+      let KeyOutcome::Forward(bytes) =
+        dispatcher.handle_event(key(uppercase, KeyModifiers::CONTROL), now)
+      else {
+        panic!("Ctrl+{uppercase:?} should be forwarded to the PTY");
+      };
+      assert_eq!(bytes, [expected], "Ctrl+{uppercase:?}");
+    }
+  }
+
+  #[test]
+  fn alt_printable_ascii_characters_are_prefixed_with_escape() {
+    let mut dispatcher = KeyDispatcher::new(
+      normalize_prefix_key("<C-x>").expect("prefix key"),
+      Duration::from_millis(700),
+      KeyMap::default(),
+    );
+    let now = Instant::now();
+
+    for byte in 0x20..=0x7e {
+      let code = KeyCode::Char(char::from(byte));
+      let KeyOutcome::Forward(bytes) = dispatcher.handle_event(key(code, KeyModifiers::ALT), now)
+      else {
+        panic!("Alt+{code:?} should be forwarded to the PTY");
+      };
+      assert_eq!(bytes, [b'\x1b', byte], "Alt+{code:?}");
+    }
+  }
+
+  #[test]
+  fn every_printable_ascii_character_is_forwarded_unchanged() {
+    let mut dispatcher = KeyDispatcher::new(
+      normalize_prefix_key("<C-x>").expect("prefix key"),
+      Duration::from_millis(700),
+      KeyMap::default(),
+    );
+    let now = Instant::now();
+
+    for byte in 0x20..=0x7e {
+      let code = KeyCode::Char(char::from(byte));
+      let KeyOutcome::Forward(bytes) = dispatcher.handle_event(key(code, KeyModifiers::NONE), now)
+      else {
+        panic!("printable ASCII {code:?} should be forwarded to the PTY");
+      };
+      assert_eq!(bytes, [byte], "printable ASCII {code:?}");
+    }
   }
 
   // Developer approved: do not remove.

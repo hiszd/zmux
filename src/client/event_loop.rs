@@ -3024,6 +3024,56 @@ mod tests {
   }
 
   #[test]
+  fn shifted_grave_reaches_the_server_as_tilde_input() {
+    use crossterm::event::{
+      Event,
+      KeyCode,
+      KeyEvent,
+      KeyModifiers,
+    };
+
+    let config = lua::load_config("").expect("default key configuration");
+    let viewport = Viewport {
+      rows: 24,
+      columns: 80,
+    };
+    let snapshot = SessionSnapshot {
+      number: "1".to_owned(),
+      workspaces: Vec::new(),
+      active_workspace_id: 0,
+    };
+    let mut session = ClientSession::new(snapshot, Vec::new(), viewport);
+    let mut outer_size = (80, 24);
+    let mut viewport = viewport;
+    let mut dispatcher =
+      KeyDispatcher::new(config.prefix_key, config.sequence_timeout, config.keymap.clone());
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let mut next_request_id = 1;
+    let trace = crate::trace::Trace::from_environment();
+    let mut context = ClientContext {
+      session: &mut session,
+      outer_size: &mut outer_size,
+      viewport: &mut viewport,
+      dispatcher: &mut dispatcher,
+      sender: &sender,
+      next_request_id: &mut next_request_id,
+      lua: &config.lua,
+      trace: &trace,
+    };
+
+    handle_input(Event::Key(KeyEvent::new(KeyCode::Char('`'), KeyModifiers::SHIFT)), &mut context)
+      .expect("forward Shift+backtick");
+
+    assert!(matches!(
+      receiver.try_recv(),
+      Ok(ClientMessage::Request {
+        request: ClientRequest::Input(bytes),
+        ..
+      }) if bytes == b"~"
+    ));
+  }
+
+  #[test]
   fn focused_drawer_routes_direct_keys_then_global_leader_without_pty_fallback() {
     use crossterm::event::{
       Event,

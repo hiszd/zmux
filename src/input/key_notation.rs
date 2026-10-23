@@ -37,6 +37,20 @@ pub type KeySeq = Vec<KeyStroke>;
 
 impl KeyStroke {
   pub fn from_crossterm(event: CrosstermKeyEvent) -> Option<Self> {
+    if event
+      .modifiers
+      .intersects(KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META)
+    {
+      return None;
+    }
+    if event.code == KeyCode::Null {
+      return Some(Self {
+        key: Key::Space,
+        ctrl: true,
+        alt: event.modifiers.contains(KeyModifiers::ALT),
+        shift: event.modifiers.contains(KeyModifiers::SHIFT),
+      });
+    }
     let (key, inferred_shift) = match event.code {
       KeyCode::Char(' ') => (Key::Space, false),
       KeyCode::Char(character) => {
@@ -46,6 +60,7 @@ impl KeyStroke {
       KeyCode::Esc => (Key::Escape, false),
       KeyCode::Backspace => (Key::Backspace, false),
       KeyCode::Tab => (Key::Tab, false),
+      KeyCode::BackTab => (Key::Tab, true),
       KeyCode::Delete => (Key::Delete, false),
       KeyCode::Insert => (Key::Insert, false),
       KeyCode::Home => (Key::Home, false),
@@ -226,6 +241,7 @@ pub fn key_seq_to_string(sequence: &[KeyStroke]) -> String {
 
 fn shifted_character(character: char) -> char {
   match character {
+    '`' => '~',
     '1' => '!',
     '2' => '@',
     '3' => '#',
@@ -250,22 +266,75 @@ fn shifted_character(character: char) -> char {
   }
 }
 
-pub fn encode_key(event: CrosstermKeyEvent) -> Option<Vec<u8>> {
-  let bytes = match (event.code, event.modifiers) {
-    (KeyCode::Char(character), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
-      let character = character.to_ascii_lowercase();
-      if character.is_ascii_lowercase() {
-        vec![character as u8 - b'a' + 1]
-      } else if character == ' ' {
-        vec![0]
+// Xterm encodes Shift, Alt, and Control as 1 + 1, 2, and 4 respectively.
+fn modifier_parameter(modifiers: KeyModifiers) -> Option<u8> {
+  let mut parameter = 1;
+  if modifiers.contains(KeyModifiers::SHIFT) {
+    parameter += 1;
+  }
+  if modifiers.contains(KeyModifiers::ALT) {
+    parameter += 2;
+  }
+  if modifiers.contains(KeyModifiers::CONTROL) {
+    parameter += 4;
+  }
+  (parameter != 1).then_some(parameter)
+}
+
+fn modified_csi(final_character: char, modifiers: KeyModifiers) -> Vec<u8> {
+  match modifier_parameter(modifiers) {
+    Some(parameter) => format!("\x1b[1;{parameter}{final_character}").into_bytes(),
+    None => format!("\x1b[{final_character}").into_bytes(),
+  }
+}
+
+fn modified_tilde_csi(code: u8, modifiers: KeyModifiers) -> Vec<u8> {
+  match modifier_parameter(modifiers) {
+    Some(parameter) => format!("\x1b[{code};{parameter}~").into_bytes(),
+    None => format!("\x1b[{code}~").into_bytes(),
+  }
+}
+
+fn function_key_sequence(number: u8, modifiers: KeyModifiers) -> Option<Vec<u8>> {
+  let sequence = match number {
+    1..=4 => {
+      let final_character = char::from(b'P' + number - 1);
+      if modifier_parameter(modifiers).is_some() {
+        modified_csi(final_character, modifiers)
       } else {
-        return None;
+        format!("\x1bO{final_character}").into_bytes()
       }
     }
-    (KeyCode::Char(character), modifiers) if modifiers.contains(KeyModifiers::ALT) => {
-      let mut output = vec![0x1b];
-      output.extend(character.to_string().as_bytes());
-      output
+    5 => modified_tilde_csi(15, modifiers),
+    6 => modified_tilde_csi(17, modifiers),
+    7 => modified_tilde_csi(18, modifiers),
+    8 => modified_tilde_csi(19, modifiers),
+    9 => modified_tilde_csi(20, modifiers),
+    10 => modified_tilde_csi(21, modifiers),
+    11 => modified_tilde_csi(23, modifiers),
+    12 => modified_tilde_csi(24, modifiers),
+    _ => return None,
+  };
+  Some(sequence)
+}
+
+fn control_character(character: char) -> Option<u8> {
+  let character = character.to_ascii_uppercase();
+  match character {
+    '?' => Some(0x7f),
+    ' '..='_' => Some(character as u8 & 0x1f),
+    _ => None,
+  }
+}
+
+pub fn encode_key(event: CrosstermKeyEvent) -> Option<Vec<u8>> {
+  let bytes = match (event.code, event.modifiers) {
+    (KeyCode::Null, modifiers) => {
+      let mut bytes = vec![0];
+      if modifiers.contains(KeyModifiers::ALT) {
+        bytes.insert(0, 0x1b);
+      }
+      bytes
     }
     (KeyCode::Char(character), modifiers) => {
       let character = if modifiers.contains(KeyModifiers::SHIFT) {
@@ -273,21 +342,73 @@ pub fn encode_key(event: CrosstermKeyEvent) -> Option<Vec<u8>> {
       } else {
         character
       };
-      character.to_string().into_bytes()
+      let mut output = if modifiers.contains(KeyModifiers::CONTROL) {
+        vec![control_character(character)?]
+      } else {
+        character.to_string().into_bytes()
+      };
+      if modifiers.contains(KeyModifiers::ALT) {
+        output.insert(0, 0x1b);
+      }
+      output
     }
-    (KeyCode::Enter, _) => vec![b'\r'],
-    (KeyCode::Esc, _) => vec![0x1b],
-    (KeyCode::Backspace, _) => vec![0x7f],
-    (KeyCode::Tab, _) => vec![b'\t'],
-    (KeyCode::Left, _) => b"\x1b[D".to_vec(),
-    (KeyCode::Right, _) => b"\x1b[C".to_vec(),
-    (KeyCode::Up, _) => b"\x1b[A".to_vec(),
-    (KeyCode::Down, _) => b"\x1b[B".to_vec(),
-    (KeyCode::Home, _) => b"\x1b[H".to_vec(),
-    (KeyCode::End, _) => b"\x1b[F".to_vec(),
-    (KeyCode::Delete, _) => b"\x1b[3~".to_vec(),
-    (KeyCode::PageUp, _) => b"\x1b[5~".to_vec(),
-    (KeyCode::PageDown, _) => b"\x1b[6~".to_vec(),
+    (KeyCode::Enter, modifiers) => {
+      let mut bytes = vec![b'\r'];
+      if modifiers.contains(KeyModifiers::ALT) {
+        bytes.insert(0, 0x1b);
+      }
+      bytes
+    }
+    (KeyCode::Esc, modifiers) => {
+      let mut bytes = vec![0x1b];
+      if modifiers.contains(KeyModifiers::ALT) {
+        bytes.insert(0, 0x1b);
+      }
+      bytes
+    }
+    (KeyCode::Backspace, modifiers) => {
+      let mut bytes = vec![if modifiers.contains(KeyModifiers::CONTROL) {
+        0x08
+      } else {
+        0x7f
+      }];
+      if modifiers.contains(KeyModifiers::ALT) {
+        bytes.insert(0, 0x1b);
+      }
+      bytes
+    }
+    (KeyCode::Tab, modifiers)
+      if !modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+    {
+      vec![b'\t']
+    }
+    (KeyCode::Tab, modifiers)
+      if modifiers.contains(KeyModifiers::SHIFT)
+        && !modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+    {
+      b"\x1b[Z".to_vec()
+    }
+    (KeyCode::Tab, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
+      modified_csi('Z', modifiers)
+    }
+    (KeyCode::Tab, modifiers) => modified_csi('I', modifiers),
+    (KeyCode::BackTab, modifiers)
+      if !modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+    {
+      b"\x1b[Z".to_vec()
+    }
+    (KeyCode::BackTab, modifiers) => modified_csi('Z', modifiers | KeyModifiers::SHIFT),
+    (KeyCode::Left, modifiers) => modified_csi('D', modifiers),
+    (KeyCode::Right, modifiers) => modified_csi('C', modifiers),
+    (KeyCode::Up, modifiers) => modified_csi('A', modifiers),
+    (KeyCode::Down, modifiers) => modified_csi('B', modifiers),
+    (KeyCode::Home, modifiers) => modified_csi('H', modifiers),
+    (KeyCode::End, modifiers) => modified_csi('F', modifiers),
+    (KeyCode::Insert, modifiers) => modified_tilde_csi(2, modifiers),
+    (KeyCode::Delete, modifiers) => modified_tilde_csi(3, modifiers),
+    (KeyCode::F(number), modifiers) => function_key_sequence(number, modifiers)?,
+    (KeyCode::PageUp, modifiers) => modified_tilde_csi(5, modifiers),
+    (KeyCode::PageDown, modifiers) => modified_tilde_csi(6, modifiers),
     _ => return None,
   };
   Some(bytes)
