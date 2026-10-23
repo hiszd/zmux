@@ -39,18 +39,24 @@ use crate::{
   ui::{
     CursorShape,
     DrawerBorder,
-    DrawerProperty,
     DrawerSide,
-    DrawerValue,
-    DrawerWidth,
     LayoutAxis,
+    ToastPosition,
     UiChild,
-    UiDrawerOptions,
+    UiElementOptions,
+    UiElementProperty,
+    UiElementType,
+    UiElementValue,
+    UiSize,
     UiTree,
   },
 };
 
+pub const CONFIG_API_VERSION: u32 = 1;
+pub const DEFAULT_CONFIG_SOURCE: &str = include_str!("../../defaults/zmux.lua");
+
 pub struct AppConfig {
+  pub config_api_version: Option<u32>,
   pub keymap: KeyMap,
   pub cursor_shape: CursorShape,
   pub default_shell: Option<PathBuf>,
@@ -71,7 +77,7 @@ pub struct LaunchState {
 
 impl Default for AppConfig {
   fn default() -> Self {
-    load_config(include_str!("../../zmux.lua")).expect("built-in Lua defaults are valid")
+    load_config(DEFAULT_CONFIG_SOURCE).expect("built-in Lua defaults are valid")
   }
 }
 
@@ -350,10 +356,18 @@ impl LuaConfig {
     self.ui_tree.borrow_mut().render(area, buffer);
   }
 
-  pub fn focused_ui(&self) -> Option<u64> { self.ui_tree.borrow().focused_drawer() }
+  pub fn focused_ui(&self) -> Option<u64> { self.ui_tree.borrow().focused_element() }
+
+  pub fn focused_ui_captures_input(&self) -> bool {
+    self.ui_tree.borrow().focused_element_captures_input()
+  }
+
+  pub fn expire_ui_toasts(&self, now: std::time::Instant) -> bool {
+    self.ui_tree.borrow_mut().expire_toasts(now)
+  }
 
   pub fn focused_ui_binding(&self, key: KeyStroke) -> Option<(u64, Function, Table)> {
-    let id = self.ui_tree.borrow().focused_drawer()?;
+    let id = self.ui_tree.borrow().focused_element()?;
     let handles = self.ui_handles.borrow();
     let handle = handles.get(&id)?.clone();
     let keys = handle.get::<Table>("__zmux_ui_keys").ok()?;
@@ -363,6 +377,8 @@ impl LuaConfig {
   }
 
   pub fn blur_focused_ui(&self) -> bool { self.ui_tree.borrow_mut().blur_focused() }
+
+  pub fn dismiss_focused_ui(&self) -> bool { self.ui_tree.borrow_mut().dismiss_focused_element() }
 
   pub fn invoke_ui_key_callback(
     &self,
@@ -790,6 +806,10 @@ pub fn load_config_with_context(
   lua.globals().set("g", globals.clone())?;
   lua.globals().set("global", globals.clone())?;
   lua.globals().set("inf", lua.create_table()?)?;
+  let zmux = lua.create_table()?;
+  zmux.set("version", env!("CARGO_PKG_VERSION"))?;
+  zmux.set("config_api_version", CONFIG_API_VERSION)?;
+  lua.globals().set("zmux", zmux)?;
   let arguments_table = lua.create_table_with_capacity(arguments.len(), 0)?;
   for (index, argument) in arguments.iter().enumerate() {
     arguments_table.set(index + 1, argument.as_str())?;
@@ -1063,6 +1083,15 @@ pub fn load_config_with_context(
   lua.load(source).exec()?;
   config_loading.set(false);
 
+  let config_api_version = options.get::<Option<u32>>("config_version")?;
+  if let Some(version) = config_api_version
+    && version != CONFIG_API_VERSION
+  {
+    return Err(mlua::Error::external(format!(
+      "config API version {version} is not supported; this program supports version {CONFIG_API_VERSION}"
+    )));
+  }
+
   let cursor_shape = options
     .get::<String>("cursor_shape")?
     .parse::<CursorShape>()
@@ -1076,6 +1105,7 @@ pub fn load_config_with_context(
   let timeout_ms = options.get::<u64>("sequence_timeout_ms")?;
   let keymap = keymap.borrow().clone();
   Ok(AppConfig {
+    config_api_version,
     keymap,
     cursor_shape,
     default_shell,
@@ -1147,7 +1177,15 @@ fn register_ui_api(
     let in_callback = Rc::clone(in_callback);
     lua.create_function(move |lua, options: Table| {
       ensure_ui_creation_context(&config_loading)?;
-      create_drawer_handle(lua, &tree, &handles, options, &commands, &config_loading, &in_callback)
+      create_ui_element_handle(
+        lua,
+        &tree,
+        &handles,
+        options,
+        &commands,
+        &config_loading,
+        &in_callback,
+      )
     })?
   };
   ui.set("text", text)?;
@@ -1275,20 +1313,42 @@ fn parse_drawer_side(value: &str) -> LuaResult<DrawerSide> {
   }
 }
 
-fn parse_drawer_width(value: Value) -> LuaResult<DrawerWidth> {
+fn parse_ui_size(value: Value) -> LuaResult<UiSize> {
   match value {
-    Value::Nil => Ok(DrawerWidth::Auto),
-    Value::Integer(width) if (0..=i64::from(u16::MAX)).contains(&width) => {
-      Ok(DrawerWidth::Fixed(width as u16))
+    Value::Nil => Ok(UiSize::Auto),
+    Value::Integer(size) if (0..=i64::from(u16::MAX)).contains(&size) => {
+      Ok(UiSize::Fixed(size as u16))
     }
-    Value::String(width) if width.to_string_lossy() == "auto" => Ok(DrawerWidth::Auto),
-    _ => Err(mlua::Error::external("drawer width must be 'auto' or a cell count")),
+    Value::String(size) if size.to_string_lossy() == "auto" => Ok(UiSize::Auto),
+    _ => Err(mlua::Error::external("UI size must be 'auto' or a non-negative cell count")),
+  }
+}
+
+fn parse_ui_coordinate(value: Value, property: &str) -> LuaResult<u16> {
+  match value {
+    Value::Nil => Ok(0),
+    Value::Integer(value) if (0..=i64::from(u16::MAX)).contains(&value) => Ok(value as u16),
+    _ => Err(mlua::Error::external(format!(
+      "UI coordinate '{property}' must be a non-negative cell count"
+    ))),
+  }
+}
+
+fn parse_toast_position(value: &str) -> LuaResult<ToastPosition> {
+  match value {
+    "top_right" => Ok(ToastPosition::TopRight),
+    "top_center" => Ok(ToastPosition::TopCenter),
+    "bottom_right" => Ok(ToastPosition::BottomRight),
+    "bottom_center" => Ok(ToastPosition::BottomCenter),
+    _ => Err(mlua::Error::external(
+      "Toast position must be 'top_right', 'top_center', 'bottom_right', or 'bottom_center'",
+    )),
   }
 }
 
 fn parse_drawer_border(value: Value) -> LuaResult<DrawerBorder> {
   let Value::String(value) = value else {
-    return Err(mlua::Error::external("drawer border must be a Ratatui border preset"));
+    return Err(mlua::Error::external("UI border must be a Ratatui border preset"));
   };
   match value.to_string_lossy().as_str() {
     "none" => Ok(DrawerBorder::None),
@@ -1304,7 +1364,7 @@ fn parse_drawer_border(value: Value) -> LuaResult<DrawerBorder> {
     "heavy_quadruple_dashed" => Ok(DrawerBorder::HeavyQuadrupleDashed),
     "quadrant_inside" => Ok(DrawerBorder::QuadrantInside),
     "quadrant_outside" => Ok(DrawerBorder::QuadrantOutside),
-    value => Err(mlua::Error::external(format!("unknown drawer border preset '{value}'"))),
+    value => Err(mlua::Error::external(format!("unknown UI border preset '{value}'"))),
   }
 }
 
@@ -1405,7 +1465,7 @@ fn create_layout_constructor(
   })
 }
 
-fn create_drawer_handle(
+fn create_ui_element_handle(
   lua: &Lua,
   tree: &Rc<RefCell<UiTree>>,
   handles: &Rc<RefCell<HashMap<u64, Table>>>,
@@ -1414,18 +1474,46 @@ fn create_drawer_handle(
   config_loading: &Rc<Cell<bool>>,
   in_callback: &Rc<Cell<bool>>,
 ) -> LuaResult<Table> {
-  let element_type = options
+  let type_name = options
     .get::<Option<String>>("type")?
     .unwrap_or_else(|| "drawer".to_owned());
-  if element_type != "drawer" {
-    return Err(mlua::Error::external("cmd.ui.create currently supports type 'drawer' only"));
-  }
-  let side = parse_drawer_side(
-    &options
-      .get::<Option<String>>("side")?
-      .unwrap_or_else(|| "left".to_owned()),
-  )?;
-  let width = parse_drawer_width(options.get::<Value>("width")?)?;
+  let element_type = match type_name.as_str() {
+    "drawer" => UiElementType::Drawer {
+      side: parse_drawer_side(
+        &options
+          .get::<Option<String>>("side")?
+          .unwrap_or_else(|| "left".to_owned()),
+      )?,
+      width: parse_ui_size(options.get::<Value>("width")?)?,
+    },
+    "modal" => UiElementType::Modal {
+      width: parse_ui_size(options.get::<Value>("width")?)?,
+      height: parse_ui_size(options.get::<Value>("height")?)?,
+    },
+    "popover" => UiElementType::Popover {
+      x: parse_ui_coordinate(options.get::<Value>("x")?, "x")?,
+      y: parse_ui_coordinate(options.get::<Value>("y")?, "y")?,
+      width: parse_ui_size(options.get::<Value>("width")?)?,
+      height: parse_ui_size(options.get::<Value>("height")?)?,
+    },
+    "bottom_panel" => UiElementType::BottomPanel {
+      height: parse_ui_size(options.get::<Value>("height")?)?,
+    },
+    "toast" => {
+      let position = parse_toast_position(
+        &options
+          .get::<Option<String>>("position")?
+          .unwrap_or_else(|| "top_right".to_owned()),
+      )?;
+      let duration = Duration::from_millis(options.get::<Option<u64>>("duration")?.unwrap_or(3000));
+      UiElementType::Toast { position, duration }
+    }
+    _ => {
+      return Err(mlua::Error::external(
+        "cmd.ui.create type must be 'drawer', 'modal', 'popover', 'bottom_panel', or 'toast'",
+      ));
+    }
+  };
   let title = options.get::<Option<String>>("title")?.unwrap_or_default();
   let border = match options.get::<Value>("border")? {
     Value::Nil => DrawerBorder::Plain,
@@ -1437,21 +1525,31 @@ fn create_drawer_handle(
     .unwrap_or_default();
   let content = options
     .get::<Option<Table>>("content")?
-    .ok_or_else(|| mlua::Error::external("Drawer requires a 'content' UI node"))?;
+    .ok_or_else(|| mlua::Error::external("UI elements require a 'content' UI node"))?;
   let content_id = ui_node_id(&content)?;
   let keys = options
     .get::<Option<Table>>("keys")?
     .map(|keys| parse_ui_keys(&keys))
     .transpose()?
     .unwrap_or_default();
+  if matches!(element_type, UiElementType::Toast { .. }) && !keys.is_empty() {
+    return Err(mlua::Error::external("Toast elements do not support key bindings"));
+  }
+  let is_toast = matches!(element_type, UiElementType::Toast { .. });
   let id = Rc::new(Cell::new(0_u64));
-  let handle =
-    make_drawer_handle(lua, tree, Rc::clone(&id), commands, config_loading, in_callback)?;
-  let drawer_id = tree
+  let handle = make_ui_element_handle(
+    lua,
+    tree,
+    Rc::clone(&id),
+    commands,
+    config_loading,
+    in_callback,
+    is_toast,
+  )?;
+  let element_id = tree
     .borrow_mut()
-    .create_drawer(UiDrawerOptions {
-      side,
-      width,
+    .create_element(UiElementOptions {
+      element_type,
       title,
       border,
       border_style,
@@ -1459,20 +1557,21 @@ fn create_drawer_handle(
       visible: options.get::<Option<bool>>("visible")?.unwrap_or(false),
     })
     .map_err(mlua::Error::external)?;
-  id.set(drawer_id);
-  handle.set("__zmux_ui_drawer", drawer_id)?;
+  id.set(element_id);
+  handle.set("__zmux_ui_element", element_id)?;
   handle.set("__zmux_ui_keys", ui_keymap_table(lua, &keys)?)?;
-  handles.borrow_mut().insert(drawer_id, handle.clone());
+  handles.borrow_mut().insert(element_id, handle.clone());
   Ok(handle)
 }
 
-fn make_drawer_handle(
+fn make_ui_element_handle(
   lua: &Lua,
   tree: &Rc<RefCell<UiTree>>,
   id: Rc<Cell<u64>>,
   commands: &Rc<RefCell<VecDeque<RuntimeCommand>>>,
   config_loading: &Rc<Cell<bool>>,
   in_callback: &Rc<Cell<bool>>,
+  is_toast: bool,
 ) -> LuaResult<Table> {
   let handle = lua.create_table()?;
   let set = {
@@ -1485,8 +1584,11 @@ fn make_drawer_handle(
     lua.create_function(move |lua, (property, value): (String, Value)| {
       ensure_ui_mutation_context(&config_loading, &in_callback)?;
       if property == "keys" {
+        if is_toast {
+          return Err(mlua::Error::external("Toast elements do not support key bindings"));
+        }
         let Value::Table(keys) = value else {
-          return Err(mlua::Error::external("Drawer 'keys' property must be a table"));
+          return Err(mlua::Error::external("UI element 'keys' property must be a table"));
         };
         let keys = parse_ui_keys(&keys)?;
         handle_for_keys.set("__zmux_ui_keys", ui_keymap_table(lua, &keys)?)?;
@@ -1495,27 +1597,60 @@ fn make_drawer_handle(
       let (property_kind, value) = match property.as_str() {
         "side" => {
           let Value::String(value) = value else {
-            return Err(mlua::Error::external("Drawer 'side' property must be a string"));
+            return Err(mlua::Error::external("UI element 'side' property must be a string"));
           };
-          (DrawerProperty::Side, DrawerValue::Side(parse_drawer_side(&value.to_string_lossy())?))
+          (
+            UiElementProperty::Side,
+            UiElementValue::Side(parse_drawer_side(&value.to_string_lossy())?),
+          )
         }
-        "width" => (DrawerProperty::Width, DrawerValue::Width(parse_drawer_width(value)?)),
+        "width" => (UiElementProperty::Width, UiElementValue::Size(parse_ui_size(value)?)),
+        "height" => (UiElementProperty::Height, UiElementValue::Size(parse_ui_size(value)?)),
+        "x" => (UiElementProperty::X, UiElementValue::Coordinate(parse_ui_coordinate(value, "x")?)),
+        "y" => (UiElementProperty::Y, UiElementValue::Coordinate(parse_ui_coordinate(value, "y")?)),
+        "position" => {
+          let Value::String(value) = value else {
+            return Err(mlua::Error::external("Toast 'position' property must be a string"));
+          };
+          (
+            UiElementProperty::Position,
+            UiElementValue::Position(parse_toast_position(&value.to_string_lossy())?),
+          )
+        }
+        "duration" => {
+          let Value::Integer(value) = value else {
+            return Err(mlua::Error::external(
+              "Toast 'duration' property must be an integer number of milliseconds",
+            ));
+          };
+          if value < 0 {
+            return Err(mlua::Error::external("Toast 'duration' must not be negative"));
+          }
+          (
+            UiElementProperty::Duration,
+            UiElementValue::Duration(Duration::from_millis(value as u64)),
+          )
+        }
         "title" => {
           let Value::String(value) = value else {
-            return Err(mlua::Error::external("Drawer 'title' property must be a string"));
+            return Err(mlua::Error::external("UI element 'title' property must be a string"));
           };
-          (DrawerProperty::Title, DrawerValue::Title(value.to_string_lossy()))
+          (UiElementProperty::Title, UiElementValue::Title(value.to_string_lossy()))
         }
-        "border" => (DrawerProperty::Border, DrawerValue::Border(parse_drawer_border(value)?)),
+        "border" => {
+          (UiElementProperty::Border, UiElementValue::Border(parse_drawer_border(value)?))
+        }
         "border_style" => {
           let style = parse_style(value)?.unwrap_or_default();
-          (DrawerProperty::BorderStyle, DrawerValue::Style(style))
+          (UiElementProperty::BorderStyle, UiElementValue::Style(style))
         }
-        _ => return Err(mlua::Error::external(format!("unknown Drawer property '{property}'"))),
+        _ => {
+          return Err(mlua::Error::external(format!("unknown UI element property '{property}'")));
+        }
       };
       let changed = tree
         .borrow_mut()
-        .set_drawer_property(id.get(), property_kind, value)
+        .set_element_property(id.get(), property_kind, value)
         .map_err(mlua::Error::external)?;
       finish_ui_mutation(changed, &config_loading, &commands);
       Ok(())
@@ -1627,18 +1762,170 @@ fn ensure_command_context(in_callback: &Cell<bool>) -> LuaResult<()> {
   }
 }
 
+fn first_executable_line(source: &str) -> Option<&str> {
+  let bytes = source.as_bytes();
+  let mut index = 0;
+  loop {
+    while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+      index += 1;
+    }
+    if index == bytes.len() {
+      return None;
+    }
+    if bytes.get(index..index + 2) == Some(b"--") {
+      index += 2;
+      if bytes.get(index) == Some(&b'[') {
+        let mut delimiter_end = index + 1;
+        while bytes.get(delimiter_end) == Some(&b'=') {
+          delimiter_end += 1;
+        }
+        if bytes.get(delimiter_end) == Some(&b'[') {
+          let equals = delimiter_end - index - 1;
+          let closing = format!("]{}]", "=".repeat(equals));
+          let content_start = delimiter_end + 1;
+          let closing_offset = source.get(content_start..)?.find(&closing)?;
+          index = content_start + closing_offset + closing.len();
+          continue;
+        }
+      }
+      index = bytes[index..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(bytes.len(), |newline| index + newline + 1);
+      continue;
+    }
+    if bytes.get(index..index + 2) == Some(b"#!") {
+      index = bytes[index..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(bytes.len(), |newline| index + newline + 1);
+      continue;
+    }
+    let line_end = bytes[index..]
+      .iter()
+      .position(|byte| *byte == b'\n')
+      .map_or(bytes.len(), |newline| index + newline);
+    return source.get(index..line_end).map(str::trim);
+  }
+}
+
+fn validate_file_config_api_version(source: &str) -> LuaResult<()> {
+  let declaration = first_executable_line(source);
+  let Some(declaration) = declaration else {
+    return Err(mlua::Error::external(format!(
+      "configuration must declare opt.config_version = {CONFIG_API_VERSION} as its first executable statement"
+    )));
+  };
+  let Some(value) = declaration
+    .strip_prefix("opt.config_version")
+    .map(str::trim_start)
+    .and_then(|value| value.strip_prefix('='))
+  else {
+    return Err(mlua::Error::external(format!(
+      "configuration must declare opt.config_version = {CONFIG_API_VERSION} as its first executable statement"
+    )));
+  };
+  let version = value
+    .split_once("--")
+    .map_or(value, |(version, _)| version)
+    .trim()
+    .parse::<u32>()
+    .map_err(|_| {
+      mlua::Error::external(format!(
+        "configuration must declare opt.config_version = {CONFIG_API_VERSION} as its first executable statement"
+      ))
+    })?;
+  if version != CONFIG_API_VERSION {
+    return Err(mlua::Error::external(format!(
+      "config API version {version} is not supported; this program supports version {CONFIG_API_VERSION}"
+    )));
+  }
+  Ok(())
+}
+
 pub fn load_file_with_context(
   path: &std::path::Path,
   arguments: &[String],
   launch: LaunchState,
 ) -> LuaResult<AppConfig> {
   let source = std::fs::read_to_string(path).map_err(mlua::Error::external)?;
-  load_config_with_context(&source, arguments, launch)
+  validate_file_config_api_version(&source)?;
+  let config = load_config_with_context(&source, arguments, launch)?;
+  if config.config_api_version.is_none() {
+    return Err(mlua::Error::external(format!(
+      "configuration must declare opt.config_version = {CONFIG_API_VERSION}"
+    )));
+  }
+  Ok(config)
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn lua_exposes_program_and_config_api_versions() {
+    load_config(
+      "assert(type(zmux.version) == 'string' and #zmux.version > 0)\nassert(zmux.config_api_version == 1)",
+    )
+    .expect("runtime version metadata");
+  }
+
+  #[test]
+  fn declared_config_api_version_must_be_supported() {
+    let error = match load_config("opt.config_version = 2") {
+      Ok(_) => panic!("unsupported config API must be rejected"),
+      Err(error) => error,
+    };
+    assert!(error.to_string().contains("config API version 2"));
+    assert!(error.to_string().contains("supports version 1"));
+  }
+
+  #[test]
+  fn config_files_must_declare_the_config_api_version() {
+    let directory = std::env::temp_dir().join(format!(
+      "zmux-config-version-test-{}-{}",
+      std::process::id(),
+      std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock after epoch")
+        .as_nanos(),
+    ));
+    std::fs::create_dir_all(&directory).expect("create temporary config directory");
+    let path = directory.join("zmux.lua");
+    std::fs::write(&path, "error('config without a version must not execute')")
+      .expect("write temporary config");
+
+    let error = match load_file_with_context(&path, &[], LaunchState::default()) {
+      Ok(_) => panic!("config files without a version must be rejected"),
+      Err(error) => error,
+    };
+    assert!(
+      error
+        .to_string()
+        .contains("must declare opt.config_version = 1")
+    );
+
+    std::fs::write(&path, "opt.config_version = 2\nerror('stale config must not execute')")
+      .expect("write unsupported config");
+    let error = match load_file_with_context(&path, &[], LaunchState::default()) {
+      Ok(_) => panic!("unsupported config files must be rejected"),
+      Err(error) => error,
+    };
+    assert!(error.to_string().contains("config API version 2"));
+    assert!(!error.to_string().contains("stale config must not execute"));
+
+    std::fs::write(
+      &path,
+      "--[[ config header\nmultiline comment ]]\nopt.config_version = 1 -- current API",
+    )
+    .expect("write versioned config");
+    let config = load_file_with_context(&path, &[], LaunchState::default())
+      .unwrap_or_else(|error| panic!("supported config API version should load: {error}"));
+    assert_eq!(config.config_api_version, Some(CONFIG_API_VERSION));
+
+    std::fs::remove_dir_all(directory).expect("remove temporary config directory");
+  }
 
   fn snapshot() -> AppSnapshot {
     AppSnapshot {
@@ -1733,7 +2020,8 @@ mod tests {
   // Developer approved: do not remove.
   #[test]
   fn sample_configuration_loads_with_luajit() {
-    let config = load_config(include_str!("../../zmux.lua")).expect("sample Lua config");
+    let config = load_config(DEFAULT_CONFIG_SOURCE).expect("built-in Lua config");
+    assert_eq!(config.config_api_version, Some(CONFIG_API_VERSION));
     assert_eq!(config.prefix_key, normalize_prefix_key("<C-Space>").expect("prefix"));
     assert_eq!(config.sequence_timeout, Duration::from_secs(8));
     config.lua.sync_state(&snapshot()).expect("sync UI state");
@@ -1750,7 +2038,7 @@ mod tests {
   // Developer approved: do not remove.
   #[test]
   fn repeated_ui_state_and_bar_callbacks_do_not_exhaust_the_lua_stack() {
-    let config = load_config(include_str!("../../zmux.lua")).expect("sample Lua config");
+    let config = load_config(DEFAULT_CONFIG_SOURCE).expect("built-in Lua config");
     let mut state = snapshot();
     state.session = Some(zmux::protocol::SessionSnapshot {
       number: "9".to_owned(),
@@ -2015,6 +2303,137 @@ mod tests {
   #[test]
   fn runtime_commands_cannot_be_called_during_config_loading() {
     assert!(load_config("cmd.tab.next()").is_err());
+  }
+
+  #[test]
+  fn ui_create_renders_modal_popover_bottom_panel_and_toast_elements() {
+    use ratatui::{
+      buffer::Buffer,
+      layout::Rect,
+    };
+
+    let cases = [
+      ("modal", "M", "width = 10, height = 5, border = 'none'", (15, 3)),
+      ("popover", "P", "x = 2, y = 1, width = 8, height = 3, border = 'none'", (2, 1)),
+      ("bottom_panel", "B", "height = 3, border = 'none'", (0, 9)),
+      ("toast", "T", "duration = 5000, position = 'top_right', border = 'none'", (39, 0)),
+    ];
+
+    for (element_type, text, options, expected) in cases {
+      let source = format!(
+        "local content = cmd.ui.text({{ text = '{text}' }})\nlocal element = cmd.ui.create({{ type = '{element_type}', {options}, content = content }})\nelement.show()"
+      );
+      let config =
+        load_config(&source).unwrap_or_else(|error| panic!("create {element_type}: {error}"));
+      let area = Rect::new(0, 0, 40, 12);
+      let mut buffer = Buffer::empty(area);
+      config.lua.render_ui_elements(area, &mut buffer);
+      let rendered_at = buffer
+        .content
+        .iter()
+        .position(|cell| cell.symbol() == text)
+        .unwrap_or_else(|| panic!("{element_type} did not render content"));
+      assert_eq!((rendered_at % 40, rendered_at / 40), expected, "{element_type}");
+    }
+
+    assert!(load_config(
+      "local content = cmd.ui.text({ text = 'x' })\ncmd.ui.create({ type = 'unknown', content = content })"
+    )
+    .is_err());
+  }
+
+  #[test]
+  fn modal_and_popover_clamp_to_small_nonzero_origin_areas() {
+    use ratatui::{
+      buffer::Buffer,
+      layout::Rect,
+    };
+
+    for specification in [
+      "type = 'modal', width = 50, height = 30",
+      "type = 'popover', x = 500, y = 300, width = 50, height = 30",
+    ] {
+      let source = format!(
+        "local content = cmd.ui.text({{ text = 'X' }})\ncmd.ui.create({{ {specification}, border = 'none', visible = true, content = content }})"
+      );
+      let config = load_config(&source).expect("small-area overlay config");
+      assert!(config.lua.focused_ui().is_some());
+      let area = Rect::new(5, 7, 4, 2);
+      let mut buffer = Buffer::empty(area);
+      config.lua.render_ui_elements(area, &mut buffer);
+      assert_eq!(buffer[(5, 7)].symbol(), "X", "{specification}");
+    }
+  }
+
+  #[test]
+  fn modal_dismissal_and_toast_expiration_update_retained_visibility() {
+    use ratatui::{
+      buffer::Buffer,
+      layout::Rect,
+    };
+
+    let config = load_config(
+      r#"
+        local content = cmd.ui.text({ text = "Overlay" })
+        local modal = cmd.ui.create({ type = "modal", content = content })
+        modal.show()
+        local toast_content = cmd.ui.text({ text = "Transient" })
+        local toast = cmd.ui.create({ type = "toast", duration = 10, content = toast_content })
+        toast.show()
+      "#,
+    )
+    .expect("modal and toast elements");
+    assert!(config.lua.focused_ui().is_some());
+    assert!(config.lua.focused_ui_captures_input());
+
+    let area = Rect::new(0, 0, 40, 12);
+    let mut buffer = Buffer::empty(area);
+    config.lua.render_ui_elements(area, &mut buffer);
+    assert!(buffer.content.iter().any(|cell| cell.symbol() == "O"));
+    assert!(buffer.content.iter().any(|cell| cell.symbol() == "T"));
+
+    assert!(config.lua.dismiss_focused_ui());
+    assert!(config.lua.focused_ui().is_none());
+    assert!(
+      config
+        .lua
+        .expire_ui_toasts(std::time::Instant::now() + Duration::from_secs(1))
+    );
+    assert!(
+      !config
+        .lua
+        .expire_ui_toasts(std::time::Instant::now() + Duration::from_secs(2))
+    );
+
+    let mut buffer = Buffer::empty(area);
+    config.lua.render_ui_elements(area, &mut buffer);
+    assert!(!buffer.content.iter().any(|cell| cell.symbol() == "O"));
+    assert!(!buffer.content.iter().any(|cell| cell.symbol() == "T"));
+  }
+
+  #[test]
+  fn dismissing_modal_restores_the_previously_focused_drawer() {
+    let config = load_config(
+      r#"
+        local drawer_content = cmd.ui.text({ text = "Drawer" })
+        local drawer = cmd.ui.create({ type = "drawer", content = drawer_content })
+        drawer.show()
+        drawer.focus()
+        local modal_content = cmd.ui.text({ text = "Dialog" })
+        local modal = cmd.ui.create({ type = "modal", content = modal_content })
+        cmd.event.on("ClientLoaded", function() modal.show() end)
+      "#,
+    )
+    .expect("nested focus config");
+    let drawer_id = config.lua.focused_ui().expect("focused Drawer");
+    let callbacks = config.lua.event_handlers("ClientLoaded");
+    config
+      .lua
+      .invoke_event_handler(&callbacks[0], &AppEvent::default())
+      .expect("show modal over Drawer");
+    assert_ne!(config.lua.focused_ui(), Some(drawer_id));
+    assert!(config.lua.dismiss_focused_ui());
+    assert_eq!(config.lua.focused_ui(), Some(drawer_id));
   }
 
   #[test]

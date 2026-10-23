@@ -74,7 +74,7 @@ Workspace creation and editing use a directory selector and optional name field.
 
 ## Lua configuration
 
-The default configuration is `./zmux.lua`; set `ZMUX_CONFIG` to load another file. LuaLS support is configured in [`.luarc.json`](.luarc.json), with definitions in [`lua/zmux.lua`](lua/zmux.lua).
+The default user configuration is `zmux/zmux.lua` under the platform's standard config directory: `$XDG_CONFIG_HOME` (or `~/.config`) on Linux and other Unix-like systems, `~/Library/Application Support` on macOS, or `%APPDATA%` on Windows. If that file is absent, zmux uses its built-in defaults; it does not search the current working directory. Set `ZMUX_CONFIG` to select an explicit file (for example, `ZMUX_CONFIG=./zmux.lua`). User config files must declare the supported config API version with `opt.config_version = 1` as the first executable statement (comments may precede it). The program checks this before executing the file; missing or unsupported versions and other load errors stop startup rather than silently falling back. This API version changes when a breaking Lua config API change is introduced, while `zmux.version` reports the running program's release version. LuaLS support is configured in [`.luarc.json`](.luarc.json), with definitions in [`lua/zmux.lua`](lua/zmux.lua).
 
 Commands are registered under `cmd`, options under `opt`, and Rust supplies the server-authoritative `g`/`global` snapshot. Register event handlers with `cmd.event.on`; commands requested by key and event callbacks are applied after the callback returns. The generic fuzzy picker is `cmd.ui.pick(items, callback)`: it calls back with the selected item on Enter or `nil` on Escape.
 
@@ -124,7 +124,40 @@ cmd.key.bind("ui", function()
 end, { desc = "Show status drawer" })
 ```
 
-`Text`, `row`, and `column` constructors return handles. Layout children may be auto-sized, fixed in terminal cells, or set to `"fill"` to share remaining space equally. A focused Drawer checks its direct key bindings before the global key dispatcher; unbound keys can invoke global leader mappings but are never sent to the PTY. When global leader mode is active, element bindings are ignored. A no-op function consumes a local binding; omitting a key removes it. Setters such as `status.set("text", "Updated")` and `drawer.set("border", "double")` invalidate the retained UI and schedule a coalesced redraw.
+`Text`, `row`, and `column` constructors return handles. Layout children may be auto-sized, fixed in terminal cells, or set to `"fill"` to share remaining space equally. `ui.create` also supports `modal`, `popover`, `bottom_panel`, and `toast` alongside `drawer`. Modals center over the terminal panel, dim its background, take focus when shown, and capture keys until Escape or `hide()`; a Popover is positioned by `x` and `y` cell offsets in that panel, clamps to fit, and also captures keys. A Bottom Panel overlays the bottom of the panel rather than reserving rows. Toasts are non-focusable and dismiss automatically after `duration` milliseconds (default 3000); positions are `top_right`, `top_center`, `bottom_right`, or `bottom_center`. All accept nested retained content, title, border, and border style.
+
+For example, all four patterns use the same constructor and handle lifecycle:
+
+```lua
+local ui = cmd.ui
+local dialog = ui.create({
+    type = "modal",
+    title = "Confirm",
+    content = ui.column({ ui.text({ text = "Close this tab?" }) }),
+    keys = { y = function(element) element.hide(); cmd.tab.close() end },
+})
+local menu = ui.create({
+    type = "popover", x = 8, y = 2,
+    content = ui.column({ ui.text({ text = "Actions" }) }),
+})
+local output = ui.create({
+    type = "bottom_panel", height = 5,
+    content = ui.column({ ui.text({ text = "Command output" }) }),
+})
+local notice = ui.create({
+    type = "toast", position = "bottom_right", duration = 2500,
+    content = ui.text({ text = "Saved" }),
+})
+
+cmd.key.bind("q", function()
+    dialog.show() -- Modal and Popover focus automatically.
+end)
+cmd.key.bind("m", function() menu.show() end)
+cmd.key.bind("o", function() output.show() end)
+cmd.key.bind("s", function() notice.show() end)
+```
+
+A focused Drawer checks its direct key bindings before the global key dispatcher; unbound keys can invoke global leader mappings but are never sent to the PTY. Modal and Popover input is stricter: direct bindings run first, Escape hides the element by default, and every other key is consumed rather than sent to global bindings or the PTY. A no-op function consumes a local binding; omitting a key removes it. Setters such as `status.set("text", "Updated")` and `drawer.set("border", "double")` invalidate the retained UI and schedule a coalesced redraw.
 
 List global bindings from the loaded configuration with `zmux keybinds`; use `--json` for pretty-printed JSON on stdout. Each entry includes its sequence and optional description, and the configured prefix is reported separately. Focus-scoped UI Element bindings are not included in this listing. This command loads the Lua config but does not connect to or start the Server.
 

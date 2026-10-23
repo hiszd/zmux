@@ -66,6 +66,63 @@ struct CliOptions {
   server_process: bool,
 }
 
+#[derive(Clone, Copy)]
+enum ConfigPlatform {
+  #[cfg(any(test, all(unix, not(target_os = "macos"))))]
+  Unix,
+  #[cfg(any(test, target_os = "macos"))]
+  MacOs,
+  #[cfg(any(test, target_os = "windows"))]
+  Windows,
+  #[cfg(any(test, not(any(unix, target_os = "windows"))))]
+  Other,
+}
+
+fn config_path_for(
+  platform: ConfigPlatform,
+  _xdg_config_home: Option<&std::path::Path>,
+  home: Option<&std::path::Path>,
+  _appdata: Option<&std::path::Path>,
+) -> Option<PathBuf> {
+  let config_directory = match platform {
+    #[cfg(any(test, all(unix, not(target_os = "macos"))))]
+    ConfigPlatform::Unix => _xdg_config_home
+      .filter(|path| path.is_absolute())
+      .map(PathBuf::from)
+      .or_else(|| home.map(|path| path.join(".config")))?,
+    #[cfg(any(test, target_os = "macos"))]
+    ConfigPlatform::MacOs => home?.join("Library/Application Support"),
+    #[cfg(any(test, target_os = "windows"))]
+    ConfigPlatform::Windows => _appdata
+      .map(PathBuf::from)
+      .or_else(|| home.map(|path| path.join("AppData/Roaming")))?,
+    #[cfg(any(test, not(any(unix, target_os = "windows"))))]
+    ConfigPlatform::Other => home?.join(".config"),
+  };
+  Some(config_directory.join("zmux").join("zmux.lua"))
+}
+
+fn resolve_config_path(explicit: Option<PathBuf>, default: Option<PathBuf>) -> Option<PathBuf> {
+  explicit.or(default)
+}
+
+fn default_config_path() -> Option<PathBuf> {
+  let home = std::env::var_os("HOME")
+    .or_else(|| std::env::var_os("USERPROFILE"))
+    .map(PathBuf::from);
+  let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+  let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
+  #[cfg(target_os = "windows")]
+  let platform = ConfigPlatform::Windows;
+  #[cfg(target_os = "macos")]
+  let platform = ConfigPlatform::MacOs;
+  #[cfg(all(unix, not(target_os = "macos")))]
+  let platform = ConfigPlatform::Unix;
+  #[cfg(not(any(unix, target_os = "windows")))]
+  let platform = ConfigPlatform::Other;
+  config_path_for(platform, xdg_config_home.as_deref(), home.as_deref(), appdata.as_deref())
+}
+
 fn main() {
   let trace = Trace::from_environment();
   if let Err(error) = run() {
@@ -484,7 +541,7 @@ fn launch_client(
   arguments: &[String],
   launch: lua::LaunchState,
 ) -> Result<(), Box<dyn std::error::Error>> {
-  let config = configuration(arguments, launch);
+  let config = configuration(arguments, launch)?;
   let (launch, startup_commands) = client::run_pre_client(endpoint, &config)?;
   if launch.require_session && launch.session_name.is_none() {
     println!("no active sessions");
@@ -535,53 +592,109 @@ fn print_keybinds(config: &lua::AppConfig, json: bool) -> Result<(), Box<dyn std
 fn keybinds_configuration(
   arguments: &[String],
 ) -> Result<lua::AppConfig, Box<dyn std::error::Error>> {
-  let explicit_path = std::env::var_os("ZMUX_CONFIG").map(PathBuf::from);
-  let path = explicit_path
-    .clone()
-    .unwrap_or_else(|| PathBuf::from("zmux.lua"));
   let launch = lua::LaunchState {
     command: "keybinds".to_owned(),
     working_directory: std::env::current_dir()?,
     ..lua::LaunchState::default()
   };
-
-  if path.exists() {
-    return lua::load_file_with_context(&path, arguments, launch)
-      .map_err(|error| format!("could not load {}: {error}", path.display()).into());
-  }
-  if explicit_path.is_some() {
-    return Err(format!("could not load {}: file does not exist", path.display()).into());
-  }
-  lua::load_config_with_context(include_str!("../zmux.lua"), arguments, launch).map_err(Into::into)
+  configuration(arguments, launch)
 }
 
-fn configuration(arguments: &[String], launch: lua::LaunchState) -> lua::AppConfig {
-  let path = std::env::var_os("ZMUX_CONFIG")
-    .map(PathBuf::from)
-    .unwrap_or_else(|| PathBuf::from("zmux.lua"));
-  if !path.exists() {
-    return lua::load_config_with_context(include_str!("../zmux.lua"), arguments, launch)
-      .expect("built-in Lua defaults are valid");
-  }
-  match lua::load_file_with_context(&path, arguments, launch.clone()) {
-    Ok(config) => config,
-    Err(error) => {
-      eprintln!("could not load {}: {error}", path.display());
-      lua::load_config_with_context(include_str!("../zmux.lua"), arguments, launch)
-        .expect("built-in Lua defaults are valid")
+fn configuration(
+  arguments: &[String],
+  launch: lua::LaunchState,
+) -> Result<lua::AppConfig, Box<dyn std::error::Error>> {
+  let explicit_path = std::env::var_os("ZMUX_CONFIG").map(PathBuf::from);
+  let path = resolve_config_path(explicit_path.clone(), default_config_path());
+  if let Some(path) = path {
+    match std::fs::metadata(&path) {
+      Ok(_) => {
+        return lua::load_file_with_context(&path, arguments, launch)
+          .map_err(|error| format!("could not load {}: {error}", path.display()).into());
+      }
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound && explicit_path.is_none() => {}
+      Err(error) => {
+        return Err(format!("could not load {}: {error}", path.display()).into());
+      }
+    }
+    if explicit_path.is_some() {
+      return Err(format!("could not load {}: file does not exist", path.display()).into());
     }
   }
+  lua::load_config_with_context(lua::DEFAULT_CONFIG_SOURCE, arguments, launch).map_err(Into::into)
 }
 
 #[cfg(test)]
 mod tests {
   use super::{
     Command,
+    ConfigPlatform,
+    config_path_for,
     headless::ScriptInput,
     keybinds_json,
     lua,
     parse_args,
+    resolve_config_path,
   };
+
+  #[test]
+  fn config_location_uses_standard_platform_directories() {
+    let home = std::path::Path::new("/home/test");
+    assert_eq!(
+      config_path_for(ConfigPlatform::Unix, None, Some(home), None),
+      Some(std::path::PathBuf::from("/home/test/.config/zmux/zmux.lua")),
+    );
+    assert_eq!(
+      config_path_for(
+        ConfigPlatform::Unix,
+        Some(std::path::Path::new("/tmp/config")),
+        Some(home),
+        None,
+      ),
+      Some(std::path::PathBuf::from("/tmp/config/zmux/zmux.lua")),
+    );
+    assert_eq!(
+      config_path_for(ConfigPlatform::MacOs, None, Some(home), None),
+      Some(std::path::PathBuf::from("/home/test/Library/Application Support/zmux/zmux.lua")),
+    );
+    assert_eq!(
+      config_path_for(ConfigPlatform::Other, None, Some(home), None),
+      Some(std::path::PathBuf::from("/home/test/.config/zmux/zmux.lua")),
+    );
+    assert_eq!(
+      config_path_for(
+        ConfigPlatform::Windows,
+        None,
+        Some(home),
+        Some(std::path::Path::new("C:/Users/test/AppData/Roaming")),
+      ),
+      Some(std::path::PathBuf::from("C:/Users/test/AppData/Roaming/zmux/zmux.lua")),
+    );
+  }
+
+  #[test]
+  fn explicit_config_path_overrides_platform_default() {
+    assert_eq!(
+      resolve_config_path(
+        Some(std::path::PathBuf::from("/custom/zmux.lua")),
+        Some(std::path::PathBuf::from("/home/test/.config/zmux/zmux.lua")),
+      ),
+      Some(std::path::PathBuf::from("/custom/zmux.lua")),
+    );
+  }
+
+  #[test]
+  fn relative_xdg_config_home_is_ignored() {
+    assert_eq!(
+      config_path_for(
+        ConfigPlatform::Unix,
+        Some(std::path::Path::new("relative/config")),
+        Some(std::path::Path::new("/home/test")),
+        None,
+      ),
+      Some(std::path::PathBuf::from("/home/test/.config/zmux/zmux.lua")),
+    );
+  }
 
   // Developer approved: do not remove.
   #[test]

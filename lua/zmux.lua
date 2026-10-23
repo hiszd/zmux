@@ -95,11 +95,15 @@
 ---@field bind fun(keys: string, callback: fun()|nil, opts?: ZmuxKeymapOptions) Bind a neovim-notation key sequence after the configured prefix; pass nil to unbind.
 
 ---@alias ZmuxUiSize integer|"auto"|"fill"
+---@alias ZmuxElementSize integer|"auto"
 ---@alias ZmuxDrawerSide "left"|"right"
----@alias ZmuxDrawerWidth integer|"auto"
+---@alias ZmuxDrawerWidth ZmuxElementSize
 ---@alias ZmuxDrawerBorder "none"|"plain"|"rounded"|"double"|"thick"|"light_double_dashed"|"heavy_double_dashed"|"light_triple_dashed"|"heavy_triple_dashed"|"light_quadruple_dashed"|"heavy_quadruple_dashed"|"quadrant_inside"|"quadrant_outside"
----@alias ZmuxDrawerProperty "side"|"width"|"title"|"border"|"border_style"|"keys"
----@alias ZmuxDrawerPropertyValue ZmuxDrawerSide|ZmuxDrawerWidth|string|ZmuxDrawerBorder|ZmuxStyle|table<string, fun(element: ZmuxDrawerHandle, key: ZmuxUiKey)>
+---@alias ZmuxToastPosition "top_right"|"top_center"|"bottom_right"|"bottom_center"
+---@alias ZmuxUiElementProperty "side"|"width"|"height"|"x"|"y"|"position"|"duration"|"title"|"border"|"border_style"|"keys"
+---@alias ZmuxUiElementPropertyValue ZmuxDrawerSide|ZmuxElementSize|integer|string|ZmuxDrawerBorder|ZmuxStyle|table<string, fun(element: ZmuxUiElementHandle, key: ZmuxUiKey)>
+---@alias ZmuxDrawerProperty ZmuxUiElementProperty
+---@alias ZmuxDrawerPropertyValue ZmuxUiElementPropertyValue
 ---@alias ZmuxTextProperty "text"|"style"
 ---@alias ZmuxLayoutProperty "children"
 
@@ -126,28 +130,76 @@
 ---@field set fun(property: ZmuxLayoutProperty, value: ZmuxLayoutChild[]) Replace this Layout's children.
 
 ---@class ZmuxDrawerOptions
----@field type? "drawer" Element type; currently only drawers are supported.
+---@field type? "drawer" Element type; defaults to "drawer".
 ---@field side? ZmuxDrawerSide Edge to attach to. Defaults to "left".
 ---@field width? ZmuxDrawerWidth Fixed cell width or content-sized "auto". Defaults to "auto".
 ---@field title? string Optional border title.
 ---@field border? ZmuxDrawerBorder Ratatui border preset. Defaults to "plain".
 ---@field border_style? ZmuxStyle Border color and modifiers.
 ---@field content ZmuxUiNodeHandle Nested content tree.
----@field keys? table<string, fun(element: ZmuxDrawerHandle, key: ZmuxUiKey)> Direct bindings active while this Drawer is focused.
+---@field keys? table<string, fun(element: ZmuxUiElementHandle, key: ZmuxUiKey)> Direct bindings active while this element is focused.
 ---@field visible? boolean Initial visibility. Defaults to false.
 
----@class ZmuxDrawerHandle
----@field set fun(property: ZmuxDrawerProperty, value: ZmuxDrawerPropertyValue) Set a typed Drawer property; visual changes automatically schedule a redraw.
----@field show fun() Show this Drawer without focusing it.
----@field hide fun() Hide this Drawer and release its focus if needed.
----@field toggle fun() Toggle visibility without implicitly taking focus.
----@field focus fun() Focus this Drawer, showing it if necessary.
----@field blur fun() Return keyboard focus to the terminal.
+---@class ZmuxModalOptions
+---@field type "modal"
+---@field width? ZmuxElementSize Width in cells or "auto"; defaults to content width.
+---@field height? ZmuxElementSize Height in cells or "auto"; defaults to content height.
+---@field title? string Optional border title.
+---@field border? ZmuxDrawerBorder Ratatui border preset. Defaults to "plain".
+---@field border_style? ZmuxStyle Border color and modifiers.
+---@field content ZmuxUiNodeHandle Nested content tree.
+---@field keys? table<string, fun(element: ZmuxUiElementHandle, key: ZmuxUiKey)> Direct bindings; modal input is captured until Escape or hide().
+---@field visible? boolean Initial visibility. Defaults to false.
+
+---@class ZmuxPopoverOptions
+---@field type "popover"
+---@field x? integer Horizontal cell offset in the UI area; defaults to 0 and is clamped to fit.
+---@field y? integer Vertical cell offset in the UI area; defaults to 0 and is clamped to fit.
+---@field width? ZmuxElementSize Width in cells or "auto"; defaults to content width.
+---@field height? ZmuxElementSize Height in cells or "auto"; defaults to content height.
+---@field title? string Optional border title.
+---@field border? ZmuxDrawerBorder Ratatui border preset. Defaults to "plain".
+---@field border_style? ZmuxStyle Border color and modifiers.
+---@field content ZmuxUiNodeHandle Nested content tree.
+---@field keys? table<string, fun(element: ZmuxUiElementHandle, key: ZmuxUiKey)> Direct bindings; popover input is captured until Escape or hide().
+---@field visible? boolean Initial visibility. Defaults to false.
+
+---@class ZmuxBottomPanelOptions
+---@field type "bottom_panel"
+---@field height? ZmuxElementSize Height in cells or "auto"; defaults to content height.
+---@field title? string Optional border title.
+---@field border? ZmuxDrawerBorder Ratatui border preset. Defaults to "plain".
+---@field border_style? ZmuxStyle Border color and modifiers.
+---@field content ZmuxUiNodeHandle Nested content tree.
+---@field keys? table<string, fun(element: ZmuxUiElementHandle, key: ZmuxUiKey)> Direct bindings while focused.
+---@field visible? boolean Initial visibility. Defaults to false.
+
+---@class ZmuxToastOptions
+---@field type "toast"
+---@field position? ZmuxToastPosition Screen corner or center edge; defaults to "top_right".
+---@field duration? integer Visible duration in milliseconds; defaults to 3000.
+---@field title? string Optional border title.
+---@field border? ZmuxDrawerBorder Ratatui border preset. Defaults to "plain".
+---@field border_style? ZmuxStyle Border color and modifiers.
+---@field content ZmuxUiNodeHandle Nested content tree.
+---@field visible? boolean Initial visibility. Defaults to false.
+
+---@alias ZmuxUiElementOptions ZmuxDrawerOptions|ZmuxModalOptions|ZmuxPopoverOptions|ZmuxBottomPanelOptions|ZmuxToastOptions
+
+---@class ZmuxUiElementHandle
+---@field set fun(property: ZmuxUiElementProperty, value: ZmuxUiElementPropertyValue) Set a typed property; visual changes automatically schedule a redraw.
+---@field show fun() Show this element; Modal and Popover are focused automatically.
+---@field hide fun() Hide this element and release its focus if needed.
+---@field toggle fun() Toggle visibility; showing Modal and Popover focuses them.
+---@field focus fun() Focus this element, showing it if necessary. Toasts cannot be focused.
+---@field blur fun() Return keyboard focus to the terminal; Modal and Popover elements must be hidden instead.
+
+---@alias ZmuxDrawerHandle ZmuxUiElementHandle
 
 ---@class ZmuxUiApi
 ---@field pick fun(items: ZmuxPickerItem[], callback: fun(item: any|nil)) Open a generic fuzzy picker from a key or event callback and later call back with the chosen item or nil on Escape.
 ---@field redraw fun() Request a client redraw.
----@field create fun(options: ZmuxDrawerOptions): ZmuxDrawerHandle Create a retained UI element while loading configuration.
+---@field create fun(options: ZmuxUiElementOptions): ZmuxUiElementHandle Create a retained Drawer, Modal, Popover, Bottom Panel, or Toast while loading configuration.
 ---@field text fun(options: ZmuxTextOptions): ZmuxTextHandle Create a Text node.
 ---@field row fun(children: ZmuxLayoutChild[]): ZmuxLayoutHandle Create a horizontal Layout.
 ---@field column fun(children: ZmuxLayoutChild[]): ZmuxLayoutHandle Create a vertical Layout.
@@ -237,6 +289,7 @@
 ---@field manual? ZmuxTerminalState Fixed rows and columns when policy is "manual".
 
 ---@class ZmuxOptions
+---@field config_version integer Required config API version; must match `zmux.config_api_version`.
 ---@field cursor_shape? "block"|"underline"|"bar"
 ---@field default_shell? string Shell executable for newly created sessions. Defaults to $SHELL.
 ---@field ignore_size? boolean Whether this Client's terminal dimensions are excluded from shared PTY sizing; defaults to false.
@@ -266,3 +319,9 @@ launch = {}
 ---@class ZmuxInfoApi
 ---@type ZmuxInfoApi
 inf = {}
+
+---@class ZmuxRuntimeApi
+---@field version string Version of the running zmux program.
+---@field config_api_version integer Config API version supported by this program.
+---@type ZmuxRuntimeApi
+zmux = {}

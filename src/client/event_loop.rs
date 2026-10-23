@@ -1451,6 +1451,7 @@ fn run_event_loop(
       }
       Err(RecvTimeoutError::Timeout) => {
         let now = Instant::now();
+        needs_draw |= config.lua.expire_ui_toasts(now);
         if let Some(timeout) = dispatcher.expire(now) {
           match timeout {
             KeyTimeout::Execute(callback) => {
@@ -1972,6 +1973,43 @@ fn handle_input(
     && let Event::Key(key) = &event
   {
     return handle_workspace_modal_key(*key, context);
+  }
+  if context.lua.focused_ui_captures_input()
+    && let Event::Key(key) = &event
+    && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+  {
+    let stroke = KeyStroke::from_crossterm(*key);
+    if let Some((_, callback, handle)) =
+      stroke.and_then(|stroke| context.lua.focused_ui_binding(stroke))
+    {
+      context
+        .trace
+        .mark(&format!("modal-ui-key-callback-start key={key:?}"));
+      let effects = match context.lua.invoke_ui_key_callback(&callback, handle, *key) {
+        Ok(commands) => execute_runtime_commands(commands, context)?,
+        Err(error) => {
+          context.trace.error("lua.ui_key_callback", &error);
+          context.session.key_warning =
+            Some((format!("UI key callback: {error}"), Instant::now() + Duration::from_secs(3)));
+          Effects {
+            redraw: true,
+            ..Effects::default()
+          }
+        }
+      };
+      context.trace.mark("modal-ui-key-callback-complete");
+      return Ok(effects);
+    }
+    if key.code == crossterm::event::KeyCode::Esc
+      && key.modifiers.is_empty()
+      && context.lua.dismiss_focused_ui()
+    {
+      return Ok(Effects {
+        redraw: true,
+        ..Effects::default()
+      });
+    }
+    return Ok(Effects::default());
   }
   if !context.dispatcher.is_leader()
     && let Event::Key(key) = &event
@@ -3076,6 +3114,68 @@ mod tests {
         .expect("Escape blurs focused Drawer");
     assert!(escape.redraw);
     assert!(context.lua.focused_ui().is_none());
+  }
+
+  #[test]
+  fn focused_modal_captures_keys_and_escape_dismisses_it() {
+    use crossterm::event::{
+      Event,
+      KeyCode,
+      KeyEvent,
+      KeyModifiers,
+    };
+
+    let config = lua::load_config(
+      r#"
+        cmd.key.bind("a", function() cmd.tab.next() end)
+        local content = cmd.ui.text({ text = "Dialog" })
+        local modal = cmd.ui.create({ type = "modal", content = content })
+        modal.show()
+      "#,
+    )
+    .expect("valid modal config");
+    let viewport = Viewport {
+      rows: 24,
+      columns: 80,
+    };
+    let snapshot = SessionSnapshot {
+      number: "1".to_owned(),
+      workspaces: Vec::new(),
+      active_workspace_id: 0,
+    };
+    let mut session = ClientSession::new(snapshot, Vec::new(), viewport);
+    let mut outer_size = (80, 24);
+    let mut viewport = viewport;
+    let mut dispatcher =
+      KeyDispatcher::new(config.prefix_key, config.sequence_timeout, config.keymap.clone());
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let mut next_request_id = 1;
+    let trace = crate::trace::Trace::from_environment();
+    let mut context = ClientContext {
+      session: &mut session,
+      outer_size: &mut outer_size,
+      viewport: &mut viewport,
+      dispatcher: &mut dispatcher,
+      sender: &sender,
+      next_request_id: &mut next_request_id,
+      lua: &config.lua,
+      trace: &trace,
+    };
+
+    handle_input(Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)), &mut context)
+      .expect("modal captures global binding key");
+    assert!(!context.dispatcher.is_leader());
+    assert!(
+      receiver.try_iter().next().is_none(),
+      "modal keys must not reach global bindings or PTY"
+    );
+
+    let escape =
+      handle_input(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), &mut context)
+        .expect("Escape dismisses modal");
+    assert!(escape.redraw);
+    assert!(context.lua.focused_ui().is_none());
+    assert!(receiver.try_iter().next().is_none());
   }
 
   // Developer approved: do not remove.

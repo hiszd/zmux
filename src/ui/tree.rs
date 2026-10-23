@@ -82,9 +82,48 @@ pub(crate) enum DrawerSide {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DrawerWidth {
+pub(crate) enum UiSize {
   Auto,
   Fixed(u16),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToastPosition {
+  TopRight,
+  TopCenter,
+  BottomRight,
+  BottomCenter,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UiElementType {
+  Drawer {
+    side: DrawerSide,
+    width: UiSize,
+  },
+  Modal {
+    width: UiSize,
+    height: UiSize,
+  },
+  Popover {
+    x: u16,
+    y: u16,
+    width: UiSize,
+    height: UiSize,
+  },
+  BottomPanel {
+    height: UiSize,
+  },
+  Toast {
+    position: ToastPosition,
+    duration: std::time::Duration,
+  },
+}
+
+impl UiElementType {
+  fn auto_focus(self) -> bool { matches!(self, Self::Modal { .. } | Self::Popover { .. }) }
+
+  fn captures_input(self) -> bool { matches!(self, Self::Modal { .. } | Self::Popover { .. }) }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -155,12 +194,11 @@ pub(crate) enum UiNodeKind {
 pub(crate) struct UiNode {
   pub kind: UiNodeKind,
   parent: Option<u64>,
-  drawer_root: Option<u64>,
+  element_root: Option<u64>,
 }
 
-pub(crate) struct UiDrawerOptions {
-  pub side: DrawerSide,
-  pub width: DrawerWidth,
+pub(crate) struct UiElementOptions {
+  pub element_type: UiElementType,
   pub title: String,
   pub border: DrawerBorder,
   pub border_style: Style,
@@ -169,15 +207,16 @@ pub(crate) struct UiDrawerOptions {
 }
 
 #[derive(Clone)]
-pub(crate) struct UiDrawer {
+pub(crate) struct UiElement {
   pub id: u64,
-  pub side: DrawerSide,
-  pub width: DrawerWidth,
+  pub element_type: UiElementType,
   pub title: String,
   pub border: DrawerBorder,
   pub border_style: Style,
   pub content_id: u64,
   pub visible: bool,
+  previous_focus: Option<u64>,
+  toast_deadline: Option<std::time::Instant>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -187,9 +226,14 @@ pub(crate) struct IntrinsicSize {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum DrawerProperty {
+pub(crate) enum UiElementProperty {
   Side,
   Width,
+  Height,
+  X,
+  Y,
+  Position,
+  Duration,
   Title,
   Border,
   BorderStyle,
@@ -198,10 +242,10 @@ pub(crate) enum DrawerProperty {
 pub(crate) struct UiTree {
   next_id: u64,
   nodes: HashMap<u64, UiNode>,
-  drawers: Vec<UiDrawer>,
-  focused_drawer: Option<u64>,
+  elements: Vec<UiElement>,
+  focused_element: Option<u64>,
   intrinsic_cache: HashMap<u64, IntrinsicSize>,
-  drawer_rects: HashMap<u64, Rect>,
+  element_rects: HashMap<u64, Rect>,
   node_rects: HashMap<u64, Rect>,
   layout_area: Option<Rect>,
   layout_dirty: bool,
@@ -212,10 +256,10 @@ impl Default for UiTree {
     Self {
       next_id: 1,
       nodes: HashMap::new(),
-      drawers: Vec::new(),
-      focused_drawer: None,
+      elements: Vec::new(),
+      focused_element: None,
       intrinsic_cache: HashMap::new(),
-      drawer_rects: HashMap::new(),
+      element_rects: HashMap::new(),
       node_rects: HashMap::new(),
       layout_area: None,
       layout_dirty: true,
@@ -238,7 +282,7 @@ impl UiTree {
     self.nodes.insert(id, UiNode {
       kind: UiNodeKind::Text { text, style },
       parent: None,
-      drawer_root: None,
+      element_root: None,
     });
     self.layout_dirty = true;
     Ok(id)
@@ -261,32 +305,47 @@ impl UiTree {
     self.nodes.insert(id, UiNode {
       kind: UiNodeKind::Layout { axis, children },
       parent: None,
-      drawer_root: None,
+      element_root: None,
     });
     self.layout_dirty = true;
     Ok(id)
   }
 
-  pub(crate) fn create_drawer(&mut self, options: UiDrawerOptions) -> Result<u64, String> {
+  pub(crate) fn create_element(&mut self, options: UiElementOptions) -> Result<u64, String> {
     let id = self.next_id()?;
     let content = self
       .nodes
       .get_mut(&options.content_id)
-      .ok_or_else(|| "drawer content handle is no longer valid".to_owned())?;
-    if content.parent.is_some() || content.drawer_root.is_some() {
+      .ok_or_else(|| "UI element content handle is no longer valid".to_owned())?;
+    if content.parent.is_some() || content.element_root.is_some() {
       return Err("a UI node can only belong to one parent".to_owned());
     }
-    content.drawer_root = Some(id);
-    self.drawers.push(UiDrawer {
+    content.element_root = Some(id);
+    let toast_deadline = match options.element_type {
+      UiElementType::Toast { duration, .. } if options.visible => {
+        Some(std::time::Instant::now() + duration)
+      }
+      _ => None,
+    };
+    let previous_focus = if options.visible && options.element_type.auto_focus() {
+      self.focused_element
+    } else {
+      None
+    };
+    self.elements.push(UiElement {
       id,
-      side: options.side,
-      width: options.width,
+      element_type: options.element_type,
       title: options.title,
       border: options.border,
       border_style: options.border_style,
       content_id: options.content_id,
       visible: options.visible,
+      previous_focus,
+      toast_deadline,
     });
+    if options.visible && options.element_type.auto_focus() {
+      self.focused_element = Some(id);
+    }
     self.layout_dirty = true;
     Ok(id)
   }
@@ -301,7 +360,7 @@ impl UiTree {
         .nodes
         .get(&child.node_id)
         .ok_or_else(|| "UI child handle is no longer valid".to_owned())?;
-      if node.parent.is_some_and(|parent| parent != parent_id) || node.drawer_root.is_some() {
+      if node.parent.is_some_and(|parent| parent != parent_id) || node.element_root.is_some() {
         return Err("a UI node can only belong to one parent".to_owned());
       }
       let mut ancestor = Some(parent_id);
@@ -422,45 +481,118 @@ impl UiTree {
     self.layout_dirty = true;
   }
 
-  pub(crate) fn set_drawer_property(
+  pub(crate) fn set_element_property(
     &mut self,
     id: u64,
-    property: DrawerProperty,
-    value: DrawerValue,
+    property: UiElementProperty,
+    value: UiElementValue,
   ) -> Result<bool, String> {
-    let drawer = self
-      .drawers
-      .iter_mut()
-      .find(|drawer| drawer.id == id)
-      .ok_or_else(|| "Drawer handle is no longer valid".to_owned())?;
+    let element = self
+      .element_mut(id)
+      .ok_or_else(|| "UI element handle is no longer valid".to_owned())?;
     let changed = match (property, value) {
-      (DrawerProperty::Side, DrawerValue::Side(value)) if drawer.side != value => {
-        drawer.side = value;
+      (UiElementProperty::Side, UiElementValue::Side(value)) => match &mut element.element_type {
+        UiElementType::Drawer { side, .. } if *side != value => {
+          *side = value;
+          true
+        }
+        UiElementType::Drawer { .. } => false,
+        _ => return Err("'side' is only valid for a Drawer".to_owned()),
+      },
+      (UiElementProperty::Width, UiElementValue::Size(value)) => match &mut element.element_type {
+        UiElementType::Drawer { width, .. }
+        | UiElementType::Modal { width, .. }
+        | UiElementType::Popover { width, .. }
+          if *width != value =>
+        {
+          *width = value;
+          true
+        }
+        UiElementType::Drawer { .. }
+        | UiElementType::Modal { .. }
+        | UiElementType::Popover { .. } => false,
+        _ => return Err("'width' is not valid for this UI element".to_owned()),
+      },
+      (UiElementProperty::Height, UiElementValue::Size(value)) => match &mut element.element_type {
+        UiElementType::Modal { height, .. }
+        | UiElementType::Popover { height, .. }
+        | UiElementType::BottomPanel { height }
+          if *height != value =>
+        {
+          *height = value;
+          true
+        }
+        UiElementType::Modal { .. }
+        | UiElementType::Popover { .. }
+        | UiElementType::BottomPanel { .. } => false,
+        _ => return Err("'height' is not valid for this UI element".to_owned()),
+      },
+      (UiElementProperty::X, UiElementValue::Coordinate(value)) => {
+        match &mut element.element_type {
+          UiElementType::Popover { x, .. } if *x != value => {
+            *x = value;
+            true
+          }
+          UiElementType::Popover { .. } => false,
+          _ => return Err("'x' is only valid for a Popover".to_owned()),
+        }
+      }
+      (UiElementProperty::Y, UiElementValue::Coordinate(value)) => {
+        match &mut element.element_type {
+          UiElementType::Popover { y, .. } if *y != value => {
+            *y = value;
+            true
+          }
+          UiElementType::Popover { .. } => false,
+          _ => return Err("'y' is only valid for a Popover".to_owned()),
+        }
+      }
+      (UiElementProperty::Position, UiElementValue::Position(value)) => {
+        match &mut element.element_type {
+          UiElementType::Toast { position, .. } if *position != value => {
+            *position = value;
+            true
+          }
+          UiElementType::Toast { .. } => false,
+          _ => return Err("'position' is only valid for a Toast".to_owned()),
+        }
+      }
+      (UiElementProperty::Duration, UiElementValue::Duration(value)) => {
+        match &mut element.element_type {
+          UiElementType::Toast { duration, .. } if *duration != value => {
+            *duration = value;
+            true
+          }
+          UiElementType::Toast { .. } => false,
+          _ => return Err("'duration' is only valid for a Toast".to_owned()),
+        }
+      }
+      (UiElementProperty::Title, UiElementValue::Title(value)) if element.title != value => {
+        element.title = value;
         true
       }
-      (DrawerProperty::Width, DrawerValue::Width(value)) if drawer.width != value => {
-        drawer.width = value;
+      (UiElementProperty::Border, UiElementValue::Border(value)) if element.border != value => {
+        element.border = value;
         true
       }
-      (DrawerProperty::Title, DrawerValue::Title(value)) if drawer.title != value => {
-        drawer.title = value;
+      (UiElementProperty::BorderStyle, UiElementValue::Style(value))
+        if element.border_style != value =>
+      {
+        element.border_style = value;
         true
       }
-      (DrawerProperty::Border, DrawerValue::Border(value)) if drawer.border != value => {
-        drawer.border = value;
-        true
-      }
-      (DrawerProperty::BorderStyle, DrawerValue::Style(value)) if drawer.border_style != value => {
-        drawer.border_style = value;
-        true
-      }
-      (DrawerProperty::Side, DrawerValue::Side(_))
-      | (DrawerProperty::Width, DrawerValue::Width(_))
-      | (DrawerProperty::Title, DrawerValue::Title(_))
-      | (DrawerProperty::Border, DrawerValue::Border(_))
-      | (DrawerProperty::BorderStyle, DrawerValue::Style(_)) => false,
+      (UiElementProperty::Title, UiElementValue::Title(_))
+      | (UiElementProperty::Border, UiElementValue::Border(_))
+      | (UiElementProperty::BorderStyle, UiElementValue::Style(_)) => false,
       _ => return Err("UI property received a value of the wrong type".to_owned()),
     };
+    if changed
+      && matches!(property, UiElementProperty::Duration)
+      && let UiElementType::Toast { duration, .. } = element.element_type
+      && element.visible
+    {
+      element.toast_deadline = Some(std::time::Instant::now() + duration);
+    }
     if changed {
       self.layout_dirty = true;
     }
@@ -468,30 +600,54 @@ impl UiTree {
   }
 
   pub(crate) fn show(&mut self, id: u64) -> Result<bool, String> {
-    let drawer = self.drawer_mut(id)?;
-    if drawer.visible {
-      return Ok(false);
+    let prior_focus = self.focused_element;
+    let element = self
+      .element_mut(id)
+      .ok_or_else(|| "UI element handle is no longer valid".to_owned())?;
+    let was_visible = element.visible;
+    let auto_focus = element.element_type.auto_focus();
+    if auto_focus && !was_visible && prior_focus != Some(id) {
+      element.previous_focus = prior_focus;
     }
-    drawer.visible = true;
-    self.layout_dirty = true;
-    Ok(true)
+    element.visible = true;
+    if let UiElementType::Toast { duration, .. } = element.element_type {
+      element.toast_deadline = Some(std::time::Instant::now() + duration);
+    }
+    if auto_focus {
+      self.focused_element = Some(id);
+    }
+    if !was_visible || auto_focus {
+      self.layout_dirty = true;
+    }
+    Ok(!was_visible || auto_focus)
   }
 
   pub(crate) fn hide(&mut self, id: u64) -> Result<bool, String> {
-    let drawer = self.drawer_mut(id)?;
-    if !drawer.visible {
-      return Ok(false);
-    }
-    drawer.visible = false;
-    if self.focused_drawer == Some(id) {
-      self.focused_drawer = None;
+    let previous_focus = {
+      let element = self
+        .element_mut(id)
+        .ok_or_else(|| "UI element handle is no longer valid".to_owned())?;
+      if !element.visible {
+        return Ok(false);
+      }
+      element.visible = false;
+      element.toast_deadline = None;
+      element.previous_focus.take()
+    };
+    if self.focused_element == Some(id) {
+      self.focused_element = previous_focus.filter(|focused_id| {
+        self
+          .elements
+          .iter()
+          .any(|element| element.id == *focused_id && element.visible)
+      });
     }
     self.layout_dirty = true;
     Ok(true)
   }
 
   pub(crate) fn toggle(&mut self, id: u64) -> Result<bool, String> {
-    if self.drawer(id)?.visible {
+    if self.element(id)?.visible {
       self.hide(id)
     } else {
       self.show(id)
@@ -499,41 +655,83 @@ impl UiTree {
   }
 
   pub(crate) fn focus(&mut self, id: u64) -> Result<bool, String> {
-    self.show(id)?;
-    if self.focused_drawer == Some(id) {
-      return Ok(false);
+    if self.focused_element != Some(id) && self.focused_element_captures_input() {
+      return Err("hide the active Modal or Popover before focusing another element".to_owned());
     }
-    self.focused_drawer = Some(id);
+    if matches!(self.element(id)?.element_type, UiElementType::Toast { .. }) {
+      return Err("Toast elements cannot receive focus".to_owned());
+    }
+    let was_focused = self.focused_element == Some(id);
+    let shown = self.show(id)?;
+    if was_focused || self.focused_element == Some(id) {
+      return Ok(shown);
+    }
+    self.focused_element = Some(id);
     Ok(true)
   }
 
   pub(crate) fn blur(&mut self, id: u64) -> Result<bool, String> {
-    self.drawer(id)?;
-    if self.focused_drawer != Some(id) {
+    let element = self.element(id)?;
+    if element.visible && element.element_type.captures_input() {
+      return Err("Modal and Popover elements must be hidden rather than blurred".to_owned());
+    }
+    if self.focused_element != Some(id) {
       return Ok(false);
     }
-    self.focused_drawer = None;
+    self.focused_element = None;
     Ok(true)
   }
 
-  pub(crate) fn focused_drawer(&self) -> Option<u64> { self.focused_drawer }
+  pub(crate) fn focused_element(&self) -> Option<u64> { self.focused_element }
 
-  pub(crate) fn blur_focused(&mut self) -> bool { self.focused_drawer.take().is_some() }
-
-  fn drawer(&self, id: u64) -> Result<&UiDrawer, String> {
+  pub(crate) fn focused_element_captures_input(&self) -> bool {
     self
-      .drawers
-      .iter()
-      .find(|drawer| drawer.id == id)
-      .ok_or_else(|| "Drawer handle is no longer valid".to_owned())
+      .focused_element
+      .and_then(|id| self.element(id).ok())
+      .is_some_and(|element| element.element_type.captures_input())
   }
 
-  fn drawer_mut(&mut self, id: u64) -> Result<&mut UiDrawer, String> {
+  pub(crate) fn blur_focused(&mut self) -> bool { self.focused_element.take().is_some() }
+
+  pub(crate) fn dismiss_focused_element(&mut self) -> bool {
     self
-      .drawers
-      .iter_mut()
-      .find(|drawer| drawer.id == id)
-      .ok_or_else(|| "Drawer handle is no longer valid".to_owned())
+      .focused_element
+      .and_then(|id| self.hide(id).ok())
+      .unwrap_or(false)
+  }
+
+  pub(crate) fn expire_toasts(&mut self, now: std::time::Instant) -> bool {
+    let mut expired = false;
+    for element in &mut self.elements {
+      if element.visible
+        && element
+          .toast_deadline
+          .is_some_and(|deadline| now >= deadline)
+      {
+        element.visible = false;
+        element.toast_deadline = None;
+        if self.focused_element == Some(element.id) {
+          self.focused_element = None;
+        }
+        expired = true;
+      }
+    }
+    if expired {
+      self.layout_dirty = true;
+    }
+    expired
+  }
+
+  fn element(&self, id: u64) -> Result<&UiElement, String> {
+    self
+      .elements
+      .iter()
+      .find(|element| element.id == id)
+      .ok_or_else(|| "UI element handle is no longer valid".to_owned())
+  }
+
+  fn element_mut(&mut self, id: u64) -> Option<&mut UiElement> {
+    self.elements.iter_mut().find(|element| element.id == id)
   }
 
   fn intrinsic_size(&mut self, id: u64) -> Result<IntrinsicSize, String> {
@@ -593,85 +791,155 @@ impl UiTree {
     if self.layout_dirty || self.layout_area != Some(area) {
       self.rebuild_layout(area);
     }
-    for drawer in &self.drawers {
-      if !drawer.visible {
+    for element in &self.elements {
+      if !element.visible {
         continue;
       }
-      let Some(drawer_area) = self.drawer_rects.get(&drawer.id).copied() else {
+      let Some(element_area) = self.element_rects.get(&element.id).copied() else {
         continue;
       };
-      if drawer_area.is_empty() {
+      if element_area.is_empty() {
         continue;
       }
-      Clear.render(drawer_area, buffer);
+      if matches!(element.element_type, UiElementType::Modal { .. }) {
+        for y in area.y..area.y.saturating_add(area.height) {
+          for x in area.x..area.x.saturating_add(area.width) {
+            let style = buffer[(x, y)]
+              .style()
+              .add_modifier(ratatui::style::Modifier::DIM);
+            buffer[(x, y)].set_style(style);
+          }
+        }
+      }
+      Clear.render(element_area, buffer);
       let block = Block::default()
-        .borders(drawer.border.borders())
-        .border_type(drawer.border.ratatui_type())
-        .border_style(drawer.border_style)
-        .title(drawer.title.as_str());
-      let content_area = block.inner(drawer_area);
-      block.render(drawer_area, buffer);
-      self.render_node(drawer.content_id, content_area, buffer);
+        .borders(element.border.borders())
+        .border_type(element.border.ratatui_type())
+        .border_style(element.border_style)
+        .title(element.title.as_str());
+      let content_area = self
+        .node_rects
+        .get(&element.content_id)
+        .copied()
+        .unwrap_or_else(|| block.inner(element_area));
+      block.render(element_area, buffer);
+      self.render_node(element.content_id, content_area, buffer);
     }
   }
 
   fn rebuild_layout(&mut self, area: Rect) {
-    self.drawer_rects.clear();
+    self.element_rects.clear();
     self.node_rects.clear();
     let mut left_offset = 0_u16;
     let mut right_offset = 0_u16;
-    let visible: Vec<(u64, DrawerSide, DrawerWidth, u64, DrawerBorder, String)> = self
-      .drawers
+    let visible: Vec<_> = self
+      .elements
       .iter()
-      .filter(|drawer| drawer.visible)
-      .map(|drawer| {
+      .filter(|element| element.visible)
+      .map(|element| {
         (
-          drawer.id,
-          drawer.side,
-          drawer.width,
-          drawer.content_id,
-          drawer.border,
-          drawer.title.clone(),
+          element.id,
+          element.element_type,
+          element.content_id,
+          element.border,
+          element.title.clone(),
         )
       })
       .collect();
 
-    for (id, side, width, content_id, border, title) in visible {
+    for (id, element_type, content_id, border, title) in visible {
       let intrinsic = self.intrinsic_size(content_id).unwrap_or_default();
-      let border_width = border.horizontal_inset();
-      let desired = match width {
-        DrawerWidth::Auto => intrinsic
-          .width
-          .max(UnicodeWidthStr::width(title.as_str()).min(usize::from(u16::MAX)) as u16)
-          .saturating_add(border_width),
-        DrawerWidth::Fixed(width) => width,
+      let border_x = border.horizontal_inset();
+      let border_y = border.horizontal_inset();
+      let title_width = UnicodeWidthStr::width(title.as_str()).min(usize::from(u16::MAX)) as u16;
+      let auto_width = intrinsic.width.max(title_width).saturating_add(border_x);
+      let auto_height = intrinsic.height.saturating_add(border_y);
+      let element_area = match element_type {
+        UiElementType::Drawer { side, width } => {
+          let desired = match width {
+            UiSize::Auto => auto_width,
+            UiSize::Fixed(width) => width,
+          };
+          let available = area
+            .width
+            .saturating_sub(left_offset.saturating_add(right_offset));
+          let offset = match side {
+            DrawerSide::Left => left_offset,
+            DrawerSide::Right => right_offset,
+          };
+          let width = desired.min(available);
+          let x = match side {
+            DrawerSide::Left => area.x.saturating_add(offset),
+            DrawerSide::Right => area
+              .x
+              .saturating_add(area.width.saturating_sub(offset).saturating_sub(width)),
+          };
+          match side {
+            DrawerSide::Left => left_offset = left_offset.saturating_add(width),
+            DrawerSide::Right => right_offset = right_offset.saturating_add(width),
+          }
+          Rect::new(x, area.y, width, area.height)
+        }
+        UiElementType::Modal { width, height } => {
+          let width = resolve_size(width, auto_width, area.width);
+          let height = resolve_size(height, auto_height, area.height);
+          Rect::new(
+            area.x.saturating_add(area.width.saturating_sub(width) / 2),
+            area
+              .y
+              .saturating_add(area.height.saturating_sub(height) / 2),
+            width,
+            height,
+          )
+        }
+        UiElementType::Popover {
+          x,
+          y,
+          width,
+          height,
+        } => {
+          let width = resolve_size(width, auto_width, area.width);
+          let height = resolve_size(height, auto_height, area.height);
+          let x = x.min(area.width.saturating_sub(width));
+          let y = y.min(area.height.saturating_sub(height));
+          Rect::new(area.x.saturating_add(x), area.y.saturating_add(y), width, height)
+        }
+        UiElementType::BottomPanel { height } => {
+          let height = resolve_size(height, auto_height, area.height);
+          Rect::new(
+            area.x,
+            area.y.saturating_add(area.height.saturating_sub(height)),
+            area.width,
+            height,
+          )
+        }
+        UiElementType::Toast { position, .. } => {
+          let width = auto_width.min(area.width);
+          let height = auto_height.min(area.height);
+          let x = match position {
+            ToastPosition::TopRight | ToastPosition::BottomRight => {
+              area.x.saturating_add(area.width.saturating_sub(width))
+            }
+            ToastPosition::TopCenter | ToastPosition::BottomCenter => {
+              area.x.saturating_add(area.width.saturating_sub(width) / 2)
+            }
+          };
+          let y = match position {
+            ToastPosition::TopRight | ToastPosition::TopCenter => area.y,
+            ToastPosition::BottomRight | ToastPosition::BottomCenter => {
+              area.y.saturating_add(area.height.saturating_sub(height))
+            }
+          };
+          Rect::new(x, y, width, height)
+        }
       };
-      let available = area
-        .width
-        .saturating_sub(left_offset.saturating_add(right_offset));
-      let offset = match side {
-        DrawerSide::Left => left_offset,
-        DrawerSide::Right => right_offset,
-      };
-      let width = desired.min(available);
-      let x = match side {
-        DrawerSide::Left => area.x.saturating_add(offset),
-        DrawerSide::Right => area
-          .x
-          .saturating_add(area.width.saturating_sub(offset).saturating_sub(width)),
-      };
-      let drawer_area = Rect::new(x, area.y, width, area.height);
-      match side {
-        DrawerSide::Left => left_offset = left_offset.saturating_add(width),
-        DrawerSide::Right => right_offset = right_offset.saturating_add(width),
-      }
-      self.drawer_rects.insert(id, drawer_area);
-      let inner = if border == DrawerBorder::None {
-        drawer_area
+      self.element_rects.insert(id, element_area);
+      let content_area = if border == DrawerBorder::None {
+        element_area
       } else {
-        Block::default().borders(Borders::ALL).inner(drawer_area)
+        Block::default().borders(Borders::ALL).inner(element_area)
       };
-      self.layout_node(content_id, inner);
+      self.layout_node(content_id, content_area);
     }
     self.layout_area = Some(area);
     self.layout_dirty = false;
@@ -735,12 +1003,22 @@ impl UiTree {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum DrawerValue {
+pub(crate) enum UiElementValue {
   Side(DrawerSide),
-  Width(DrawerWidth),
+  Size(UiSize),
+  Coordinate(u16),
+  Position(ToastPosition),
+  Duration(std::time::Duration),
   Title(String),
   Border(DrawerBorder),
   Style(Style),
+}
+
+fn resolve_size(size: UiSize, intrinsic: u16, available: u16) -> u16 {
+  match size {
+    UiSize::Auto => intrinsic.min(available),
+    UiSize::Fixed(size) => size.min(available),
+  }
 }
 
 fn measure_text(text: &str) -> IntrinsicSize {

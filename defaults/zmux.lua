@@ -1,5 +1,6 @@
--- User configuration. LuaLS types come from lua/zmux.lua.
+-- Built-in configuration. LuaLS types come from lua/zmux.lua.
 --
+opt.config_version = 1
 -- The cursor shape used while the PTY is focused: "block", "underline", or
 -- "bar".
 opt.cursor_shape = "block"
