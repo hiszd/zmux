@@ -55,6 +55,7 @@ enum Command {
   List {
     attach: bool,
   },
+  WorkspaceList(String),
   Kill(String),
   ServerStop,
   ServerStatus,
@@ -191,6 +192,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
       require_session: true,
       working_directory: std::env::current_dir()?,
     }),
+    Command::WorkspaceList(session_name) => {
+      let workspaces = headless::list_workspaces(&endpoint, session_name)?;
+      if workspaces.is_empty() {
+        println!("no workspaces");
+      } else {
+        println!("ACTIVE  WORKSPACE             WORKING DIRECTORY");
+        for workspace in workspaces {
+          println!(
+            "{:<6} {:<21} {}",
+            if workspace.active { "*" } else { "" },
+            workspace.name,
+            workspace.working_directory.display()
+          );
+        }
+      }
+      Ok(())
+    }
     Command::Run {
       source,
       path,
@@ -410,6 +428,39 @@ fn parse_args(mut arguments: impl Iterator<Item = String>) -> Result<CliOptions,
       }
       Command::List { attach }
     }
+    "workspace" => {
+      let subcommand = arguments
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "workspace requires list"))?;
+      match subcommand.as_str() {
+        "list" => {
+          let session = arguments.next().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "workspace list requires a session name")
+          })?;
+          let session = parse_session_name(&session)?;
+          while let Some(argument) = arguments.next() {
+            match argument.as_str() {
+              "--socket" => {
+                socket_instance = arguments.next().ok_or_else(|| {
+                  io::Error::new(io::ErrorKind::InvalidInput, "--socket requires a name")
+                })?;
+              }
+              "--help" | "-h" => {
+                print_help();
+                std::process::exit(0);
+              }
+              other => return Err(invalid_argument(other)),
+            }
+          }
+          Command::WorkspaceList(session)
+        }
+        "--help" | "-h" => {
+          print_help();
+          std::process::exit(0);
+        }
+        other => return Err(invalid_argument(other)),
+      }
+    }
     "kill" => {
       let value = arguments.next().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "kill requires a session name")
@@ -476,6 +527,7 @@ fn print_help() {
   println!("  zmux new [SESSION] [--strict] [--path PATH] [--socket NAME]");
   println!("  zmux attach SESSION [--socket NAME]");
   println!("  zmux list [--attach | -a] [--socket NAME]");
+  println!("  zmux workspace list SESSION [--socket NAME]");
   println!("  zmux kill SESSION [--socket NAME]");
   println!("  zmux server stop [--socket NAME]");
   println!("  zmux server status [--socket NAME]");
@@ -508,6 +560,7 @@ fn run_admin_command(
     Command::ServerStatus => AdminRequest::Status,
     Command::New { .. }
     | Command::Attach(_)
+    | Command::WorkspaceList(_)
     | Command::Run { .. }
     | Command::Keybinds { .. }
     | Command::Config(_) => unreachable!(),
@@ -988,6 +1041,21 @@ mod tests {
     assert!(
       matches!(&options.command, Command::New { path: Some(path), .. } if path == std::path::Path::new("/work/project"))
     );
+  }
+
+  // Developer approved: do not remove.
+  #[test]
+  fn workspace_list_accepts_session_and_socket_options() {
+    let options = parse_args(
+      ["workspace", "list", "project", "--socket", "named"]
+        .map(str::to_owned)
+        .into_iter(),
+    )
+    .expect("valid workspace list command");
+
+    assert!(matches!(options.command, Command::WorkspaceList(ref session) if session == "project"));
+    assert_eq!(options.socket_instance, "named");
+    assert!(parse_args(["workspace", "list"].map(str::to_owned).into_iter()).is_err());
   }
 
   // Developer approved: do not remove.

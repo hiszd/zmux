@@ -39,6 +39,42 @@ pub enum ScriptInput {
   Source(String),
 }
 
+pub fn list_workspaces(
+  endpoint: &Endpoint,
+  session_id: String,
+) -> Result<Vec<HeadlessWorkspace>, Box<dyn std::error::Error>> {
+  let mut stream = transport::connect(endpoint)?;
+  write_frame(
+    &mut stream,
+    &ClientMessage::HeadlessHello(HeadlessHello {
+      protocol_version: PROTOCOL_VERSION,
+      working_directory: std::env::current_dir()?,
+      shell: std::env::var_os("SHELL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/bin/sh")),
+      environment: std::env::vars().collect(),
+    }),
+  )?;
+  write_frame(&mut stream, &ClientMessage::HeadlessRequest {
+    id: 1,
+    request: HeadlessRequest::WorkspaceList {
+      session_id: Some(session_id),
+    },
+  })?;
+  let response: ServerMessage = read_frame(&mut stream)?;
+  match response {
+    ServerMessage::HeadlessReply {
+      id: 1,
+      result: Ok(HeadlessResult::Workspaces(workspaces)),
+    } => Ok(workspaces),
+    ServerMessage::HeadlessReply {
+      id: 1,
+      result: Err(error),
+    } => Err(io::Error::other(error).into()),
+    other => Err(format!("unexpected server response: {other:?}").into()),
+  }
+}
+
 struct Pending {
   request: HeadlessRequest,
   callback: Option<Function>,
