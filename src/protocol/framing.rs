@@ -252,6 +252,7 @@ pub enum ServerMessage {
   },
   StateChanged {
     session: SessionSnapshot,
+    /// Terminal snapshots to update; empty for selection-only state changes.
     terminals: Vec<TerminalSnapshot>,
   },
   TerminalOutput {

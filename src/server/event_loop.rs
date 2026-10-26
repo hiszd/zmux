@@ -20,7 +20,10 @@ use std::{
     },
   },
   thread,
-  time::Duration,
+  time::{
+    Duration,
+    Instant,
+  },
 };
 
 use interprocess::local_socket::prelude::*;
@@ -591,6 +594,16 @@ impl ServerState {
       return Ok(());
     };
     let session_name = connection.session_name.clone();
+    let request_label = match &request {
+      ClientRequest::PreviousTab => "previous-tab",
+      ClientRequest::NextTab => "next-tab",
+      ClientRequest::SelectTab(_) => "select-tab",
+      _ => "other",
+    };
+    let request_started = Instant::now();
+    self.trace.mark(&format!(
+      "server-request-start client_id={client_id} request_id={request_id} type={request_label}"
+    ));
     let mut detach = false;
     let result = match request {
       ClientRequest::Input(bytes) => self.send_input(&session_name, &bytes),
@@ -650,6 +663,14 @@ impl ServerState {
         result: result.clone(),
       });
     }
+    self.trace.duration(
+      "server-request-complete",
+      request_started.elapsed(),
+      &format!(
+        "client_id={client_id} request_id={request_id} type={request_label} result={}",
+        if result.is_ok() { "ok" } else { "error" }
+      ),
+    );
     if detach {
       if let Some(connection) = self.clients.get(&client_id) {
         let _ = connection.sender.send(ServerMessage::Detached);
@@ -727,13 +748,17 @@ impl ServerState {
       .session(number)
       .and_then(|session| session.model.active_tab())
       .ok_or_else(|| "Session has no active Tab".to_owned())?;
+    self.close_tab(number, tab_id)
+  }
+
+  fn close_tab(&mut self, number: &str, tab_id: TabId) -> Result<(), String> {
     let outcome = self
       .session_mut(number)
       .ok_or_else(|| "Session no longer exists".to_owned())?
       .model
       .close_tab(tab_id);
     if matches!(outcome, SessionTabCloseOutcome::NotFound) {
-      return Err("active Tab was not found in its Session".to_owned());
+      return Err("Tab was not found in its Session".to_owned());
     }
     if let Some(session) = self.session_mut(number) {
       session.tabs.remove(&tab_id);
@@ -789,7 +814,7 @@ impl ServerState {
       .ok_or_else(|| "Session no longer exists".to_owned())?
       .model
       .select_tab(tab_id);
-    self.broadcast_state(number)
+    self.broadcast_selection_state(number)
   }
 
   fn create_workspace(
@@ -887,7 +912,7 @@ impl ServerState {
     {
       return Err("Workspace does not exist or is already active".to_owned());
     }
-    self.broadcast_state(number)
+    self.broadcast_selection_state(number)
   }
 
   fn close_active_workspace(&mut self, number: &str) -> Result<(), String> {
@@ -1092,25 +1117,32 @@ impl ServerState {
 
   fn poll_processes(&mut self) -> Result<(), Box<dyn std::error::Error>> {
     let mut changed_sessions = HashSet::new();
+    let mut closed_tabs = Vec::new();
     for session in &mut self.sessions {
+      let number = session.model.name().get().to_owned();
       for tab in session.tabs.values_mut() {
         if !tab.explicit_title
           && let Some(process_name) = tab.pane.foreground_process_name()
           && tab.title != process_name
         {
           tab.title = process_name;
-          changed_sessions.insert(session.model.name().get().to_owned());
+          changed_sessions.insert(number.clone());
         }
-        if tab.exit_code.is_none()
-          && let Some(exit_code) = tab.pane.poll_exit()?
-        {
+        if let Some(exit_code) = tab.pane.poll_exit()? {
           tab.exit_code = Some(exit_code);
-          changed_sessions.insert(session.model.name().get().to_owned());
+          closed_tabs.push((number.clone(), tab.id));
         }
       }
     }
+    for (number, tab_id) in closed_tabs {
+      if self.session(&number).is_some() {
+        self.close_tab(&number, tab_id).map_err(io::Error::other)?;
+      }
+    }
     for number in changed_sessions {
-      self.broadcast_state(&number).map_err(io::Error::other)?;
+      if self.session(&number).is_some() {
+        self.broadcast_state(&number).map_err(io::Error::other)?;
+      }
     }
     Ok(())
   }
@@ -1148,8 +1180,21 @@ impl ServerState {
     let session = self
       .session(number)
       .ok_or_else(|| "Session no longer exists".to_owned())?;
+    let snapshot_started = Instant::now();
     let state = session.snapshot();
+    let state_snapshot_duration = snapshot_started.elapsed();
+    let terminal_snapshot_started = Instant::now();
     let terminals = session.terminal_snapshots();
+    self.trace.duration(
+      "server-state-snapshots",
+      snapshot_started.elapsed(),
+      &format!(
+        "state={state_snapshot_duration:?} terminals={:?} terminal_count={}",
+        terminal_snapshot_started.elapsed(),
+        terminals.len()
+      ),
+    );
+    let broadcast_started = Instant::now();
     for client_id in &session.clients {
       if let Some(client) = self.clients.get(client_id) {
         let _ = client.sender.send(ServerMessage::StateChanged {
@@ -1158,6 +1203,39 @@ impl ServerState {
         });
       }
     }
+    self.trace.duration(
+      "server-state-broadcast-queued",
+      broadcast_started.elapsed(),
+      &format!("clients={} terminals={}", session.clients.len(), terminals.len()),
+    );
+    Ok(())
+  }
+
+  fn broadcast_selection_state(&self, number: &str) -> Result<(), String> {
+    let session = self
+      .session(number)
+      .ok_or_else(|| "Session no longer exists".to_owned())?;
+    let snapshot_started = Instant::now();
+    let state = session.snapshot();
+    self.trace.duration(
+      "server-selection-state-snapshot",
+      snapshot_started.elapsed(),
+      &format!("workspaces={}", state.workspaces.len()),
+    );
+    let broadcast_started = Instant::now();
+    for client_id in &session.clients {
+      if let Some(client) = self.clients.get(client_id) {
+        let _ = client.sender.send(ServerMessage::StateChanged {
+          session: state.clone(),
+          terminals: Vec::new(),
+        });
+      }
+    }
+    self.trace.duration(
+      "server-selection-state-broadcast-queued",
+      broadcast_started.elapsed(),
+      &format!("clients={}", session.clients.len()),
+    );
     Ok(())
   }
 
@@ -1505,6 +1583,83 @@ mod tests {
         break;
       }
     }
+  }
+
+  #[test]
+  fn underscore_input_is_written_to_the_shell_pty_unchanged() {
+    let endpoint = Endpoint::new(Some(&format!("underscore-pty-test-{}", std::process::id())))
+      .expect("test endpoint");
+    let server_endpoint = endpoint.clone();
+    let server = thread::spawn(move || run(server_endpoint).expect("server loop"));
+    let (mut client, state, _) = connect_test_client(&endpoint, None, Viewport {
+      rows: 24,
+      columns: 80,
+    });
+    let tab_id = state.workspaces[0].tabs[0].id;
+
+    write_frame(&mut client, &ClientMessage::Request {
+      id: 1,
+      request: ClientRequest::Input(b"printf '__ZMUX_UNDERSCORE_42__\\n'\r".to_vec()),
+    })
+    .expect("send underscore input through the Server to the PTY");
+    read_until_terminal_output(&mut client, tab_id, "__ZMUX_UNDERSCORE_42__");
+
+    write_frame(&mut client, &ClientMessage::Request {
+      id: 2,
+      request: ClientRequest::StopServer,
+    })
+    .expect("stop Server");
+    assert_server_stopping(&mut client);
+    drop(client);
+    server.join().expect("Server stops cleanly");
+  }
+
+  #[test]
+  fn tab_selection_broadcasts_state_without_terminal_snapshots() {
+    let endpoint = Endpoint::new(Some(&format!("selection-state-test-{}", std::process::id())))
+      .expect("test endpoint");
+    let server_endpoint = endpoint.clone();
+    let server = thread::spawn(move || run(server_endpoint).expect("server loop"));
+    let (mut client, _, _) = connect_test_client(&endpoint, None, Viewport {
+      rows: 24,
+      columns: 80,
+    });
+
+    write_frame(&mut client, &ClientMessage::Request {
+      id: 1,
+      request: ClientRequest::NewTab,
+    })
+    .expect("create second Tab");
+    let state = read_state_with_active_tab_count(&mut client, 2);
+    let previous_tab = state.workspaces[0].tabs[0].id;
+
+    write_frame(&mut client, &ClientMessage::Request {
+      id: 2,
+      request: ClientRequest::PreviousTab,
+    })
+    .expect("select previous Tab");
+    let terminals = loop {
+      match read_frame::<_, ServerMessage>(&mut client).expect("read previous Tab update") {
+        ServerMessage::StateChanged { session, terminals } => {
+          assert_eq!(session.workspaces[0].active_tab_id, previous_tab);
+          break terminals;
+        }
+        ServerMessage::TerminalOutput { .. }
+        | ServerMessage::TerminalChanged(_)
+        | ServerMessage::Reply { .. } => {}
+        message => panic!("unexpected Tab selection update: {message:?}"),
+      }
+    };
+    assert!(terminals.is_empty(), "tab selection must not resend terminal contents");
+
+    write_frame(&mut client, &ClientMessage::Request {
+      id: 3,
+      request: ClientRequest::StopServer,
+    })
+    .expect("stop Server");
+    assert_server_stopping(&mut client);
+    drop(client);
+    server.join().expect("Server stops cleanly");
   }
 
   // Developer approved: do not remove.
@@ -1871,6 +2026,64 @@ mod tests {
     server
       .join()
       .expect("Server exits after final Session closes");
+  }
+
+  // Developer approved: do not remove.
+  #[test]
+  fn shell_exit_closes_the_tab_and_final_session() {
+    let endpoint = Endpoint::new(Some(&format!("shell-exit-test-{}", std::process::id())))
+      .expect("test endpoint");
+    let server_endpoint = endpoint.clone();
+    let server = thread::spawn(move || run(server_endpoint).expect("server loop"));
+    let (mut client, initial_state, _) = connect_test_client(&endpoint, None, Viewport {
+      rows: 24,
+      columns: 80,
+    });
+    let initial_tab_id = initial_state.workspaces[0].tabs[0].id;
+
+    write_frame(&mut client, &ClientMessage::Request {
+      id: 1,
+      request: ClientRequest::NewTab,
+    })
+    .expect("create second Tab");
+    let state = read_state_with_active_tab_count(&mut client, 2);
+    let exited_tab_id = state
+      .workspaces
+      .iter()
+      .find(|workspace| workspace.id == state.active_workspace_id)
+      .expect("active Workspace")
+      .active_tab_id;
+
+    write_frame(&mut client, &ClientMessage::Request {
+      id: 2,
+      request: ClientRequest::Input(b"exit\r".to_vec()),
+    })
+    .expect("exit shell");
+    let state = read_state_with_active_tab_count(&mut client, 1);
+    let workspace = state
+      .workspaces
+      .iter()
+      .find(|workspace| workspace.id == state.active_workspace_id)
+      .expect("active Workspace");
+    assert_eq!(workspace.tabs[0].id, initial_tab_id);
+    assert_ne!(workspace.tabs[0].id, exited_tab_id);
+
+    write_frame(&mut client, &ClientMessage::Request {
+      id: 3,
+      request: ClientRequest::CloseTab,
+    })
+    .expect("close remaining Tab");
+    loop {
+      match read_frame::<_, ServerMessage>(&mut client).expect("read final Session closure") {
+        ServerMessage::SessionClosed => break,
+        ServerMessage::TerminalOutput { .. }
+        | ServerMessage::TerminalChanged(_)
+        | ServerMessage::Reply { .. } => {}
+        message => panic!("unexpected server update: {message:?}"),
+      }
+    }
+    drop(client);
+    server.join().expect("Server exits after final Tab closes");
   }
 
   // Developer approved: do not remove.
