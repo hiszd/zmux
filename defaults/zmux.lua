@@ -10,12 +10,18 @@ opt.default_shell = "/usr/bin/fish"
 opt.prefix_key = "<C-Space>"
 -- Time in milliseconds to wait for the next key in a sequence. Set to zero to
 -- keep waiting indefinitely.
-opt.sequence_timeout_ms = 8000
+opt.sequence_timeout_ms = 700
 
 -- UI anchors reserve rows at the top and bottom of the terminal. Each anchor
 -- accepts `height` (rows) and `visible` (boolean).
 opt.ui.anchors.top.height = 1
 opt.ui.anchors.bottom.height = 1
+-- Style the PTY border with any Ratatui preset, or set it to "none" to use
+-- the full panel for terminal cells. border_style accepts a ZmuxStyle table.
+opt.ui.pty.border = "plain"
+-- opt.ui.pty.border = "none"
+-- opt.ui.pty.border = "rounded"
+-- opt.ui.pty.border_style = { fg = "cyan", bold = true }
 -- The which-key popup can use at most this many columns. Its default is 7.
 opt.ui.which.maxcolumns = 7
 -- The which-key popup height can be a percentage string or a row count. The
@@ -144,7 +150,7 @@ cmd.key.bind("sw", function()
 	cmd.session.switch()
 end, { desc = "Switch active session" })
 
-cmd.key.bind("px", function()
+cmd.key.bind("<C-x>", function()
 	cmd.server.stop()
 end, { desc = "Stop the background process" })
 

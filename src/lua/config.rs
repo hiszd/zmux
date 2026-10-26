@@ -185,10 +185,17 @@ impl Default for WhichKeyOptions {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub struct PtyOptions {
+  pub border: DrawerBorder,
+  pub border_style: Style,
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct UiOptions {
   pub top: AnchorOptions,
   pub bottom: AnchorOptions,
   pub which: WhichKeyOptions,
+  pub pty: PtyOptions,
 }
 
 #[derive(Clone, Debug)]
@@ -556,10 +563,12 @@ impl LuaConfig {
     };
     let anchors = ui.get::<Option<Table>>("anchors")?;
     let which = ui.get::<Option<Table>>("which")?;
+    let pty = ui.get::<Option<Table>>("pty")?;
     Ok(UiOptions {
       top: read_anchor(anchors.as_ref(), "top")?,
       bottom: read_anchor(anchors.as_ref(), "bottom")?,
       which: read_which_key(which.as_ref())?,
+      pty: read_pty(pty.as_ref())?,
     })
   }
 
@@ -725,8 +734,34 @@ impl Default for UiOptions {
         max_columns: 7,
         max_height: WhichKeyHeight::Percent(55),
       },
+      pty: PtyOptions {
+        border: DrawerBorder::Plain,
+        border_style: Style::default(),
+      },
     }
   }
+}
+
+fn read_pty(pty: Option<&Table>) -> LuaResult<PtyOptions> {
+  let defaults = PtyOptions {
+    border: DrawerBorder::Plain,
+    border_style: Style::default(),
+  };
+  let Some(pty) = pty else {
+    return Ok(defaults);
+  };
+  let border = match pty.get::<Value>("border")? {
+    Value::Nil => defaults.border,
+    value => parse_drawer_border(value)?,
+  };
+  let border_style = pty
+    .get::<Value>("border_style")
+    .and_then(parse_style)?
+    .unwrap_or(defaults.border_style);
+  Ok(PtyOptions {
+    border,
+    border_style,
+  })
 }
 
 fn read_which_key(which: Option<&Table>) -> LuaResult<WhichKeyOptions> {
@@ -947,28 +982,50 @@ pub fn load_config_with_context(
     let handlers = Rc::clone(&handlers);
     let config_loading = Rc::clone(&config_loading);
     lua.create_function(
-      move |_, (name, callback, options): (String, Function, Option<Table>)| {
+      move |_, (events, callback, options): (Value, Function, Option<Table>)| {
         if !config_loading.get() {
           return Err(mlua::Error::external(
             "cmd.event.on is only available while loading configuration",
           ));
         }
-        if !valid_event_name(&name) {
-          return Err(mlua::Error::external(format!("unknown event: {name}")));
+        let names = match events {
+          Value::String(name) => vec![name.to_string_lossy()],
+          Value::Table(events) => events
+            .sequence_values::<Value>()
+            .map(|event| match event? {
+              Value::String(name) => Ok(name.to_string_lossy()),
+              _ => Err(mlua::Error::external("cmd.event.on event names must be strings")),
+            })
+            .collect::<LuaResult<Vec<_>>>()?,
+          other => {
+            return Err(mlua::Error::external(format!(
+              "cmd.event.on expects an event name or an array of event names, got {}",
+              other.type_name()
+            )));
+          }
+        };
+        for name in &names {
+          if !valid_event_name(name) {
+            return Err(mlua::Error::external(format!("unknown event: {name}")));
+          }
         }
         let interrupt = options
           .map(|options| options.get::<Option<bool>>("interrupt"))
           .transpose()?
           .flatten()
           .unwrap_or(false);
-        handlers
-          .borrow_mut()
-          .entry(name)
-          .or_default()
-          .push(RegisteredCallback {
-            function: callback,
+        let mut handlers = handlers.borrow_mut();
+        let mut registered_names = Vec::new();
+        for name in names {
+          if registered_names.contains(&name) {
+            continue;
+          }
+          registered_names.push(name.clone());
+          handlers.entry(name).or_default().push(RegisteredCallback {
+            function: callback.clone(),
             interrupt,
           });
+        }
         Ok(())
       },
     )?
@@ -1166,6 +1223,9 @@ pub fn load_config_with_context(
   which.set("maxcolumns", 7_u64)?;
   which.set("maxheight", "55%")?;
   ui.set("which", which)?;
+  let pty = lua.create_table()?;
+  pty.set("border", "plain")?;
+  ui.set("pty", pty)?;
   let bars = lua.create_table()?;
   for name in ["top", "bottom"] {
     bars.set(name, lua.create_table()?)?;
@@ -2083,13 +2143,38 @@ mod tests {
       .expect("run ClientLoaded handler");
   }
 
+  #[test]
+  fn event_handlers_can_listen_to_multiple_events() {
+    let config = load_config(
+      r#"
+        cmd.event.on({"session_created", "session_closed"}, function(event)
+          assert(event.name == "session_created" or event.name == "session_closed")
+        end, { interrupt = true })
+      "#,
+    )
+    .expect("multi-event handler config");
+
+    for name in ["session_created", "session_closed"] {
+      let handlers = config.lua.event_handlers(name);
+      assert_eq!(handlers.len(), 1);
+      assert!(handlers[0].interrupt);
+      config
+        .lua
+        .invoke_event_handler(&handlers[0], &AppEvent {
+          name: name.to_owned(),
+          ..AppEvent::default()
+        })
+        .expect("run multi-event handler");
+    }
+  }
+
   // Developer approved: do not remove.
   #[test]
   fn sample_configuration_loads_with_luajit() {
     let config = load_config(DEFAULT_CONFIG_SOURCE).expect("built-in Lua config");
     assert_eq!(config.config_api_version, Some(CONFIG_API_VERSION));
     assert_eq!(config.prefix_key, normalize_prefix_key("<C-Space>").expect("prefix"));
-    assert_eq!(config.sequence_timeout, Duration::from_secs(8));
+    assert_eq!(config.sequence_timeout, Duration::from_millis(700));
     config.lua.sync_state(&snapshot()).expect("sync UI state");
     let segments = config
       .lua
@@ -2185,6 +2270,34 @@ mod tests {
     .expect("which-key row configuration");
     let options = config.lua.sync_options().expect("UI options");
     assert_eq!(options.which.max_height.rows(100), 20);
+  }
+
+  #[test]
+  fn pty_border_options_accept_presets_styles_and_none() {
+    let config = load_config(
+      r#"
+        opt.ui.pty.border = "rounded"
+        opt.ui.pty.border_style = { fg = "cyan", bold = true }
+      "#,
+    )
+    .expect("PTY border configuration");
+    let options = config.lua.sync_options().expect("UI options");
+    assert_eq!(options.pty.border, DrawerBorder::Rounded);
+    assert_eq!(options.pty.border_style.fg, Some(Color::Cyan));
+    assert!(
+      options
+        .pty
+        .border_style
+        .add_modifier
+        .contains(Modifier::BOLD)
+    );
+
+    let config = load_config("opt.ui.pty.border = 'none'").expect("borderless PTY config");
+    let options = config.lua.sync_options().expect("UI options");
+    assert_eq!(options.pty.border, DrawerBorder::None);
+
+    let config = load_config("opt.ui.pty.border = 'zigzag'").expect("load invalid border value");
+    assert!(config.lua.sync_options().is_err());
   }
 
   // Developer approved: do not remove.

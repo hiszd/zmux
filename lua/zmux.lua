@@ -87,7 +87,7 @@
 ---@field interrupt? boolean For PreClient, wait for built-in interactive work requested by this handler before continuing startup.
 
 ---@class ZmuxEventApi
----@field on fun(name: ZmuxEventName, callback: fun(event: ZmuxEvent), opts?: ZmuxEventOptions) Register a callback for an application event.
+---@field on fun(name: ZmuxEventName|ZmuxEventName[], callback: fun(event: ZmuxEvent), opts?: ZmuxEventOptions) Register a callback for one or more application events.
 
 ---@alias ZmuxPickerItem string|{label?: string, text?: string, value?: any}
 
@@ -278,10 +278,15 @@
 ---@field maxcolumns? integer Maximum number of which-key columns. Defaults to 7.
 ---@field maxheight? integer|string Maximum dialog height in rows or as a percentage string, clamped to 60% of the screen. Defaults to "55%".
 
+---@class ZmuxPtyOptions
+---@field border? ZmuxDrawerBorder Border preset around the PTY; defaults to "plain". Use "none" to disable it.
+---@field border_style? ZmuxStyle Border color and modifiers.
+
 ---@class ZmuxUIOptions
 ---@field anchors? ZmuxAnchors
 ---@field bars? ZmuxBars
 ---@field which? ZmuxWhichOptions
+---@field pty? ZmuxPtyOptions
 ---@field style? ZmuxDefaultStyleProvider Default style function, overridden by a segment's explicit style.
 
 ---@class ZmuxTerminalSizeOptions

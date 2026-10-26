@@ -310,7 +310,9 @@ pub fn layout(area: Rect, options: UiOptions) -> UiLayout {
   let bottom_anchor =
     Rect::new(area.x, area.y + top_height + panel_height, area.width, bottom_height);
   let pty = panel;
-  let pane = Block::default().borders(Borders::ALL).inner(pty);
+  let pane = Block::default()
+    .borders(options.pty.border.borders())
+    .inner(pty);
   UiLayout {
     top_anchor,
     bottom_anchor,
@@ -397,7 +399,9 @@ pub fn draw(frame: &mut Frame<'_>, view: &UiRender<'_>) -> mlua::Result<()> {
       draw_bar(buffer, layout.bottom_anchor, &bottom_contents);
     }
     Block::default()
-      .borders(Borders::ALL)
+      .borders(view.options.pty.border.borders())
+      .border_type(view.options.pty.border.ratatui_type())
+      .border_style(view.options.pty.border_style)
       .render(layout.pty, buffer);
     render_screen(buffer, layout.pane, screen);
     view.lua.render_ui_elements(layout.panel, buffer);
@@ -810,6 +814,20 @@ mod tests {
   fn drawer_overlays_do_not_reduce_the_pty_viewport() {
     let options = UiOptions::default();
     assert_eq!(pane_size(80, 24, options), (20, 78));
+  }
+
+  #[test]
+  fn disabling_the_pty_border_uses_the_full_panel_area() {
+    let options = UiOptions {
+      pty: crate::lua::PtyOptions {
+        border: crate::ui::DrawerBorder::None,
+        ..UiOptions::default().pty
+      },
+      ..UiOptions::default()
+    };
+    let parts = layout(Rect::new(0, 0, 80, 24), options);
+    assert_eq!((parts.pane.width, parts.pane.height), (80, 22));
+    assert_eq!(pane_size(80, 24, options), (22, 80));
   }
 
   // Developer approved: do not remove.

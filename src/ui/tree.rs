@@ -144,7 +144,7 @@ pub(crate) enum DrawerBorder {
 }
 
 impl DrawerBorder {
-  fn ratatui_type(self) -> BorderType {
+  pub(crate) fn ratatui_type(self) -> BorderType {
     match self {
       Self::None | Self::Plain => BorderType::Plain,
       Self::Rounded => BorderType::Rounded,
@@ -161,7 +161,7 @@ impl DrawerBorder {
     }
   }
 
-  fn borders(self) -> Borders {
+  pub(crate) fn borders(self) -> Borders {
     if self == Self::None {
       Borders::NONE
     } else {
