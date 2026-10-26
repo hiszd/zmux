@@ -266,6 +266,34 @@ fn shifted_character(character: char) -> char {
   }
 }
 
+fn normalized_character(event: CrosstermKeyEvent) -> Option<char> {
+  let KeyCode::Char(character) = event.code else {
+    return None;
+  };
+  Some(if event.modifiers.contains(KeyModifiers::SHIFT) {
+    shifted_character(character)
+  } else {
+    character
+  })
+}
+
+/// Returns the character a text field should insert for a key event.
+///
+/// Shift is applied consistently with PTY encoding. Control, Alt, and
+/// platform-specific modifiers are commands rather than text input.
+pub fn text_character(event: CrosstermKeyEvent) -> Option<char> {
+  if event.modifiers.intersects(
+    KeyModifiers::CONTROL
+      | KeyModifiers::ALT
+      | KeyModifiers::SUPER
+      | KeyModifiers::HYPER
+      | KeyModifiers::META,
+  ) {
+    return None;
+  }
+  normalized_character(event)
+}
+
 // Xterm encodes Shift, Alt, and Control as 1 + 1, 2, and 4 respectively.
 fn modifier_parameter(modifiers: KeyModifiers) -> Option<u8> {
   let mut parameter = 1;
@@ -336,12 +364,8 @@ pub fn encode_key(event: CrosstermKeyEvent) -> Option<Vec<u8>> {
       }
       bytes
     }
-    (KeyCode::Char(character), modifiers) => {
-      let character = if modifiers.contains(KeyModifiers::SHIFT) {
-        shifted_character(character)
-      } else {
-        character
-      };
+    (KeyCode::Char(_), modifiers) => {
+      let character = normalized_character(event)?;
       let mut output = if modifiers.contains(KeyModifiers::CONTROL) {
         vec![control_character(character)?]
       } else {
@@ -415,8 +439,332 @@ pub fn encode_key(event: CrosstermKeyEvent) -> Option<Vec<u8>> {
 }
 
 #[cfg(test)]
+pub(crate) fn all_non_character_key_codes() -> Vec<KeyCode> {
+  use crossterm::event::{
+    MediaKeyCode,
+    ModifierKeyCode,
+  };
+
+  let mut codes = vec![
+    KeyCode::Backspace,
+    KeyCode::Enter,
+    KeyCode::Left,
+    KeyCode::Right,
+    KeyCode::Up,
+    KeyCode::Down,
+    KeyCode::Home,
+    KeyCode::End,
+    KeyCode::PageUp,
+    KeyCode::PageDown,
+    KeyCode::Tab,
+    KeyCode::BackTab,
+    KeyCode::Delete,
+    KeyCode::Insert,
+    KeyCode::Null,
+    KeyCode::Esc,
+    KeyCode::CapsLock,
+    KeyCode::ScrollLock,
+    KeyCode::NumLock,
+    KeyCode::PrintScreen,
+    KeyCode::Pause,
+    KeyCode::Menu,
+    KeyCode::KeypadBegin,
+    KeyCode::Media(MediaKeyCode::Play),
+    KeyCode::Media(MediaKeyCode::Pause),
+    KeyCode::Media(MediaKeyCode::PlayPause),
+    KeyCode::Media(MediaKeyCode::Reverse),
+    KeyCode::Media(MediaKeyCode::Stop),
+    KeyCode::Media(MediaKeyCode::FastForward),
+    KeyCode::Media(MediaKeyCode::Rewind),
+    KeyCode::Media(MediaKeyCode::TrackNext),
+    KeyCode::Media(MediaKeyCode::TrackPrevious),
+    KeyCode::Media(MediaKeyCode::Record),
+    KeyCode::Media(MediaKeyCode::LowerVolume),
+    KeyCode::Media(MediaKeyCode::RaiseVolume),
+    KeyCode::Media(MediaKeyCode::MuteVolume),
+    KeyCode::Modifier(ModifierKeyCode::LeftShift),
+    KeyCode::Modifier(ModifierKeyCode::LeftControl),
+    KeyCode::Modifier(ModifierKeyCode::LeftAlt),
+    KeyCode::Modifier(ModifierKeyCode::LeftSuper),
+    KeyCode::Modifier(ModifierKeyCode::LeftHyper),
+    KeyCode::Modifier(ModifierKeyCode::LeftMeta),
+    KeyCode::Modifier(ModifierKeyCode::RightShift),
+    KeyCode::Modifier(ModifierKeyCode::RightControl),
+    KeyCode::Modifier(ModifierKeyCode::RightAlt),
+    KeyCode::Modifier(ModifierKeyCode::RightSuper),
+    KeyCode::Modifier(ModifierKeyCode::RightHyper),
+    KeyCode::Modifier(ModifierKeyCode::RightMeta),
+    KeyCode::Modifier(ModifierKeyCode::IsoLevel3Shift),
+    KeyCode::Modifier(ModifierKeyCode::IsoLevel5Shift),
+  ];
+  codes.extend((0..=u8::MAX).map(KeyCode::F));
+  codes
+}
+
+#[cfg(test)]
 mod tests {
+  use crossterm::event::{
+    KeyEventKind,
+    KeyEventState,
+  };
+
   use super::*;
+
+  fn expected_shifted_ascii(character: char) -> char {
+    match character {
+      '`' => '~',
+      '1' => '!',
+      '2' => '@',
+      '3' => '#',
+      '4' => '$',
+      '5' => '%',
+      '6' => '^',
+      '7' => '&',
+      '8' => '*',
+      '9' => '(',
+      '0' => ')',
+      '-' => '_',
+      '=' => '+',
+      '[' => '{',
+      ']' => '}',
+      '\\' => '|',
+      ';' => ':',
+      '\'' => '"',
+      ',' => '<',
+      '.' => '>',
+      '/' => '?',
+      'a'..='z' => character.to_ascii_uppercase(),
+      _ => character,
+    }
+  }
+
+  fn expected_control_byte(character: char) -> Option<u8> {
+    let character = character.to_ascii_uppercase();
+    match character {
+      '?' => Some(0x7f),
+      ' '..='?' => Some(character as u8 - b' '),
+      '@'..='_' => Some(character as u8 - b'@'),
+      _ => None,
+    }
+  }
+
+  fn expected_modifier_parameter(modifiers: KeyModifiers) -> Option<u8> {
+    let parameter = 1
+      + u8::from(modifiers.contains(KeyModifiers::SHIFT))
+      + 2 * u8::from(modifiers.contains(KeyModifiers::ALT))
+      + 4 * u8::from(modifiers.contains(KeyModifiers::CONTROL));
+    (parameter != 1).then_some(parameter)
+  }
+
+  fn expected_modified_csi(final_character: char, modifiers: KeyModifiers) -> Vec<u8> {
+    match expected_modifier_parameter(modifiers) {
+      Some(parameter) => format!("\x1b[1;{parameter}{final_character}").into_bytes(),
+      None => format!("\x1b[{final_character}").into_bytes(),
+    }
+  }
+
+  fn expected_modified_tilde_csi(code: u8, modifiers: KeyModifiers) -> Vec<u8> {
+    match expected_modifier_parameter(modifiers) {
+      Some(parameter) => format!("\x1b[{code};{parameter}~").into_bytes(),
+      None => format!("\x1b[{code}~").into_bytes(),
+    }
+  }
+
+  fn expected_non_character_bytes(code: KeyCode, modifiers: KeyModifiers) -> Option<Vec<u8>> {
+    let alt_prefix = |mut bytes: Vec<u8>| {
+      if modifiers.contains(KeyModifiers::ALT) {
+        bytes.insert(0, 0x1b);
+      }
+      bytes
+    };
+    Some(match code {
+      KeyCode::Null => alt_prefix(vec![0]),
+      KeyCode::Enter => alt_prefix(vec![b'\r']),
+      KeyCode::Esc => alt_prefix(vec![0x1b]),
+      KeyCode::Backspace => alt_prefix(vec![if modifiers.contains(KeyModifiers::CONTROL) {
+        0x08
+      } else {
+        0x7f
+      }]),
+      KeyCode::Tab
+        if !modifiers
+          .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+      {
+        vec![b'\t']
+      }
+      KeyCode::Tab
+        if modifiers.contains(KeyModifiers::SHIFT)
+          && !modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+      {
+        b"\x1b[Z".to_vec()
+      }
+      KeyCode::Tab if modifiers.contains(KeyModifiers::SHIFT) => {
+        expected_modified_csi('Z', modifiers)
+      }
+      KeyCode::Tab => expected_modified_csi('I', modifiers),
+      KeyCode::BackTab if !modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) => {
+        b"\x1b[Z".to_vec()
+      }
+      KeyCode::BackTab => expected_modified_csi('Z', modifiers | KeyModifiers::SHIFT),
+      KeyCode::Left => expected_modified_csi('D', modifiers),
+      KeyCode::Right => expected_modified_csi('C', modifiers),
+      KeyCode::Up => expected_modified_csi('A', modifiers),
+      KeyCode::Down => expected_modified_csi('B', modifiers),
+      KeyCode::Home => expected_modified_csi('H', modifiers),
+      KeyCode::End => expected_modified_csi('F', modifiers),
+      KeyCode::Insert => expected_modified_tilde_csi(2, modifiers),
+      KeyCode::Delete => expected_modified_tilde_csi(3, modifiers),
+      KeyCode::PageUp => expected_modified_tilde_csi(5, modifiers),
+      KeyCode::PageDown => expected_modified_tilde_csi(6, modifiers),
+      KeyCode::F(number @ 1..=4) => {
+        let final_character = char::from(b'P' + number - 1);
+        match expected_modifier_parameter(modifiers) {
+          Some(_) => expected_modified_csi(final_character, modifiers),
+          None => format!("\x1bO{final_character}").into_bytes(),
+        }
+      }
+      KeyCode::F(number @ 5..=12) => {
+        let tilde_code = [15, 17, 18, 19, 20, 21, 23, 24][usize::from(number - 5)];
+        expected_modified_tilde_csi(tilde_code, modifiers)
+      }
+      _ => return None,
+    })
+  }
+
+  fn printable_modifiers() -> [KeyModifiers; 8] {
+    [
+      KeyModifiers::NONE,
+      KeyModifiers::SHIFT,
+      KeyModifiers::ALT,
+      KeyModifiers::SHIFT | KeyModifiers::ALT,
+      KeyModifiers::CONTROL,
+      KeyModifiers::SHIFT | KeyModifiers::CONTROL,
+      KeyModifiers::ALT | KeyModifiers::CONTROL,
+      KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL,
+    ]
+  }
+
+  #[test]
+  fn every_non_character_key_code_modifier_mask_kind_and_state_has_expected_bytes() {
+    let kinds = [KeyEventKind::Press, KeyEventKind::Repeat, KeyEventKind::Release];
+    for code in all_non_character_key_codes() {
+      for modifier_bits in 0..=KeyModifiers::all().bits() {
+        let modifiers = KeyModifiers::from_bits_retain(modifier_bits);
+        let expected = expected_non_character_bytes(code, modifiers);
+        for kind in kinds {
+          for state_bits in 0..=KeyEventState::all().bits() {
+            let event = CrosstermKeyEvent::new_with_kind_and_state(
+              code,
+              modifiers,
+              kind,
+              KeyEventState::from_bits_retain(state_bits),
+            );
+            assert_eq!(
+              encode_key(event),
+              expected,
+              "PTY bytes for {code:?}, {modifiers:?}, {kind:?}, state={state_bits:#05b}"
+            );
+          }
+        }
+      }
+    }
+  }
+
+  #[test]
+  fn every_printable_ascii_key_and_modifier_combination_has_the_expected_pty_bytes() {
+    for byte in 0x20..=0x7e {
+      let input = char::from(byte);
+      for modifiers in printable_modifiers() {
+        let shifted = if modifiers.contains(KeyModifiers::SHIFT) {
+          expected_shifted_ascii(input)
+        } else {
+          input
+        };
+        let mut expected = if modifiers.contains(KeyModifiers::CONTROL) {
+          expected_control_byte(shifted).map(|byte| vec![byte])
+        } else {
+          Some(shifted.to_string().into_bytes())
+        };
+        if modifiers.contains(KeyModifiers::ALT)
+          && let Some(bytes) = expected.as_mut()
+        {
+          bytes.insert(0, 0x1b);
+        }
+
+        let event = CrosstermKeyEvent::new(KeyCode::Char(input), modifiers);
+        assert_eq!(encode_key(event), expected, "PTY bytes for {input:?} with {modifiers:?}");
+      }
+    }
+  }
+
+  #[test]
+  fn every_unicode_scalar_and_supported_modifier_combination_has_the_expected_pty_bytes() {
+    for codepoint in 0..=0x10ffff {
+      let Some(input) = char::from_u32(codepoint) else {
+        continue;
+      };
+      for modifiers in printable_modifiers() {
+        let shifted = if modifiers.contains(KeyModifiers::SHIFT) {
+          expected_shifted_ascii(input)
+        } else {
+          input
+        };
+        let mut expected = if modifiers.contains(KeyModifiers::CONTROL) {
+          expected_control_byte(shifted).map(|byte| vec![byte])
+        } else {
+          Some(shifted.to_string().into_bytes())
+        };
+        if modifiers.contains(KeyModifiers::ALT)
+          && let Some(bytes) = expected.as_mut()
+        {
+          bytes.insert(0, 0x1b);
+        }
+
+        assert_eq!(
+          encode_key(CrosstermKeyEvent::new(KeyCode::Char(input), modifiers)),
+          expected,
+          "PTY bytes for U+{codepoint:04X} ({input:?}) with {modifiers:?}"
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn underscore_is_forwarded_for_both_shifted_key_event_representations() {
+    for (code, modifiers) in [
+      (KeyCode::Char('-'), KeyModifiers::SHIFT),
+      (KeyCode::Char('_'), KeyModifiers::NONE),
+      (KeyCode::Char('_'), KeyModifiers::SHIFT),
+    ] {
+      assert_eq!(
+        encode_key(CrosstermKeyEvent::new(code, modifiers)),
+        Some(b"_".to_vec()),
+        "underscore input represented as {code:?} with {modifiers:?}"
+      );
+    }
+  }
+
+  #[test]
+  fn text_character_normalizes_shift_and_rejects_non_text_modifiers() {
+    for (code, modifiers, expected) in [
+      (KeyCode::Char('-'), KeyModifiers::SHIFT, Some('_')),
+      (KeyCode::Char('_'), KeyModifiers::NONE, Some('_')),
+      (KeyCode::Char('_'), KeyModifiers::SHIFT, Some('_')),
+      (KeyCode::Char('a'), KeyModifiers::SHIFT, Some('A')),
+      (KeyCode::Char('é'), KeyModifiers::SHIFT, Some('é')),
+      (KeyCode::Char('x'), KeyModifiers::NONE, Some('x')),
+      (KeyCode::Char('x'), KeyModifiers::CONTROL, None),
+      (KeyCode::Char('x'), KeyModifiers::ALT, None),
+      (KeyCode::Char('x'), KeyModifiers::SUPER, None),
+      (KeyCode::Up, KeyModifiers::NONE, None),
+    ] {
+      assert_eq!(
+        text_character(CrosstermKeyEvent::new(code, modifiers)),
+        expected,
+        "text character for {code:?} with {modifiers:?}"
+      );
+    }
+  }
 
   // Developer approved: do not remove.
   #[test]

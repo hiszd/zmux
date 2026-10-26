@@ -234,6 +234,8 @@ impl KeyDispatcher {
 mod tests {
   use crossterm::event::{
     KeyCode,
+    KeyEventKind,
+    KeyEventState,
     KeyModifiers,
   };
   use mlua::Lua;
@@ -278,6 +280,138 @@ mod tests {
   }
 
   fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent { KeyEvent::new(code, modifiers) }
+
+  #[test]
+  fn dispatcher_routes_every_unicode_scalar_under_every_crossterm_modifier_mask() {
+    let mut dispatcher = KeyDispatcher::new(
+      normalize_prefix_key("<F12>").expect("prefix key"),
+      Duration::from_millis(700),
+      KeyMap::default(),
+    );
+    let now = Instant::now();
+    let unsupported_modifiers = KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META;
+
+    for codepoint in 0..=0x10ffff {
+      let Some(character) = char::from_u32(codepoint) else {
+        continue;
+      };
+      for modifier_bits in 0..=KeyModifiers::all().bits() {
+        let event = key(KeyCode::Char(character), KeyModifiers::from_bits_retain(modifier_bits));
+        let expected = if event.modifiers.intersects(unsupported_modifiers) {
+          None
+        } else {
+          crate::input::key_notation::encode_key(event)
+        };
+        let outcome = dispatcher.handle_event(event, now);
+        if let Some(expected) = expected {
+          let KeyOutcome::Forward(actual) = outcome else {
+            panic!("U+{codepoint:04X} with {:?} should be forwarded", event.modifiers);
+          };
+          assert_eq!(
+            actual, expected,
+            "forwarded bytes for U+{codepoint:04X} with {:?}",
+            event.modifiers
+          );
+        } else if !matches!(outcome, KeyOutcome::Ignored) {
+          panic!("U+{codepoint:04X} with {:?} should be ignored", event.modifiers);
+        }
+      }
+    }
+  }
+
+  #[test]
+  fn dispatcher_routes_every_non_character_key_mask_kind_and_state_correctly() {
+    let prefix = KeyStroke {
+      key: crate::input::key_notation::Key::Char(char::MAX),
+      ctrl: false,
+      alt: false,
+      shift: false,
+    };
+    let mut dispatcher = KeyDispatcher::new(prefix, Duration::ZERO, KeyMap::default());
+    let now = Instant::now();
+    let unsupported_modifiers = KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META;
+
+    for code in crate::input::key_notation::all_non_character_key_codes() {
+      for modifier_bits in 0..=KeyModifiers::all().bits() {
+        let modifiers = KeyModifiers::from_bits_retain(modifier_bits);
+        for kind in [KeyEventKind::Press, KeyEventKind::Repeat, KeyEventKind::Release] {
+          for state_bits in 0..=KeyEventState::all().bits() {
+            let event = KeyEvent::new_with_kind_and_state(
+              code,
+              modifiers,
+              kind,
+              KeyEventState::from_bits_retain(state_bits),
+            );
+            let expected =
+              if kind == KeyEventKind::Release || modifiers.intersects(unsupported_modifiers) {
+                None
+              } else {
+                crate::input::key_notation::encode_key(event)
+              };
+            let outcome = dispatcher.handle_event(event, now);
+            match (outcome, expected) {
+              (KeyOutcome::Forward(actual), Some(expected)) => assert_eq!(
+                actual, expected,
+                "PTY bytes for {code:?}, {modifiers:?}, {kind:?}, state={state_bits:#05b}"
+              ),
+              (KeyOutcome::Ignored, None) => {}
+              (KeyOutcome::Ignored, Some(_)) => {
+                panic!("{code:?}, {modifiers:?}, {kind:?}, state={state_bits:#05b} should forward")
+              }
+              (KeyOutcome::Forward(_), None) => panic!(
+                "{code:?}, {modifiers:?}, {kind:?}, state={state_bits:#05b} should be ignored"
+              ),
+              _ => panic!(
+                "{code:?}, {modifiers:?}, {kind:?}, state={state_bits:#05b} entered leader mode"
+              ),
+            }
+          }
+        }
+      }
+    }
+  }
+
+  #[test]
+  fn character_event_kinds_and_keyboard_states_do_not_change_routing() {
+    let mut dispatcher = KeyDispatcher::new(
+      normalize_prefix_key("<F12>").expect("prefix key"),
+      Duration::from_millis(700),
+      KeyMap::default(),
+    );
+    let now = Instant::now();
+    let unsupported_modifiers = KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META;
+    for character in ['_', ' ', '\0', 'é', '界', '🦀', char::MAX] {
+      for modifier_bits in 0..=KeyModifiers::all().bits() {
+        let modifiers = KeyModifiers::from_bits_retain(modifier_bits);
+        for kind in [KeyEventKind::Press, KeyEventKind::Repeat, KeyEventKind::Release] {
+          for state_bits in 0..=KeyEventState::all().bits() {
+            let event = KeyEvent::new_with_kind_and_state(
+              KeyCode::Char(character),
+              modifiers,
+              kind,
+              KeyEventState::from_bits_retain(state_bits),
+            );
+            let expected =
+              if kind == KeyEventKind::Release || modifiers.intersects(unsupported_modifiers) {
+                None
+              } else {
+                crate::input::key_notation::encode_key(event)
+              };
+            let outcome = dispatcher.handle_event(event, now);
+            match (outcome, expected) {
+              (KeyOutcome::Forward(actual), Some(expected)) => assert_eq!(actual, expected),
+              (KeyOutcome::Ignored, None) => {}
+              (KeyOutcome::Ignored, Some(_)) => {
+                panic!("{event:?} should be forwarded")
+              }
+              (KeyOutcome::Forward(_), None) => panic!("{event:?} should be ignored"),
+              _ => panic!("{event:?} entered leader mode"),
+            }
+          }
+        }
+      }
+    }
+  }
 
   fn press_prefix(dispatcher: &mut KeyDispatcher, now: Instant) {
     assert!(matches!(
@@ -702,6 +836,21 @@ mod tests {
     };
     callback.call::<()>(()).expect("invoke longer mapping");
     assert_eq!(lua.globals().get::<String>("called").expect("callback ran"), "long");
+  }
+
+  #[test]
+  fn default_previous_tab_binding_executes_without_waiting_for_a_longer_binding() {
+    let config =
+      crate::lua::load_config(crate::lua::DEFAULT_CONFIG_SOURCE).expect("default config");
+    let mut dispatcher =
+      KeyDispatcher::new(config.prefix_key, config.sequence_timeout, config.keymap);
+    let now = Instant::now();
+    press_prefix(&mut dispatcher, now);
+
+    assert!(matches!(
+      dispatcher.handle_event(key(KeyCode::Char('p'), KeyModifiers::NONE), now),
+      KeyOutcome::Execute(_)
+    ));
   }
 
   // Developer approved: do not remove.

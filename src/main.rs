@@ -140,10 +140,18 @@ fn default_config_path() -> Option<PathBuf> {
 }
 
 fn main() {
+  let trace_guard = match Trace::init_from_environment() {
+    Ok(guard) => guard,
+    Err(error) => {
+      eprintln!("Could not initialize trace log: {error}");
+      None
+    }
+  };
   let trace = Trace::from_environment();
   if let Err(error) = run() {
     trace.error("application", error.as_ref());
     eprintln!("Error: {error}");
+    drop(trace_guard);
     std::process::exit(1);
   }
 }

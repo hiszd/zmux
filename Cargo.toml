@@ -19,6 +19,9 @@ libc = "0.2"
 unicode-segmentation = "1"
 unicode-width = "0.2"
 widestring = "1.2"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
 
 [dev-dependencies]
 bincode_v1 = { package = "bincode", version = "1.3" }

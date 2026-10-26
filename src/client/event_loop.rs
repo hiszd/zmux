@@ -122,7 +122,10 @@ use crate::{
     KeyDispatcher,
     KeyOutcome,
     KeyTimeout,
-    key_notation::KeyStroke,
+    key_notation::{
+      self,
+      KeyStroke,
+    },
     which_key::WhichKeyPopup,
   },
   lua::{
@@ -385,12 +388,8 @@ fn run_builtin_picker(
             query.pop();
             highlighted = 0;
           }
-          KeyCode::Char(character)
-            if !key.modifiers.intersects(
-              crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::ALT,
-            ) =>
-          {
-            query.push(character);
+          KeyCode::Char(_) if key_notation::text_character(key).is_some() => {
+            query.push(key_notation::text_character(key).expect("text character matched"));
             highlighted = 0;
           }
           _ => {}
@@ -732,16 +731,24 @@ impl ClientSession {
   /// Returns the parsed terminal belonging to the active tab.
   fn active_terminal(&self) -> Option<&TerminalView> { self.terminals.get(&self.active_tab()?.id) }
 
-  /// Replaces server state and rebuilds all terminal parsers.
+  /// Updates server state and applies any terminal snapshots included with it.
   fn set_snapshot(&mut self, snapshot: SessionSnapshot, terminals: Vec<TerminalSnapshot>) {
-    self.snapshot = snapshot;
-    self.terminals = terminals
-      .into_iter()
-      .map(|terminal| {
-        let id = terminal.tab_id;
-        (id, TerminalView::from_snapshot(terminal))
-      })
+    let live_tabs: HashSet<_> = snapshot
+      .workspaces
+      .iter()
+      .flat_map(|workspace| &workspace.tabs)
+      .map(|tab| tab.id)
       .collect();
+    self
+      .terminals
+      .retain(|tab_id, _| live_tabs.contains(tab_id));
+    for terminal in terminals {
+      let id = terminal.tab_id;
+      self
+        .terminals
+        .insert(id, TerminalView::from_snapshot(terminal));
+    }
+    self.snapshot = snapshot;
   }
 
   /// Feeds terminal output into a tab's Alacritty emulator.
@@ -1218,7 +1225,6 @@ fn run_event_loop(
     },
   )?;
   if startup_effects.quit {
-    trace.flush();
     return Ok(());
   }
   let mut startup_requests: HashSet<u64> =
@@ -1327,6 +1333,7 @@ fn run_event_loop(
         lua: &config.lua,
         trace: &trace,
       };
+      let draw_started = Instant::now();
       let mut draw_error = None;
       terminal
         .draw(|frame| {
@@ -1341,6 +1348,7 @@ fn run_event_loop(
         trace.error("ui.draw", &error);
         return Err(error.into());
       }
+      trace.duration("client-terminal-draw", draw_started.elapsed(), "");
       needs_draw = false;
       last_draw = Instant::now();
     }
@@ -1396,6 +1404,17 @@ fn run_event_loop(
         }
       }
       Ok(ClientEvent::Server(message)) => {
+        let message_label = match &message {
+          ServerMessage::StateChanged { .. } => "state-changed",
+          ServerMessage::Reply { id, .. } => {
+            trace.mark(&format!("client-server-reply-received id={id}"));
+            "reply"
+          }
+          ServerMessage::TerminalChanged(_) => "terminal-changed",
+          ServerMessage::TerminalOutput { .. } => "terminal-output",
+          _ => "other",
+        };
+        trace.mark(&format!("client-server-message-received type={message_label}"));
         if let ServerMessage::Reply { id, .. } = &message {
           startup_requests.remove(id);
         }
@@ -1541,7 +1560,6 @@ fn run_event_loop(
     }
   }
   trace.mark(&format!("client-detached-{client_id}"));
-  trace.flush();
   Ok(())
 }
 
@@ -2051,10 +2069,7 @@ fn handle_input(
   if context.dispatcher.is_leader()
     && let Event::Key(key) = &event
     && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-    && matches!(
-      key.code,
-      crossterm::event::KeyCode::Char('[') | crossterm::event::KeyCode::Char(']')
-    )
+    && matches!(key_notation::text_character(*key), Some('[') | Some(']'))
   {
     let popup = WhichKeyPopup {
       prefix: context.dispatcher.sequence().to_vec(),
@@ -2065,9 +2080,9 @@ fn handle_input(
     let viewport = Rect::new(0, 0, context.outer_size.0, context.outer_size.1);
     if popup.can_scroll(viewport) {
       let max_scroll = popup.max_scroll(viewport);
-      context.session.which_key_scroll = match key.code {
-        crossterm::event::KeyCode::Char('[') => context.session.which_key_scroll.saturating_sub(1),
-        crossterm::event::KeyCode::Char(']') => context
+      context.session.which_key_scroll = match key_notation::text_character(*key) {
+        Some('[') => context.session.which_key_scroll.saturating_sub(1),
+        Some(']') => context
           .session
           .which_key_scroll
           .saturating_add(1)
@@ -2287,12 +2302,10 @@ fn handle_session_picker_key(
         ..Effects::default()
       })
     }
-    crossterm::event::KeyCode::Char(character)
-      if !key.modifiers.intersects(
-        crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::ALT,
-      ) =>
-    {
-      picker.query.push(character);
+    crossterm::event::KeyCode::Char(_) if key_notation::text_character(key).is_some() => {
+      picker
+        .query
+        .push(key_notation::text_character(key).expect("text character matched"));
       picker.highlighted = 0;
       context.session.session_picker = Some(picker);
       Ok(Effects {
@@ -2377,12 +2390,10 @@ fn handle_lua_picker_key(
         ..Effects::default()
       })
     }
-    crossterm::event::KeyCode::Char(character)
-      if !key.modifiers.intersects(
-        crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::ALT,
-      ) =>
-    {
-      picker.query.push(character);
+    crossterm::event::KeyCode::Char(_) if key_notation::text_character(key).is_some() => {
+      picker
+        .query
+        .push(key_notation::text_character(key).expect("text character matched"));
       picker.highlighted = 0;
       context.session.lua_picker = Some(picker);
       Ok(Effects {
@@ -2434,10 +2445,8 @@ fn handle_workspace_modal_key(
           ..Effects::default()
         })
       }
-      crossterm::event::KeyCode::Char('e')
-        if !key.modifiers.intersects(
-          crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::ALT,
-        ) =>
+      crossterm::event::KeyCode::Char(_)
+        if !form.editing && key_notation::text_character(key) == Some('e') =>
       {
         match form.field {
           WorkspaceField::Directory => match DirectoryPicker::new(form) {
@@ -2490,14 +2499,14 @@ fn handle_workspace_modal_key(
           ..Effects::default()
         })
       }
-      crossterm::event::KeyCode::Char(character)
+      crossterm::event::KeyCode::Char(_)
         if form.field == WorkspaceField::Name
           && form.editing
-          && !key.modifiers.intersects(
-            crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::ALT,
-          ) =>
+          && key_notation::text_character(key).is_some() =>
       {
-        form.name.push(character);
+        form
+          .name
+          .push(key_notation::text_character(key).expect("text character matched"));
         context.session.workspace_modal = Some(WorkspaceModal::Form(form));
         Ok(Effects {
           redraw: true,
@@ -2569,12 +2578,10 @@ fn handle_workspace_modal_key(
           ..Effects::default()
         })
       }
-      crossterm::event::KeyCode::Char(character)
-        if !key.modifiers.intersects(
-          crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::ALT,
-        ) =>
-      {
-        picker.query.push(character);
+      crossterm::event::KeyCode::Char(_) if key_notation::text_character(key).is_some() => {
+        picker
+          .query
+          .push(key_notation::text_character(key).expect("text character matched"));
         picker.highlighted = 0;
         context.session.workspace_modal = Some(WorkspaceModal::Directory(picker));
         Ok(Effects {
@@ -2615,7 +2622,16 @@ fn send_tracked_request(
   effects: &mut Effects,
   request: ClientRequest,
 ) -> Result<(), Box<dyn std::error::Error>> {
+  let request_label = match &request {
+    ClientRequest::PreviousTab => "previous-tab",
+    ClientRequest::NextTab => "next-tab",
+    ClientRequest::SelectTab(_) => "select-tab",
+    _ => "other",
+  };
   let id = send_request_with_id(context.sender, context.next_request_id, request)?;
+  context
+    .trace
+    .mark(&format!("client-request-queued id={id} type={request_label}"));
   effects.awaited_requests.push(id);
   Ok(())
 }
@@ -2837,6 +2853,7 @@ mod tests {
     WorkspaceDialog,
     WorkspaceDialogMode,
     WorkspaceField,
+    WorkspaceModal,
     dispatch_ui_events,
     handle_input,
     run_pre_client,
@@ -3074,6 +3091,153 @@ mod tests {
   }
 
   #[test]
+  fn every_ascii_key_and_modifier_mask_reaches_the_server_with_exact_bytes() {
+    use crossterm::event::{
+      Event,
+      KeyCode,
+      KeyEvent,
+      KeyModifiers,
+    };
+
+    let config = lua::load_config("").expect("default key configuration");
+    let viewport = Viewport {
+      rows: 24,
+      columns: 80,
+    };
+    let snapshot = SessionSnapshot {
+      number: "1".to_owned(),
+      workspaces: Vec::new(),
+      active_workspace_id: 0,
+    };
+    let mut session = ClientSession::new(snapshot, Vec::new(), viewport);
+    let mut outer_size = (80, 24);
+    let mut viewport = viewport;
+    let mut dispatcher = KeyDispatcher::new(
+      crate::input::key_notation::normalize_prefix_key("<F12>").expect("prefix key"),
+      std::time::Duration::ZERO,
+      crate::input::KeyMap::default(),
+    );
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let mut next_request_id = 1;
+    let trace = crate::trace::Trace::from_environment();
+    let mut context = ClientContext {
+      session: &mut session,
+      outer_size: &mut outer_size,
+      viewport: &mut viewport,
+      dispatcher: &mut dispatcher,
+      sender: &sender,
+      next_request_id: &mut next_request_id,
+      lua: &config.lua,
+      trace: &trace,
+    };
+    let unsupported_modifiers = KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META;
+
+    for codepoint in 0..=0x7f {
+      let character = char::from(codepoint);
+      for modifier_bits in 0..=KeyModifiers::all().bits() {
+        let event =
+          KeyEvent::new(KeyCode::Char(character), KeyModifiers::from_bits_retain(modifier_bits));
+        let expected = if event.modifiers.intersects(unsupported_modifiers) {
+          None
+        } else {
+          crate::input::key_notation::encode_key(event)
+        };
+        handle_input(Event::Key(event), &mut context).expect("dispatch terminal input");
+        match expected {
+          Some(expected) => {
+            let Ok(ClientMessage::Request {
+              request: ClientRequest::Input(actual),
+              ..
+            }) = receiver.try_recv()
+            else {
+              panic!("{event:?} should reach the server as PTY input");
+            };
+            assert_eq!(actual, expected, "server input bytes for {event:?}");
+          }
+          None => assert!(
+            matches!(receiver.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+            "unsupported input {event:?} must not reach the server"
+          ),
+        }
+      }
+    }
+
+    for character in ['é', '界', '🦀'] {
+      let event = KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE);
+      handle_input(Event::Key(event), &mut context).expect("dispatch Unicode input");
+      assert!(matches!(
+        receiver.try_recv(),
+        Ok(ClientMessage::Request {
+          request: ClientRequest::Input(bytes),
+          ..
+        }) if bytes == character.to_string().as_bytes()
+      ));
+    }
+  }
+
+  #[test]
+  fn workspace_name_entry_converts_shifted_punctuation_to_the_typed_character() {
+    use crossterm::event::{
+      Event,
+      KeyCode,
+      KeyEvent,
+      KeyModifiers,
+    };
+
+    let config = lua::load_config("").expect("default key configuration");
+    let viewport = Viewport {
+      rows: 24,
+      columns: 80,
+    };
+    let mut session = ClientSession::new(
+      SessionSnapshot {
+        number: "1".to_owned(),
+        workspaces: Vec::new(),
+        active_workspace_id: 0,
+      },
+      Vec::new(),
+      viewport,
+    );
+    session.workspace_modal = Some(WorkspaceModal::Form(WorkspaceDialog {
+      mode: WorkspaceDialogMode::Create,
+      working_directory: ".".into(),
+      name: String::new(),
+      field: WorkspaceField::Name,
+      editing: true,
+    }));
+    let mut outer_size = (80, 24);
+    let mut viewport = viewport;
+    let mut dispatcher = KeyDispatcher::new(
+      normalize_prefix_key("<F12>").expect("prefix key"),
+      std::time::Duration::ZERO,
+      KeyMap::default(),
+    );
+    let (sender, _receiver) = std::sync::mpsc::channel();
+    let mut next_request_id = 1;
+    let trace = crate::trace::Trace::from_environment();
+    let mut context = ClientContext {
+      session: &mut session,
+      outer_size: &mut outer_size,
+      viewport: &mut viewport,
+      dispatcher: &mut dispatcher,
+      sender: &sender,
+      next_request_id: &mut next_request_id,
+      lua: &config.lua,
+      trace: &trace,
+    };
+
+    handle_input(Event::Key(KeyEvent::new(KeyCode::Char('-'), KeyModifiers::SHIFT)), &mut context)
+      .expect("type underscore in workspace name");
+    handle_input(Event::Key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)), &mut context)
+      .expect("type e in workspace name");
+
+    assert!(matches!(
+      &context.session.workspace_modal,
+      Some(WorkspaceModal::Form(WorkspaceDialog { name, .. })) if name == "_e"
+    ));
+  }
+
+  #[test]
   fn focused_drawer_routes_direct_keys_then_global_leader_without_pty_fallback() {
     use crossterm::event::{
       Event,
@@ -3226,6 +3390,59 @@ mod tests {
     assert!(escape.redraw);
     assert!(context.lua.focused_ui().is_none());
     assert!(receiver.try_iter().next().is_none());
+  }
+
+  #[test]
+  fn selection_snapshot_retains_existing_terminal_parsers_and_removes_closed_tabs() {
+    let snapshot = |active_tab_id| SessionSnapshot {
+      number: "1".to_owned(),
+      workspaces: vec![WorkspaceSnapshot {
+        id: 1,
+        name: "main".to_owned(),
+        explicit_name: None,
+        working_directory: std::path::PathBuf::from("."),
+        tabs: vec![
+          TabSnapshot {
+            id: 1,
+            name: "1".to_owned(),
+            title: "first".to_owned(),
+            exit_code: None,
+          },
+          TabSnapshot {
+            id: 2,
+            name: "2".to_owned(),
+            title: "second".to_owned(),
+            exit_code: None,
+          },
+        ],
+        active_tab_id,
+      }],
+      active_workspace_id: 1,
+    };
+    let terminal = |tab_id| TerminalSnapshot {
+      tab_id,
+      rows: 24,
+      columns: 80,
+      bytes: Vec::new(),
+      title: format!("terminal {tab_id}"),
+      exit_code: None,
+    };
+    let mut session = ClientSession::new(snapshot(2), vec![terminal(1), terminal(2)], Viewport {
+      rows: 24,
+      columns: 80,
+    });
+
+    session.set_snapshot(snapshot(1), Vec::new());
+
+    assert!(session.terminals.contains_key(&1));
+    assert!(session.terminals.contains_key(&2));
+    assert_eq!(session.active_tab().expect("active Tab").id, 1);
+
+    let mut closed_tab = snapshot(1);
+    closed_tab.workspaces[0].tabs.pop();
+    session.set_snapshot(closed_tab, Vec::new());
+    assert!(session.terminals.contains_key(&1));
+    assert!(!session.terminals.contains_key(&2));
   }
 
   // Developer approved: do not remove.
