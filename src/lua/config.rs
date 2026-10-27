@@ -7,7 +7,10 @@ use std::{
     HashMap,
     VecDeque,
   },
-  path::PathBuf,
+  path::{
+    Path,
+    PathBuf,
+  },
   rc::Rc,
   sync::mpsc::{
     Receiver,
@@ -17,7 +20,6 @@ use std::{
 };
 
 use mlua::{
-  ErrorContext,
   Function,
   Lua,
   Result as LuaResult,
@@ -42,9 +44,11 @@ use crate::{
     },
   },
   ui::{
+    BarPosition,
     CursorShape,
     DrawerBorder,
     DrawerSide,
+    HorizontalAlignment,
     LayoutAxis,
     ToastPosition,
     UiChild,
@@ -53,15 +57,17 @@ use crate::{
     UiElementType,
     UiElementValue,
     UiSize,
+    UiSlice,
     UiTree,
   },
 };
 
-pub const CONFIG_API_VERSION: u32 = 1;
+pub const CONFIG_API_VERSION: u32 = 2;
 pub const DEFAULT_CONFIG_SOURCE: &str = include_str!("../../defaults/zmux.lua");
 
 pub struct AppConfig {
   pub config_api_version: Option<u32>,
+  pub live_reload: bool,
   pub keymap: KeyMap,
   pub cursor_shape: CursorShape,
   pub default_shell: Option<PathBuf>,
@@ -143,12 +149,7 @@ pub enum RuntimeCommand {
   NextTab,
   PreviousTab,
   SelectTab(usize),
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct AnchorOptions {
-  pub height: u16,
-  pub visible: bool,
+  ReloadConfig,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -192,17 +193,10 @@ pub struct PtyOptions {
 
 #[derive(Clone, Copy, Debug)]
 pub struct UiOptions {
-  pub top: AnchorOptions,
-  pub bottom: AnchorOptions,
+  pub top_bars: u16,
+  pub bottom_bars: u16,
   pub which: WhichKeyOptions,
   pub pty: PtyOptions,
-}
-
-#[derive(Clone, Debug)]
-pub struct BarSegment {
-  pub text: String,
-  pub role: Option<String>,
-  pub style: Option<Style>,
 }
 
 pub struct LuaCallback {
@@ -265,6 +259,7 @@ pub struct LuaConfig {
   handlers: Rc<RefCell<HashMap<String, Vec<RegisteredCallback>>>>,
   commands: Rc<RefCell<VecDeque<RuntimeCommand>>>,
   in_event_callback: Rc<Cell<bool>>,
+  reload_requested: Cell<bool>,
   pending_pickers: Rc<RefCell<HashMap<u64, PendingPicker>>>,
   ui_tree: Rc<RefCell<UiTree>>,
   ui_handles: Table,
@@ -475,6 +470,10 @@ impl LuaConfig {
     self.invoke_callback(callback, (handle, key_value))
   }
 
+  pub fn request_config_reload(&self) { self.reload_requested.set(true); }
+
+  pub fn take_config_reload_request(&self) -> bool { self.reload_requested.replace(false) }
+
   pub fn launch_state(&self) -> LuaResult<LaunchState> {
     Ok(LaunchState {
       command: self.launch.get("command")?,
@@ -557,102 +556,33 @@ impl LuaConfig {
   }
 
   pub fn sync_options(&self) -> LuaResult<UiOptions> {
-    let ui = self.options.get::<Option<Table>>("ui")?;
-    let Some(ui) = ui else {
-      return Ok(UiOptions::default());
+    self.reap_ui_releases();
+    let (top_bars, bottom_bars) = self.ui_tree.borrow().bar_counts();
+    let Some(ui) = self.options.get::<Option<Table>>("ui")? else {
+      return Ok(UiOptions {
+        top_bars,
+        bottom_bars,
+        ..UiOptions::default()
+      });
     };
-    let anchors = ui.get::<Option<Table>>("anchors")?;
     let which = ui.get::<Option<Table>>("which")?;
     let pty = ui.get::<Option<Table>>("pty")?;
     Ok(UiOptions {
-      top: read_anchor(anchors.as_ref(), "top")?,
-      bottom: read_anchor(anchors.as_ref(), "bottom")?,
+      top_bars,
+      bottom_bars,
       which: read_which_key(which.as_ref())?,
       pty: read_pty(pty.as_ref())?,
     })
   }
 
-  pub fn render_bar_part(&self, anchor: &str, part: &str) -> LuaResult<Option<Vec<BarSegment>>> {
-    let context = |step: &str| format!("bar {anchor}.{part}: {step}");
-    self
-      .refresh_state()
-      .map_err(|error| error.context(context("refresh state")))?;
-    let Some(ui) = self
-      .options
-      .get::<Option<Table>>("ui")
-      .map_err(|error| error.context(context("read UI options")))?
-    else {
-      return Ok(None);
-    };
-    let Some(bars) = ui
-      .get::<Option<Table>>("bars")
-      .map_err(|error| error.context(context("read bars")))?
-    else {
-      return Ok(None);
-    };
-    let Some(bar) = bars
-      .get::<Option<Table>>(anchor)
-      .map_err(|error| error.context(context("read anchor")))?
-    else {
-      return Ok(None);
-    };
-    let content = bar
-      .get::<Value>(part)
-      .map_err(|error| error.context(context("read content")))?;
-    if matches!(content, Value::Nil) {
-      return Ok(None);
-    }
-    let content = match content {
-      Value::Function(function) => function
-        .call::<Value>(self.globals.clone())
-        .map_err(|error| error.context(context("call content provider")))?,
-      value => value,
-    };
-    let mut rendered = Vec::new();
-    for (mut segment, segment_table) in self
-      .parse_segments(content)
-      .map_err(|error| error.context(context("parse content segments")))?
-    {
-      if segment.style.is_none()
-        && let Value::Function(function) = ui
-          .get::<Value>("style")
-          .map_err(|error| error.context(context("read default style provider")))?
-      {
-        self
-          .refresh_state()
-          .map_err(|error| error.context(context("refresh state before style callback")))?;
-        let value = function
-          .call::<Value>((segment_table, self.globals.clone()))
-          .map_err(|error| error.context(context("call default style provider")))?;
-        segment.style =
-          parse_style(value).map_err(|error| error.context(context("parse default style")))?;
-      }
-      rendered.push(segment);
-    }
-    Ok(Some(rendered))
-  }
-
-  pub fn apply_default_style(&self, segment: &mut BarSegment) -> LuaResult<()> {
-    self.refresh_state()?;
-    if segment.style.is_some() {
-      return Ok(());
-    }
-    let Some(ui) = self.options.get::<Option<Table>>("ui")? else {
-      return Ok(());
-    };
-    if let Value::Function(function) = ui.get::<Value>("style")? {
-      let value = self.lua.create_table()?;
-      value.set("text", segment.text.as_str())?;
-      value.set("role", segment.role.as_deref())?;
-      let style = function.call::<Value>((value, self.globals.clone()))?;
-      segment.style = parse_style(style)?;
-    }
-    Ok(())
-  }
-
-  fn refresh_state(&self) -> LuaResult<()> {
-    let snapshot = self.snapshot.borrow().clone();
-    self.sync_state(&snapshot)
+  pub fn render_ui_bars(
+    &self,
+    top: ratatui::layout::Rect,
+    bottom: ratatui::layout::Rect,
+    buffer: &mut ratatui::buffer::Buffer,
+  ) {
+    self.reap_ui_releases();
+    self.ui_tree.borrow_mut().render_bars(top, bottom, buffer);
   }
 
   fn event_value(&self, event: &AppEvent) -> LuaResult<Table> {
@@ -672,64 +602,13 @@ impl LuaConfig {
     value.set("active", event.active)?;
     Ok(value)
   }
-
-  fn parse_segments(&self, content: Value) -> LuaResult<Vec<(BarSegment, Table)>> {
-    let values = match content {
-      Value::String(text) => {
-        let segment = self.lua.create_table()?;
-        segment.set("text", text.to_string_lossy())?;
-        return Ok(vec![(
-          BarSegment {
-            text: segment.get("text")?,
-            role: None,
-            style: None,
-          },
-          segment,
-        )]);
-      }
-      Value::Table(table) if table.contains_key("text")? => vec![table],
-      Value::Table(table) => table
-        .sequence_values::<Table>()
-        .collect::<LuaResult<Vec<_>>>()?,
-      Value::Nil => return Ok(Vec::new()),
-      value => {
-        return Err(mlua::Error::external(format!(
-          "bar content must return a string or segment table, got {}",
-          value.type_name()
-        )));
-      }
-    };
-    values
-      .into_iter()
-      .map(|table| {
-        let text = table.get::<String>("text")?;
-        let role = table.get::<Option<String>>("role")?;
-        let style = match table.get::<Value>("style")? {
-          Value::Nil => None,
-          Value::Function(function) => {
-            self.refresh_state()?;
-            let value = function.call::<Value>((table.clone(), self.globals.clone()))?;
-            parse_style(value)?
-          }
-          value => parse_style(value)?,
-        };
-        Ok((BarSegment { text, role, style }, table))
-      })
-      .collect()
-  }
 }
 
 impl Default for UiOptions {
   fn default() -> Self {
     Self {
-      top: AnchorOptions {
-        height: 1,
-        visible: true,
-      },
-      bottom: AnchorOptions {
-        height: 1,
-        visible: true,
-      },
+      top_bars: 0,
+      bottom_bars: 0,
       which: WhichKeyOptions {
         max_columns: 7,
         max_height: WhichKeyHeight::Percent(55),
@@ -807,28 +686,6 @@ fn read_which_key(which: Option<&Table>) -> LuaResult<WhichKeyOptions> {
   })
 }
 
-fn read_anchor(anchors: Option<&Table>, name: &str) -> LuaResult<AnchorOptions> {
-  let defaults = AnchorOptions {
-    height: 1,
-    visible: true,
-  };
-  let Some(anchor) = anchors
-    .map(|anchors| anchors.get::<Option<Table>>(name))
-    .transpose()?
-    .flatten()
-  else {
-    return Ok(defaults);
-  };
-  Ok(AnchorOptions {
-    height: anchor
-      .get::<Option<u16>>("height")?
-      .unwrap_or(defaults.height),
-    visible: anchor
-      .get::<Option<bool>>("visible")?
-      .unwrap_or(defaults.visible),
-  })
-}
-
 fn parse_style(value: Value) -> LuaResult<Option<Style>> {
   let Value::Table(table) = value else {
     return if matches!(value, Value::Nil) {
@@ -857,7 +714,19 @@ fn parse_style(value: Value) -> LuaResult<Option<Style>> {
   if table.get::<Option<bool>>("reverse")?.unwrap_or(false) {
     modifiers.insert(Modifier::REVERSED);
   }
-  Ok(Some(style.add_modifier(modifiers)))
+  let mut removals = Modifier::empty();
+  if let Some(remove) = table.get::<Option<Table>>("remove")? {
+    for value in remove.sequence_values::<String>() {
+      match value?.as_str() {
+        "bold" => removals.insert(Modifier::BOLD),
+        "italic" => removals.insert(Modifier::ITALIC),
+        "underline" => removals.insert(Modifier::UNDERLINED),
+        "reverse" => removals.insert(Modifier::REVERSED),
+        value => return Err(mlua::Error::external(format!("unknown style modifier '{value}'"))),
+      };
+    }
+  }
+  Ok(Some(style.add_modifier(modifiers).remove_modifier(removals)))
 }
 
 fn parse_color(value: Value) -> LuaResult<Color> {
@@ -904,6 +773,112 @@ pub fn load_config(source: &str) -> LuaResult<AppConfig> {
   load_config_with_context(source, &[], LaunchState::default())
 }
 
+fn register_import_api(lua: &Lua, root_path: Option<&Path>) -> LuaResult<()> {
+  let root_path = root_path.map(Path::to_path_buf);
+  let require = lua.globals().get::<Function>("require")?;
+  let package = lua.globals().get::<Table>("package")?;
+  if let Some(root_path) = root_path.as_deref() {
+    let directory = root_path.parent().unwrap_or_else(|| Path::new("."));
+    let module_pattern = directory.join("?.lua");
+    let init_pattern = directory.join("?/init.lua");
+    let existing_path = package.get::<String>("path")?;
+    package.set(
+      "path",
+      format!("{};{};{existing_path}", module_pattern.display(), init_pattern.display()),
+    )?;
+  }
+  let preload = package.get::<Table>("preload")?;
+  let import = lua.create_function(move |lua, module_name: String| {
+    let Some(relative_name) = module_name.strip_prefix("./") else {
+      return require
+        .call::<Value>(module_name.as_str())
+        .map_err(|error| {
+          mlua::Error::external(format!("while importing module '{module_name}': {error}"))
+        });
+    };
+    let relative_name = relative_name.to_owned();
+    let relative_path = relative_module_path(&relative_name)?;
+    let importer = importing_file_path(lua, root_path.as_deref())?;
+    let module_path = importer
+      .parent()
+      .unwrap_or_else(|| Path::new("."))
+      .join(relative_path);
+    let identity = module_path.canonicalize().map_err(|error| {
+      mlua::Error::external(format!(
+        "could not resolve relative module './{relative_name}' from {}: {error}",
+        importer.display()
+      ))
+    })?;
+    let identifier = format!("\u{1f}zmux-relative:{}", identity.display());
+    if matches!(preload.get::<Value>(identifier.as_str())?, Value::Nil) {
+      let module_path = module_path.clone();
+      let imported_name = module_name.clone();
+      let loader = lua.create_function(move |lua, _: Value| {
+        let source = std::fs::read_to_string(&module_path).map_err(|error| {
+          mlua::Error::external(format!("could not read {}: {error}", module_path.display()))
+        })?;
+        lua
+          .load(&source)
+          .set_name(format!("@{}", module_path.display()))
+          .into_function()?
+          .call::<Value>(imported_name.as_str())
+      })?;
+      preload.set(identifier.as_str(), loader)?;
+    }
+    require.call::<Value>(identifier).map_err(|error| {
+      mlua::Error::external(format!(
+        "while importing '{module_name}' from {}: {error}",
+        importer.display()
+      ))
+    })
+  })?;
+  lua.globals().set("import", import)
+}
+
+fn relative_module_path(module_name: &str) -> LuaResult<PathBuf> {
+  if module_name.is_empty() {
+    return Err(mlua::Error::external("relative module name cannot be empty"));
+  }
+  let mut path = PathBuf::new();
+  for component in module_name.split('.') {
+    if component.is_empty()
+      || !component
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+    {
+      return Err(mlua::Error::external(format!(
+        "invalid relative module name './{module_name}'; expected a dot-separated module name"
+      )));
+    }
+    path.push(component);
+  }
+  path.set_extension("lua");
+  Ok(path)
+}
+
+fn importing_file_path(lua: &Lua, root_path: Option<&Path>) -> LuaResult<PathBuf> {
+  let source_path = lua
+    .inspect_stack(1, |debug| debug.source().source.map(|source| source.into_owned()))
+    .flatten()
+    .and_then(|source| source.strip_prefix('@').map(PathBuf::from));
+  if let Some(path) = source_path {
+    return absolute_path(&path).map_err(|error| {
+      mlua::Error::external(format!("could not resolve importing file {}: {error}", path.display()))
+    });
+  }
+  root_path.map(Path::to_path_buf).ok_or_else(|| {
+    mlua::Error::external("relative imports require a file-backed configuration or module")
+  })
+}
+
+fn absolute_path(path: &Path) -> std::io::Result<PathBuf> {
+  if path.is_absolute() {
+    Ok(path.to_path_buf())
+  } else {
+    Ok(std::env::current_dir()?.join(path))
+  }
+}
+
 fn create_weak_table(lua: &Lua, mode: &str) -> LuaResult<Table> {
   let table = lua.create_table()?;
   let metatable = lua.create_table()?;
@@ -916,6 +891,15 @@ pub fn load_config_with_context(
   source: &str,
   arguments: &[String],
   initial_launch: LaunchState,
+) -> LuaResult<AppConfig> {
+  load_config_with_source_path(source, arguments, initial_launch, None)
+}
+
+fn load_config_with_source_path(
+  source: &str,
+  arguments: &[String],
+  initial_launch: LaunchState,
+  source_path: Option<&Path>,
 ) -> LuaResult<AppConfig> {
   let lua = Lua::new();
   let keymap = Rc::new(RefCell::new(KeyMap::default()));
@@ -1036,6 +1020,7 @@ pub fn load_config_with_context(
   let event = lua.create_table()?;
   event.set("on", on)?;
   let ui = lua.create_table()?;
+  let config_api = lua.create_table()?;
   let client = lua.create_table()?;
   let server = lua.create_table()?;
   let session = lua.create_table()?;
@@ -1044,6 +1029,7 @@ pub fn load_config_with_context(
   cmd.set("key", key)?;
   cmd.set("event", event)?;
   cmd.set("ui", ui.clone())?;
+  cmd.set("config", config_api.clone())?;
   cmd.set("client", client.clone())?;
   cmd.set("server", server.clone())?;
   cmd.set("session", session.clone())?;
@@ -1096,6 +1082,14 @@ pub fn load_config_with_context(
     in_callback: Rc::clone(&in_event_callback),
   };
   register_ui_api(&lua, &ui, &ui_api)?;
+  register_command(
+    &lua,
+    &config_api,
+    &commands,
+    &in_event_callback,
+    "reload",
+    RuntimeCommand::ReloadConfig,
+  )?;
   register_command(&lua, &ui, &commands, &in_event_callback, "redraw", RuntimeCommand::Redraw)?;
   register_command(&lua, &client, &commands, &in_event_callback, "detach", RuntimeCommand::Detach)?;
   register_command(
@@ -1208,17 +1202,10 @@ pub fn load_config_with_context(
 
   let options = lua.create_table()?;
   options.set("cursor_shape", "block")?;
+  options.set("live_reload", false)?;
   options.set("prefix_key", "<C-Space>")?;
   options.set("sequence_timeout_ms", 700_u64)?;
   let ui = lua.create_table()?;
-  let anchors = lua.create_table()?;
-  for name in ["top", "bottom"] {
-    let anchor = lua.create_table()?;
-    anchor.set("height", 1)?;
-    anchor.set("visible", true)?;
-    anchors.set(name, anchor)?;
-  }
-  ui.set("anchors", anchors)?;
   let which = lua.create_table()?;
   which.set("maxcolumns", 7_u64)?;
   which.set("maxheight", "55%")?;
@@ -1226,14 +1213,17 @@ pub fn load_config_with_context(
   let pty = lua.create_table()?;
   pty.set("border", "plain")?;
   ui.set("pty", pty)?;
-  let bars = lua.create_table()?;
-  for name in ["top", "bottom"] {
-    bars.set(name, lua.create_table()?)?;
-  }
-  ui.set("bars", bars)?;
   options.set("ui", ui)?;
   lua.globals().set("opt", options.clone())?;
-  lua.load(source).exec()?;
+  register_import_api(&lua, source_path)?;
+  if let Some(path) = source_path {
+    lua
+      .load(source)
+      .set_name(format!("@{}", path.display()))
+      .exec()?;
+  } else {
+    lua.load(source).exec()?;
+  }
   config_loading.set(false);
 
   let config_api_version = options.get::<Option<u32>>("config_version")?;
@@ -1249,6 +1239,11 @@ pub fn load_config_with_context(
     .get::<String>("cursor_shape")?
     .parse::<CursorShape>()
     .map_err(mlua::Error::external)?;
+  let live_reload = match options.get::<Value>("live_reload")? {
+    Value::Nil => false,
+    Value::Boolean(enabled) => enabled,
+    _ => return Err(mlua::Error::external("opt.live_reload must be a boolean")),
+  };
   let prefix_key = options
     .get::<String>("prefix_key")
     .and_then(|value| normalize_prefix_key(&value).map_err(mlua::Error::external))?;
@@ -1259,6 +1254,7 @@ pub fn load_config_with_context(
   let keymap = keymap.borrow().clone();
   Ok(AppConfig {
     config_api_version,
+    live_reload,
     keymap,
     cursor_shape,
     default_shell,
@@ -1272,6 +1268,7 @@ pub fn load_config_with_context(
       handlers,
       commands,
       in_event_callback,
+      reload_requested: Cell::new(false),
       pending_pickers,
       ui_tree,
       ui_handles,
@@ -1301,6 +1298,8 @@ fn register_ui_api(lua: &Lua, ui: &Table, context: &UiApiContext) -> LuaResult<(
   };
   let row = create_layout_constructor(lua, context, LayoutAxis::Horizontal)?;
   let column = create_layout_constructor(lua, context, LayoutAxis::Vertical)?;
+  let slices = create_slices_constructor(lua, context)?;
+  let align = create_align_constructor(lua, context)?;
   let create = {
     let context = context.clone();
     lua.create_function(move |lua, options: Table| {
@@ -1313,6 +1312,8 @@ fn register_ui_api(lua: &Lua, ui: &Table, context: &UiApiContext) -> LuaResult<(
   ui.set("text", text)?;
   ui.set("row", row)?;
   ui.set("column", column)?;
+  ui.set("slices", slices)?;
+  ui.set("align", align)?;
   ui.set("create", create)?;
   Ok(())
 }
@@ -1399,6 +1400,47 @@ fn parse_ui_children(children: &Table) -> LuaResult<Vec<UiChild>> {
       }
     })
     .collect()
+}
+
+fn parse_slice_items(items: &Table) -> LuaResult<Vec<UiSlice>> {
+  items
+    .sequence_values::<Table>()
+    .map(|value| {
+      let item = value?;
+      let index = item
+        .get::<Option<u16>>("index")?
+        .filter(|index| *index > 0)
+        .ok_or_else(|| mlua::Error::external("slice items require a positive 1-based 'index'"))?;
+      let slice_width = item
+        .get::<Option<u16>>("slice_width")?
+        .filter(|width| *width > 0)
+        .ok_or_else(|| mlua::Error::external("slice items require a positive 'slice_width'"))?;
+      let node = item
+        .get::<Option<Table>>("node")?
+        .ok_or_else(|| mlua::Error::external("slice items require a UI node in 'node'"))?;
+      Ok(UiSlice {
+        index,
+        slice_width,
+        node_id: ui_node_id(&node)?,
+      })
+    })
+    .collect()
+}
+
+fn parse_slice_count(value: Value) -> LuaResult<u16> {
+  match value {
+    Value::Integer(value) if (1..=i64::from(u16::MAX)).contains(&value) => Ok(value as u16),
+    _ => Err(mlua::Error::external("'slices' must be a positive integer")),
+  }
+}
+
+fn parse_horizontal_alignment(value: &str) -> LuaResult<HorizontalAlignment> {
+  match value {
+    "left" => Ok(HorizontalAlignment::Left),
+    "center" => Ok(HorizontalAlignment::Center),
+    "right" => Ok(HorizontalAlignment::Right),
+    _ => Err(mlua::Error::external("horizontal alignment must be 'left', 'center', or 'right'")),
+  }
 }
 
 fn parse_ui_keys(keys: &Table) -> LuaResult<HashMap<KeyStroke, Function>> {
@@ -1597,11 +1639,144 @@ fn create_layout_constructor(
   })
 }
 
+fn create_slices_constructor(lua: &Lua, context: &UiApiContext) -> LuaResult<Function> {
+  let context = context.clone();
+  lua.create_function(move |lua, options: Table| {
+    ensure_ui_mutation_context(&context.config_loading, &context.in_callback)?;
+    let slices = parse_slice_count(options.get::<Value>("slices")?)?;
+    let items = options
+      .get::<Option<Table>>("items")?
+      .ok_or_else(|| mlua::Error::external("Slices nodes require an 'items' array"))?;
+    let items = parse_slice_items(&items)?;
+    let id = context
+      .tree
+      .borrow_mut()
+      .create_slices(slices, items)
+      .map_err(mlua::Error::external)?;
+    let handle = lua.create_table()?;
+    handle.set("__zmux_ui_node", id)?;
+    let set = {
+      let tree = Rc::clone(&context.tree);
+      let commands = Rc::clone(&context.commands);
+      let config_loading = Rc::clone(&context.config_loading);
+      let in_callback = Rc::clone(&context.in_callback);
+      lua.create_function(move |_, (property, value): (String, Value)| {
+        ensure_ui_mutation_context(&config_loading, &in_callback)?;
+        let changed = match property.as_str() {
+          "slices" => tree
+            .borrow_mut()
+            .set_slice_count(id, parse_slice_count(value)?)
+            .map_err(mlua::Error::external)?,
+          "items" => {
+            let Value::Table(items) = value else {
+              return Err(mlua::Error::external("Slices 'items' property must be an array"));
+            };
+            tree
+              .borrow_mut()
+              .set_slice_items(id, parse_slice_items(&items)?)
+              .map_err(mlua::Error::external)?
+          }
+          _ => return Err(mlua::Error::external(format!("unknown Slices property '{property}'"))),
+        };
+        finish_ui_mutation(changed, &config_loading, &commands);
+        Ok(())
+      })?
+    };
+    handle.set("set", set)?;
+    track_ui_handle(
+      lua,
+      &context.leases,
+      &context.release_sender,
+      &handle,
+      UiHandleKind::Node,
+      id,
+    )?;
+    finish_ui_mutation(true, &context.config_loading, &context.commands);
+    Ok(handle)
+  })
+}
+
+fn create_align_constructor(lua: &Lua, context: &UiApiContext) -> LuaResult<Function> {
+  let context = context.clone();
+  lua.create_function(move |lua, options: Table| {
+    ensure_ui_mutation_context(&context.config_loading, &context.in_callback)?;
+    let child = options
+      .get::<Option<Table>>("content")?
+      .ok_or_else(|| mlua::Error::external("Align nodes require a 'content' UI node"))?;
+    let horizontal = parse_horizontal_alignment(
+      &options
+        .get::<Option<String>>("horizontal")?
+        .unwrap_or_else(|| "left".to_owned()),
+    )?;
+    let id = context
+      .tree
+      .borrow_mut()
+      .create_align(ui_node_id(&child)?, horizontal)
+      .map_err(mlua::Error::external)?;
+    let handle = lua.create_table()?;
+    handle.set("__zmux_ui_node", id)?;
+    let set = {
+      let tree = Rc::clone(&context.tree);
+      let commands = Rc::clone(&context.commands);
+      let config_loading = Rc::clone(&context.config_loading);
+      let in_callback = Rc::clone(&context.in_callback);
+      lua.create_function(move |_, (property, value): (String, Value)| {
+        ensure_ui_mutation_context(&config_loading, &in_callback)?;
+        let changed = match property.as_str() {
+          "content" => {
+            let Value::Table(child) = value else {
+              return Err(mlua::Error::external("Align 'content' property must be a UI node"));
+            };
+            tree
+              .borrow_mut()
+              .set_alignment_child(id, ui_node_id(&child)?)
+              .map_err(mlua::Error::external)?
+          }
+          "horizontal" => {
+            let Value::String(horizontal) = value else {
+              return Err(mlua::Error::external("Align 'horizontal' property must be a string"));
+            };
+            tree
+              .borrow_mut()
+              .set_alignment(id, parse_horizontal_alignment(&horizontal.to_string_lossy())?)
+              .map_err(mlua::Error::external)?
+          }
+          _ => return Err(mlua::Error::external(format!("unknown Align property '{property}'"))),
+        };
+        finish_ui_mutation(changed, &config_loading, &commands);
+        Ok(())
+      })?
+    };
+    handle.set("set", set)?;
+    track_ui_handle(
+      lua,
+      &context.leases,
+      &context.release_sender,
+      &handle,
+      UiHandleKind::Node,
+      id,
+    )?;
+    finish_ui_mutation(true, &context.config_loading, &context.commands);
+    Ok(handle)
+  })
+}
+
 fn create_ui_element_handle(lua: &Lua, context: &UiApiContext, options: Table) -> LuaResult<Table> {
   let type_name = options
     .get::<Option<String>>("type")?
     .unwrap_or_else(|| "drawer".to_owned());
   let element_type = match type_name.as_str() {
+    "bar" => UiElementType::Bar {
+      position: match options
+        .get::<Option<String>>("position")?
+        .as_deref()
+        .unwrap_or("top")
+      {
+        "top" => BarPosition::Top,
+        "bottom" => BarPosition::Bottom,
+        _ => return Err(mlua::Error::external("Bar position must be 'top' or 'bottom'")),
+      },
+    },
     "drawer" => UiElementType::Drawer {
       side: parse_drawer_side(
         &options
@@ -1634,7 +1809,7 @@ fn create_ui_element_handle(lua: &Lua, context: &UiApiContext, options: Table) -
     }
     _ => {
       return Err(mlua::Error::external(
-        "cmd.ui.create type must be 'drawer', 'modal', 'popover', 'bottom_panel', or 'toast'",
+        "cmd.ui.create type must be 'bar', 'drawer', 'modal', 'popover', 'bottom_panel', or 'toast'",
       ));
     }
   };
@@ -1647,6 +1822,10 @@ fn create_ui_element_handle(lua: &Lua, context: &UiApiContext, options: Table) -
     .get::<Value>("border_style")
     .and_then(parse_optional_style)?
     .unwrap_or_default();
+  let style = options
+    .get::<Value>("style")
+    .and_then(parse_optional_style)?
+    .unwrap_or_default();
   let content = options
     .get::<Option<Table>>("content")?
     .ok_or_else(|| mlua::Error::external("UI elements require a 'content' UI node"))?;
@@ -1656,12 +1835,15 @@ fn create_ui_element_handle(lua: &Lua, context: &UiApiContext, options: Table) -
     .map(|keys| parse_ui_keys(&keys))
     .transpose()?
     .unwrap_or_default();
-  if matches!(element_type, UiElementType::Toast { .. }) && !keys.is_empty() {
-    return Err(mlua::Error::external("Toast elements do not support key bindings"));
+  if matches!(element_type, UiElementType::Toast { .. } | UiElementType::Bar { .. })
+    && !keys.is_empty()
+  {
+    return Err(mlua::Error::external("Bar and Toast elements do not support key bindings"));
   }
-  let is_toast = matches!(element_type, UiElementType::Toast { .. });
+  let is_non_focusable =
+    matches!(element_type, UiElementType::Toast { .. } | UiElementType::Bar { .. });
   let id = Rc::new(Cell::new(0_u64));
-  let handle = make_ui_element_handle(lua, context, Rc::clone(&id), is_toast)?;
+  let handle = make_ui_element_handle(lua, context, Rc::clone(&id), is_non_focusable)?;
   let element_id = context
     .tree
     .borrow_mut()
@@ -1670,6 +1852,7 @@ fn create_ui_element_handle(lua: &Lua, context: &UiApiContext, options: Table) -
       title,
       border,
       border_style,
+      style,
       content_id,
       visible: options.get::<Option<bool>>("visible")?.unwrap_or(false),
     })
@@ -1693,7 +1876,7 @@ fn make_ui_element_handle(
   lua: &Lua,
   context: &UiApiContext,
   id: Rc<Cell<u64>>,
-  is_toast: bool,
+  is_non_focusable: bool,
 ) -> LuaResult<Table> {
   let handle = lua.create_table()?;
   let set = {
@@ -1707,8 +1890,8 @@ fn make_ui_element_handle(
     lua.create_function(move |lua, (property, value): (String, Value)| {
       ensure_ui_mutation_context(&config_loading, &in_callback)?;
       if property == "keys" {
-        if is_toast {
-          return Err(mlua::Error::external("Toast elements do not support key bindings"));
+        if is_non_focusable {
+          return Err(mlua::Error::external("Bar and Toast elements do not support key bindings"));
         }
         let Value::Table(keys) = value else {
           return Err(mlua::Error::external("UI element 'keys' property must be a table"));
@@ -1718,6 +1901,30 @@ fn make_ui_element_handle(
           .get::<Option<Table>>(id_for_keys.get())?
           .ok_or_else(|| mlua::Error::external("UI element handle is no longer reachable"))?;
         handle.set("__zmux_ui_keys", ui_keymap_table(lua, &keys)?)?;
+        return Ok(());
+      }
+      if property == "content" {
+        let Value::Table(content) = value else {
+          return Err(mlua::Error::external("Bar 'content' property must be a UI node"));
+        };
+        let changed = tree
+          .borrow_mut()
+          .replace_element_content(id.get(), ui_node_id(&content)?)
+          .map_err(mlua::Error::external)?;
+        finish_ui_mutation(changed, &config_loading, &commands);
+        return Ok(());
+      }
+      if property == "visible" {
+        let Value::Boolean(visible) = value else {
+          return Err(mlua::Error::external("UI element 'visible' property must be a boolean"));
+        };
+        let changed = if visible {
+          tree.borrow_mut().show(id.get())
+        } else {
+          tree.borrow_mut().hide(id.get())
+        }
+        .map_err(mlua::Error::external)?;
+        finish_ui_mutation(changed, &config_loading, &commands);
         return Ok(());
       }
       let (property_kind, value) = match property.as_str() {
@@ -1769,6 +1976,10 @@ fn make_ui_element_handle(
         "border_style" => {
           let style = parse_style(value)?.unwrap_or_default();
           (UiElementProperty::BorderStyle, UiElementValue::Style(style))
+        }
+        "style" => {
+          let style = parse_style(value)?.unwrap_or_default();
+          (UiElementProperty::Style, UiElementValue::Style(style))
         }
         _ => {
           return Err(mlua::Error::external(format!("unknown UI element property '{property}'")));
@@ -1841,9 +2052,11 @@ fn valid_event_name(name: &str) -> bool {
     name,
     "PreClient"
       | "ClientLoaded"
+      | "ConfigLoaded"
       | "session_created"
       | "session_selected"
       | "session_closed"
+      | "last_error_changed"
       | "workspace_created"
       | "workspace_closed"
       | "workspace_selected"
@@ -1970,13 +2183,14 @@ fn validate_file_config_api_version(source: &str) -> LuaResult<()> {
 }
 
 pub fn load_file_with_context(
-  path: &std::path::Path,
+  path: &Path,
   arguments: &[String],
   launch: LaunchState,
 ) -> LuaResult<AppConfig> {
-  let source = std::fs::read_to_string(path).map_err(mlua::Error::external)?;
+  let path = absolute_path(path).map_err(mlua::Error::external)?;
+  let source = std::fs::read_to_string(&path).map_err(mlua::Error::external)?;
   validate_file_config_api_version(&source)?;
-  let config = load_config_with_context(&source, arguments, launch)?;
+  let config = load_config_with_source_path(&source, arguments, launch, Some(&path))?;
   if config.config_api_version.is_none() {
     return Err(mlua::Error::external(format!(
       "configuration must declare opt.config_version = {CONFIG_API_VERSION}"
@@ -1992,19 +2206,119 @@ mod tests {
   #[test]
   fn lua_exposes_program_and_config_api_versions() {
     load_config(
-      "assert(type(zmux.version) == 'string' and #zmux.version > 0)\nassert(zmux.config_api_version == 1)",
+      "assert(type(zmux.version) == 'string' and #zmux.version > 0)\nassert(zmux.config_api_version == 2)",
     )
     .expect("runtime version metadata");
   }
 
   #[test]
+  fn require_searches_the_config_directory_before_standard_paths() {
+    let directory = std::env::temp_dir().join(format!(
+      "zmux-config-require-test-{}-{}",
+      std::process::id(),
+      std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock after epoch")
+        .as_nanos(),
+    ));
+    std::fs::create_dir_all(&directory).expect("create temporary config directory");
+    let root = directory.join("zmux.lua");
+    let module_name = format!("zmux_import_base_{}", std::process::id());
+    std::fs::write(
+      &root,
+      format!(
+        "opt.config_version = 2\nlocal bars = require('{module_name}')\nassert(bars.value == 'from config directory')\nassert(import('{module_name}') == bars)"
+      ),
+    )
+    .expect("write root configuration");
+    std::fs::write(
+      directory.join(format!("{module_name}.lua")),
+      "return { value = 'from config directory' }",
+    )
+    .expect("write module beside root configuration");
+
+    load_file_with_context(&root, &[], LaunchState::default())
+      .unwrap_or_else(|error| panic!("require should find modules beside the config: {error}"));
+
+    std::fs::remove_dir_all(directory).expect("remove temporary config directory");
+  }
+
+  #[test]
+  fn imports_resolve_relative_to_each_lua_source_and_cache_by_path() {
+    let directory = std::env::temp_dir().join(format!(
+      "zmux-config-import-test-{}-{}",
+      std::process::id(),
+      std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock after epoch")
+        .as_nanos(),
+    ));
+    std::fs::create_dir_all(directory.join("bare")).expect("create bare module directory");
+    std::fs::create_dir_all(directory.join("one")).expect("create first relative module directory");
+    std::fs::create_dir_all(directory.join("two"))
+      .expect("create second relative module directory");
+    let root = directory.join("zmux.lua");
+    let package_path = directory.display().to_string().replace('\\', "/");
+    std::fs::write(
+      &root,
+      format!(
+        r#"
+          opt.config_version = 2
+          package.path = [=[{package_path}/?.lua;]=] .. package.path
+          local bare = import("bare.main")
+          assert(bare.value == "bare:nested" and bare.name == "bare.main")
+          local one = import("./one.main")
+          local two = import("./two.main")
+          assert(one.value == "one" and one.name == "./one.main")
+          assert(two.value == "two" and two.name == "./two.main")
+          assert(import("./one.main") == one)
+          assert(one.helper_runs == 1 and two.helper_runs == 1)
+        "#
+      ),
+    )
+    .expect("write root configuration");
+    std::fs::write(
+      directory.join("bare/main.lua"),
+      "return { value = import('./nested') .. ':nested', name = ... }",
+    )
+    .expect("write bare module");
+    std::fs::write(directory.join("bare/nested.lua"), "return 'bare'")
+      .expect("write nested bare module");
+    std::fs::write(
+      directory.join("one/main.lua"),
+      "local helper = import('./helper')\nreturn { value = helper.value, helper_runs = helper.runs, name = ... }", 
+    )
+    .expect("write first relative module");
+    std::fs::write(
+      directory.join("one/helper.lua"),
+      "_G.one_helper_runs = (_G.one_helper_runs or 0) + 1\nreturn { value = 'one', runs = _G.one_helper_runs }",
+    )
+    .expect("write first relative helper");
+    std::fs::write(
+      directory.join("two/main.lua"),
+      "local helper = import('./helper')\nreturn { value = helper.value, helper_runs = helper.runs, name = ... }", 
+    )
+    .expect("write second relative module");
+    std::fs::write(
+      directory.join("two/helper.lua"),
+      "_G.two_helper_runs = (_G.two_helper_runs or 0) + 1\nreturn { value = 'two', runs = _G.two_helper_runs }",
+    )
+    .expect("write second relative helper");
+
+    load_file_with_context(&root, &[], LaunchState::default())
+      .unwrap_or_else(|error| panic!("configuration imports should load: {error}"));
+
+    std::fs::remove_dir_all(directory).expect("remove temporary import directory");
+  }
+
+  #[test]
   fn declared_config_api_version_must_be_supported() {
-    let error = match load_config("opt.config_version = 2") {
+    let error = match load_config("opt.config_version = 3") {
       Ok(_) => panic!("unsupported config API must be rejected"),
       Err(error) => error,
     };
-    assert!(error.to_string().contains("config API version 2"));
-    assert!(error.to_string().contains("supports version 1"));
+    assert!(error.to_string().contains("config API version 3"));
+    assert!(error.to_string().contains("supports version 2"));
   }
 
   #[test]
@@ -2029,21 +2343,21 @@ mod tests {
     assert!(
       error
         .to_string()
-        .contains("must declare opt.config_version = 1")
+        .contains("must declare opt.config_version = 2")
     );
 
-    std::fs::write(&path, "opt.config_version = 2\nerror('stale config must not execute')")
+    std::fs::write(&path, "opt.config_version = 3\nerror('stale config must not execute')")
       .expect("write unsupported config");
     let error = match load_file_with_context(&path, &[], LaunchState::default()) {
       Ok(_) => panic!("unsupported config files must be rejected"),
       Err(error) => error,
     };
-    assert!(error.to_string().contains("config API version 2"));
+    assert!(error.to_string().contains("config API version 3"));
     assert!(!error.to_string().contains("stale config must not execute"));
 
     std::fs::write(
       &path,
-      "--[[ config header\nmultiline comment ]]\nopt.config_version = 1 -- current API",
+      "--[[ config header\nmultiline comment ]]\nopt.config_version = 2 -- current API",
     )
     .expect("write versioned config");
     let config = load_file_with_context(&path, &[], LaunchState::default())
@@ -2144,6 +2458,23 @@ mod tests {
   }
 
   #[test]
+  fn config_loaded_is_a_supported_lifecycle_event() {
+    let config = load_config(
+      "cmd.event.on('ConfigLoaded', function(event) assert(event.name == 'ConfigLoaded') end)",
+    )
+    .expect("ConfigLoaded handler config");
+    let handlers = config.lua.event_handlers("ConfigLoaded");
+    assert_eq!(handlers.len(), 1);
+    config
+      .lua
+      .invoke_event_handler(&handlers[0], &AppEvent {
+        name: "ConfigLoaded".to_owned(),
+        ..AppEvent::default()
+      })
+      .expect("run ConfigLoaded handler");
+  }
+
+  #[test]
   fn event_handlers_can_listen_to_multiple_events() {
     let config = load_config(
       r#"
@@ -2170,81 +2501,93 @@ mod tests {
 
   // Developer approved: do not remove.
   #[test]
-  fn sample_configuration_loads_with_luajit() {
+  fn sample_configuration_creates_mutable_top_and_bottom_bars() {
     let config = load_config(DEFAULT_CONFIG_SOURCE).expect("built-in Lua config");
     assert_eq!(config.config_api_version, Some(CONFIG_API_VERSION));
     assert_eq!(config.prefix_key, normalize_prefix_key("<C-Space>").expect("prefix"));
     assert_eq!(config.sequence_timeout, Duration::from_millis(700));
-    config.lua.sync_state(&snapshot()).expect("sync UI state");
-    let segments = config
+    let options = config.lua.sync_options().expect("bar options");
+    assert_eq!((options.top_bars, options.bottom_bars), (1, 1));
+    config
       .lua
-      .render_bar_part("top", "left")
-      .expect("sample top bar")
-      .expect("sample config supplies top-left tabs");
-    assert_eq!(segments.len(), 2);
-    assert_eq!(segments[1].text, " 2 shell-two ");
-    assert_eq!(segments[1].style.and_then(|style| style.bg), Some(Color::Cyan));
+      .sync_state(&snapshot())
+      .expect("sync built-in bar state");
+    for loaded in config.lua.event_handlers("ClientLoaded") {
+      config
+        .lua
+        .invoke_event_handler(&loaded, &AppEvent {
+          name: "ClientLoaded".to_owned(),
+          ..AppEvent::default()
+        })
+        .expect("initialize built-in bar content");
+    }
+
+    let area = ratatui::layout::Rect::new(0, 0, 120, 2);
+    let mut buffer = ratatui::buffer::Buffer::empty(area);
+    config.lua.render_ui_bars(
+      ratatui::layout::Rect::new(0, 0, 120, 1),
+      ratatui::layout::Rect::new(0, 1, 120, 1),
+      &mut buffer,
+    );
+    let rendered = buffer
+      .content
+      .iter()
+      .map(|cell| cell.symbol())
+      .collect::<String>();
+    assert!(rendered.contains("2 shell-two"));
+    assert!(rendered.contains("shell-two · running"));
+
+    let mut state = snapshot();
+    state.last_error = Some("server unavailable".to_owned());
+    config
+      .lua
+      .sync_state(&state)
+      .expect("sync changed bar state");
+    let error_changed = config.lua.event_handlers("last_error_changed").remove(0);
+    config
+      .lua
+      .invoke_event_handler(&error_changed, &AppEvent {
+        name: "last_error_changed".to_owned(),
+        ..AppEvent::default()
+      })
+      .expect("update the status Bar after an error event");
+    let mut refreshed = ratatui::buffer::Buffer::empty(area);
+    config.lua.render_ui_bars(
+      ratatui::layout::Rect::new(0, 0, 120, 1),
+      ratatui::layout::Rect::new(0, 1, 120, 1),
+      &mut refreshed,
+    );
+    let rendered = refreshed
+      .content
+      .iter()
+      .map(|cell| cell.symbol())
+      .collect::<String>();
+    assert!(rendered.contains("Error: server unavailable"), "rendered bars: {rendered:?}");
+  }
+
+  #[test]
+  fn built_in_bar_nodes_subscribe_only_to_relevant_state_events() {
+    let config = load_config(DEFAULT_CONFIG_SOURCE).expect("built-in Lua config");
+    assert_eq!(config.lua.event_handlers("leader_mode_changed").len(), 1);
+    assert_eq!(config.lua.event_handlers("terminal_resized").len(), 1);
+    assert_eq!(config.lua.event_handlers("tab_selected").len(), 2);
+    assert_eq!(config.lua.event_handlers("last_error_changed").len(), 1);
   }
 
   // Developer approved: do not remove.
   #[test]
-  fn repeated_ui_state_and_bar_callbacks_do_not_exhaust_the_lua_stack() {
+  fn repeated_ui_state_sync_does_not_exhaust_the_lua_stack() {
     let config = load_config(DEFAULT_CONFIG_SOURCE).expect("built-in Lua config");
-    let mut state = snapshot();
-    state.session = Some(zmux::protocol::SessionSnapshot {
-      number: "9".to_owned(),
-      active_workspace_id: 4,
-      workspaces: vec![zmux::protocol::WorkspaceSnapshot {
-        id: 4,
-        name: "project".to_owned(),
-        explicit_name: None,
-        working_directory: "/work/project".into(),
-        tabs: vec![zmux::protocol::TabSnapshot {
-          id: 20,
-          name: "2".to_owned(),
-          title: "shell-two".to_owned(),
-          exit_code: None,
-        }],
-        active_tab_id: 20,
-      }],
-    });
-    config
-      .lua
-      .globals
-      .set("temporary", true)
-      .expect("add a temporary UI-state field");
-    config.lua.sync_state(&state).expect("initial state sync");
-    assert!(matches!(
-      config
-        .lua
-        .globals
-        .get::<Value>("temporary")
-        .expect("read temporary field"),
-      Value::Nil
-    ));
-
+    let state = snapshot();
     for frame in 0..700 {
       config
         .lua
         .sync_state(&state)
         .unwrap_or_else(|error| panic!("frame {frame}: sync state failed: {error:?}"));
-      for anchor in ["top", "bottom"] {
-        for part in ["left", "center", "right"] {
-          config
-            .lua
-            .render_bar_part(anchor, part)
-            .unwrap_or_else(|error| panic!("frame {frame}: {anchor}.{part} failed: {error:?}"));
-        }
-      }
-      let mut fallback = BarSegment {
-        text: "fallback".to_owned(),
-        role: Some("tab".to_owned()),
-        style: None,
-      };
       config
         .lua
-        .apply_default_style(&mut fallback)
-        .unwrap_or_else(|error| panic!("frame {frame}: fallback style failed: {error:?}"));
+        .sync_options()
+        .unwrap_or_else(|error| panic!("frame {frame}: sync UI options failed: {error:?}"));
     }
   }
 
@@ -2412,6 +2755,26 @@ mod tests {
     assert!(load_config("cmd.key.bind('a<Esc>', function() end)").is_err());
   }
 
+  #[test]
+  fn key_bindings_can_request_a_manual_config_reload() {
+    let config = load_config(
+      "cmd.key.bind('r', function() cmd.config.reload() end, { desc = 'Reload config' })",
+    )
+    .expect("config reload binding");
+    let callback = config
+      .keymap
+      .binding_for(&parse_key_notation("r").expect("reload key"))
+      .expect("reload binding");
+
+    assert_eq!(
+      config
+        .lua
+        .invoke_key_callback(&callback)
+        .expect("invoke reload binding"),
+      vec![RuntimeCommand::ReloadConfig]
+    );
+  }
+
   // Developer approved: do not remove.
   #[test]
   fn lua_remains_usable_after_a_key_callback_errors() {
@@ -2451,6 +2814,16 @@ mod tests {
       ("tw".to_owned(), Some("Close tab".to_owned())),
       ("z".to_owned(), Some("Replaced".to_owned())),
     ]);
+  }
+
+  #[test]
+  fn live_reload_is_disabled_by_default_and_requires_a_boolean() {
+    let config = load_config("").expect("default config");
+    assert!(!config.live_reload);
+
+    let config = load_config("opt.live_reload = true").expect("live reload enabled");
+    assert!(config.live_reload);
+    assert!(load_config("opt.live_reload = 'yes'").is_err());
   }
 
   // Developer approved: do not remove.
@@ -2531,21 +2904,6 @@ mod tests {
     let mut buffer = Buffer::empty(area);
     config.lua.render_ui_elements(area, &mut buffer);
     assert!(buffer.content.iter().any(|cell| cell.symbol() == "R"));
-  }
-
-  #[test]
-  fn ui_constructors_are_rejected_from_bar_render_providers() {
-    let config = load_config(
-      r#"
-        opt.ui.bars.top.left = function()
-          cmd.ui.text({ text = "not during rendering" })
-          return "bar"
-        end
-      "#,
-    )
-    .expect("config with a render-time constructor attempt");
-
-    assert!(config.lua.render_bar_part("top", "left").is_err());
   }
 
   #[test]
@@ -2902,35 +3260,257 @@ mod tests {
     );
   }
 
-  // Developer approved: do not remove.
   #[test]
-  fn bar_functions_receive_synced_global_state_and_apply_styles() {
+  fn bars_accept_nested_slices_alignment_and_mutable_content() {
     let config = load_config(
       r#"
-            opt.ui.anchors.top.height = 2
-            opt.ui.anchors.bottom.visible = false
-            opt.ui.bars.top.left = function(g)
-                return {{
-                    text = g.active_tab.title,
-                    role = "left",
-                    style = function(segment, current)
-                        return {fg = current.active_tab.selected and "green" or "red", bold = true}
-                    end,
-                }}
-            end
-            "#,
+        local ui = cmd.ui
+        local left = ui.text({ text = "Left" })
+        local center = ui.align({
+          content = ui.row({ ui.text({ text = "Center" }) }),
+          horizontal = "center",
+        })
+        local right = ui.align({
+          content = ui.text({ text = "Right" }),
+          horizontal = "right",
+        })
+        local content = ui.slices({
+          slices = 3,
+          items = {
+            { index = 1, slice_width = 1, node = left },
+            { index = 2, slice_width = 1, node = center },
+            { index = 3, slice_width = 1, node = right },
+          },
+        })
+        saved_mutable_bar = cmd.ui.create({
+          type = "bar",
+          position = "top",
+          content = content,
+          style = { fg = "white", bg = "blue", bold = true },
+          visible = true,
+        })
+        saved_mutable_bar.set("content", ui.text({ text = "Replacement" }))
+        saved_mutable_bar.set("style", { bg = "red" })
+        saved_mutable_bar.set("visible", false)
+        saved_mutable_bar.show()
+      "#,
     )
-    .expect("valid UI configuration");
-    config.lua.sync_state(&snapshot()).expect("state sync");
-    let options = config.lua.sync_options().expect("UI options");
-    assert_eq!(options.top.height, 2);
-    assert!(!options.bottom.visible);
-    let segments = config
+    .expect("bar, slice, alignment, and mutable handle APIs should load");
+    assert_eq!(config.lua.sync_options().expect("bar visibility").top_bars, 1);
+    let area = ratatui::layout::Rect::new(0, 0, 20, 1);
+    let mut buffer = ratatui::buffer::Buffer::empty(area);
+    config
       .lua
-      .render_bar_part("top", "left")
-      .expect("render callback")
-      .expect("configured bar part");
-    assert_eq!(segments[0].text, "shell-two");
-    assert_eq!(segments[0].style.and_then(|style| style.fg), Some(Color::Green));
+      .render_ui_bars(area, ratatui::layout::Rect::new(0, 1, 20, 0), &mut buffer);
+    let rendered = buffer
+      .content
+      .iter()
+      .map(|cell| cell.symbol())
+      .collect::<String>();
+    assert!(rendered.contains("Replacement"));
+    assert_eq!(buffer[(0, 0)].style().bg, Some(Color::Red));
+  }
+
+  #[test]
+  fn bars_render_slice_ranges_alignment_and_inherited_style() {
+    use ratatui::{
+      buffer::Buffer,
+      layout::Rect,
+      style::{
+        Color,
+        Modifier,
+      },
+    };
+
+    let config = load_config(
+      r#"
+        local ui = cmd.ui
+        local content = ui.slices({
+          slices = 3,
+          items = {
+            { index = 1, slice_width = 1, node = ui.text({
+              text = "L",
+              style = { fg = "red", remove = { "bold" } },
+            }) },
+            { index = 2, slice_width = 1, node = ui.align({
+              content = ui.text({ text = "C" }),
+              horizontal = "center",
+            }) },
+            { index = 3, slice_width = 1, node = ui.align({
+              content = ui.text({ text = "R" }),
+              horizontal = "right",
+            }) },
+          },
+        })
+        saved_bar = cmd.ui.create({
+          type = "bar",
+          position = "top",
+          content = content,
+          style = { fg = "white", bg = "blue", bold = true },
+          visible = true,
+        })
+      "#,
+    )
+    .expect("bar configuration");
+    let options = config.lua.sync_options().expect("visible bar counts");
+    assert_eq!((options.top_bars, options.bottom_bars), (1, 0));
+
+    let area = Rect::new(0, 0, 12, 1);
+    let mut buffer = Buffer::empty(area);
+    config
+      .lua
+      .render_ui_bars(area, Rect::new(0, 1, 12, 0), &mut buffer);
+
+    assert_eq!(buffer[(0, 0)].symbol(), "L");
+    assert_eq!(buffer[(5, 0)].symbol(), "C");
+    assert_eq!(buffer[(11, 0)].symbol(), "R");
+    assert_eq!(buffer[(2, 0)].style().bg, Some(Color::Blue));
+    assert!(buffer[(2, 0)].style().add_modifier.contains(Modifier::BOLD));
+    assert_eq!(buffer[(0, 0)].style().fg, Some(Color::Red));
+    assert_eq!(buffer[(0, 0)].style().bg, Some(Color::Blue));
+    assert!(!buffer[(0, 0)].style().add_modifier.contains(Modifier::BOLD));
+    assert_eq!(buffer[(5, 0)].style().fg, Some(Color::White));
+    assert!(buffer[(5, 0)].style().add_modifier.contains(Modifier::BOLD));
+  }
+
+  #[test]
+  fn bar_height_errors_preserve_content_and_visibility_updates_reserved_rows() {
+    use ratatui::{
+      buffer::Buffer,
+      layout::Rect,
+    };
+
+    let config = load_config(
+      r#"
+        local ui = cmd.ui
+        local label = ui.text({ text = "OK" })
+        saved_bar = cmd.ui.create({
+          type = "bar",
+          position = "top",
+          content = label,
+          visible = true,
+        })
+        local text_ok = pcall(function() label.set("text", "one\ntwo") end)
+        assert(not text_ok)
+        local content_ok = pcall(function()
+          saved_bar.set("content", ui.column({
+            ui.text({ text = "one" }),
+            ui.text({ text = "two" }),
+          }))
+        end)
+        assert(not content_ok)
+        cmd.event.on("tab_selected", function() saved_bar.hide() end)
+      "#,
+    )
+    .expect("invalid mutations should be rejected without damaging the Bar");
+    assert_eq!(config.lua.sync_options().expect("bar visibility").top_bars, 1);
+
+    let area = Rect::new(0, 0, 8, 1);
+    let mut buffer = Buffer::empty(area);
+    config
+      .lua
+      .render_ui_bars(area, Rect::new(0, 1, 8, 0), &mut buffer);
+    assert_eq!(buffer[(0, 0)].symbol(), "O");
+
+    let callback = config.lua.event_handlers("tab_selected").remove(0);
+    let commands = config
+      .lua
+      .invoke_event_handler(&callback, &AppEvent::default())
+      .expect("hide retained Bar");
+    assert!(commands.contains(&RuntimeCommand::Redraw));
+    assert_eq!(config.lua.sync_options().expect("hidden bar").top_bars, 0);
+  }
+
+  #[test]
+  fn visible_bars_stack_in_creation_order_from_each_edge() {
+    use ratatui::{
+      buffer::Buffer,
+      layout::Rect,
+    };
+
+    let config = load_config(
+      r#"
+        local ui = cmd.ui
+        top_first = cmd.ui.create({ type = "bar", position = "top", content = ui.text({ text = "A" }), visible = true })
+        bottom_first = cmd.ui.create({ type = "bar", position = "bottom", content = ui.text({ text = "C" }), visible = true })
+        top_second = cmd.ui.create({ type = "bar", position = "top", content = ui.text({ text = "B" }), visible = true })
+        bottom_second = cmd.ui.create({ type = "bar", position = "bottom", content = ui.text({ text = "D" }), visible = true })
+      "#,
+    )
+    .expect("two top and bottom Bars");
+    let options = config.lua.sync_options().expect("visible bars");
+    assert_eq!((options.top_bars, options.bottom_bars), (2, 2));
+
+    let area = Rect::new(0, 0, 8, 5);
+    let mut buffer = Buffer::empty(area);
+    config
+      .lua
+      .render_ui_bars(Rect::new(0, 0, 8, 2), Rect::new(0, 3, 8, 2), &mut buffer);
+    assert_eq!(buffer[(0, 0)].symbol(), "A");
+    assert_eq!(buffer[(0, 1)].symbol(), "B");
+    assert_eq!(buffer[(0, 3)].symbol(), "D");
+    assert_eq!(buffer[(0, 4)].symbol(), "C");
+  }
+
+  #[test]
+  fn slice_layout_rejects_overlapping_and_out_of_range_items() {
+    let overlapping = load_config(
+      r#"
+        local ui = cmd.ui
+        ui.slices({
+          slices = 4,
+          items = {
+            { index = 1, slice_width = 3, node = ui.text({ text = "a" }) },
+            { index = 3, slice_width = 2, node = ui.text({ text = "b" }) },
+          },
+        })
+      "#,
+    );
+    assert!(overlapping.is_err());
+
+    let out_of_range = load_config(
+      r#"
+        local ui = cmd.ui
+        ui.slices({
+          slices = 4,
+          items = {
+            { index = 4, slice_width = 2, node = ui.text({ text = "x" }) },
+          },
+        })
+      "#,
+    );
+    assert!(out_of_range.is_err());
+  }
+
+  #[test]
+  fn bars_reject_more_than_two_per_edge_and_multiline_content() {
+    let too_many = load_config(
+      r#"
+        local ui = cmd.ui
+        for _ = 1, 3 do
+          cmd.ui.create({
+            type = "bar",
+            position = "top",
+            content = ui.text({ text = "bar" }),
+          })
+        end
+      "#,
+    );
+    assert!(too_many.is_err(), "a third bar at one edge must fail creation");
+
+    let too_tall = load_config(
+      r#"
+        local ui = cmd.ui
+        cmd.ui.create({
+          type = "bar",
+          position = "bottom",
+          content = ui.column({
+            ui.text({ text = "one" }),
+            ui.text({ text = "two" }),
+          }),
+        })
+      "#,
+    );
+    assert!(too_tall.is_err(), "bar content taller than one row must fail creation");
   }
 }

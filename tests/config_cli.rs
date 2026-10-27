@@ -98,10 +98,17 @@ fn config_init_installs_embedded_assets_and_marks_definitions_read_only() {
   assert_eq!(installed_settings, include_bytes!("../assets/luarc.json"));
   serde_json::from_slice::<serde_json::Value>(&installed_settings)
     .expect("installed LuaLS settings should be valid JSON");
+  let example = config_directory.join("zmux.lua.example");
   assert_eq!(
-    fs::read(config_directory.join("zmux.lua.example")).expect("read installed example"),
+    fs::read(&example).expect("read installed example"),
     include_bytes!("../assets/zmux.lua.example"),
   );
+  let check = zmux()
+    .args(["config", "check"])
+    .env("ZMUX_CONFIG", &example)
+    .output()
+    .expect("validate installed example");
+  assert!(check.status.success(), "{}", String::from_utf8_lossy(&check.stderr));
   assert!(!config_directory.join("zmux.lua").exists(), "init must not create active user config");
   assert!(
     fs::metadata(config_directory.join("defs.lua"))
@@ -177,7 +184,7 @@ fn config_init_requires_confirmation_before_replacing_and_keeps_one_backup() {
 fn config_check_validates_explicit_config_without_starting_the_server() {
   let directory = TempDirectory::new();
   let config = directory.path().join("user.lua");
-  fs::write(&config, "opt.config_version = 1\nopt.prefix_key = '<C-x>'\n")
+  fs::write(&config, "opt.config_version = 2\nopt.prefix_key = '<C-x>'\n")
     .expect("write valid config");
 
   let output = zmux()

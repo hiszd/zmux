@@ -12,15 +12,10 @@
 //! let view = UiRender {
 //!     screen: terminal_screen,
 //!     leader_mode: false,
-//!     tab_count: 2,
-//!     active_tab: 0,
-//!     active_title: "shell",
-//!     active_exit_code: None,
 //!     modal: None,
 //!     which_key: WhichKeyPopup::default(),
 //!     key_warning: None,
 //!     options,
-//!     bars: BarContents::default(),
 //!     lua: &lua_config,
 //!     trace: &trace,
 //! };
@@ -65,7 +60,9 @@ use ratatui::{
     Block,
     Borders,
     Clear,
+    Paragraph,
     Widget,
+    Wrap,
   },
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -74,7 +71,6 @@ use unicode_width::UnicodeWidthStr;
 use crate::{
   input::which_key::WhichKeyPopup,
   lua::{
-    BarSegment,
     LuaConfig,
     UiOptions,
   },
@@ -131,31 +127,6 @@ impl std::str::FromStr for CursorShape {
   }
 }
 
-/// The three horizontally aligned groups in one status bar.
-///
-/// `None` means “use the built-in group” when passed through [`draw`]. `Some`
-/// with an empty vector means “intentionally render nothing”. Each segment's
-/// text may contain newlines; the corresponding line is selected while the bar
-/// is painted.
-#[derive(Clone, Default)]
-pub struct BarParts {
-  /// Segments drawn from the left edge.
-  pub left: Option<Vec<BarSegment>>,
-  /// Segments centered in the bar.
-  pub center: Option<Vec<BarSegment>>,
-  /// Segments drawn from the right edge.
-  pub right: Option<Vec<BarSegment>>,
-}
-
-/// Top and bottom status-bar content supplied to [`draw`].
-#[derive(Clone, Default)]
-pub struct BarContents {
-  /// Content for the top anchor.
-  pub top: BarParts,
-  /// Content for the bottom anchor.
-  pub bottom: BarParts,
-}
-
 /// A centered modal containing an optional query, selectable rows, and footer.
 ///
 /// Rows are vertically scrolled so `selected_row` remains visible. The modal
@@ -185,25 +156,17 @@ pub struct UiRender<'a> {
   pub cursor_visible: bool,
   /// Whether the leader key mode indicator is active.
   pub leader_mode: bool,
-  /// Number of tabs represented by the default top bar.
-  pub tab_count: usize,
-  /// Zero-based active tab index.
-  pub active_tab: usize,
-  /// Title used by the default bottom bar.
-  pub active_title: &'a str,
-  /// Exit code shown when the active terminal has exited.
-  pub active_exit_code: Option<u32>,
   /// Optional modal drawn over the panel.
   pub modal: Option<ModalOverlay<'a>>,
   /// Which-key popup shown while leader input is active.
   pub which_key: WhichKeyPopup,
-  /// Optional warning replacing the default right bottom-bar group.
+  /// Optional warning drawn over the bottom-most visible Bar.
   pub key_warning: Option<&'a str>,
-  /// Visibility and height settings for the anchors.
+  /// Optional temporary configuration reload notification.
+  pub reload_warning: Option<&'a str>,
+  /// UI layout and PTY style options.
   pub options: UiOptions,
-  /// User-supplied top and bottom bar groups.
-  pub bars: BarContents,
-  /// Lua configuration used to resolve segment styles.
+  /// Lua configuration that owns and renders UI elements.
   pub lua: &'a LuaConfig,
   /// Frame timing and state trace sink.
   pub trace: &'a Trace,
@@ -274,36 +237,27 @@ fn render_screen(buffer: &mut ratatui::buffer::Buffer, area: Rect, screen: &Grid
 
 /// Computes the rectangles used by the UI.
 ///
-/// Anchor heights are clamped to the available area. The PTY uses the full
-/// width between the top and bottom anchors; configurable Drawers are overlays
-/// and do not affect its geometry.
+/// Visible Bars reserve one row each, up to the available area. The PTY uses
+/// the full width between the top and bottom anchors; other UI Elements are
+/// overlays and do not affect its geometry.
 ///
 /// ```
 /// # use zmux::ui::layout;
-/// # use zmux::lua::{AnchorOptions, UiOptions};
+/// # use zmux::lua::UiOptions;
 /// # use ratatui::layout::Rect;
 /// let options = UiOptions {
-///     top: AnchorOptions { height: 1, visible: true },
-///     bottom: AnchorOptions { height: 1, visible: true },
+///     top_bars: 1,
+///     bottom_bars: 1,
 ///     ..UiOptions::default()
 /// };
 /// let parts = layout(Rect::new(0, 0, 80, 24), options);
 /// assert_eq!((parts.pane.width, parts.pane.height), (78, 21));
 /// ```
 pub fn layout(area: Rect, options: UiOptions) -> UiLayout {
-  let top_height = if options.top.visible {
-    options.top.height.min(area.height)
-  } else {
-    0
-  };
-  let bottom_height = if options.bottom.visible {
-    options
-      .bottom
-      .height
-      .min(area.height.saturating_sub(top_height))
-  } else {
-    0
-  };
+  let top_height = options.top_bars.min(area.height);
+  let bottom_height = options
+    .bottom_bars
+    .min(area.height.saturating_sub(top_height));
   let panel_height = area.height.saturating_sub(top_height + bottom_height);
   let panel = Rect::new(area.x, area.y + top_height, area.width, panel_height);
   let top_anchor = Rect::new(area.x, area.y, area.width, top_height);
@@ -332,12 +286,9 @@ pub fn pane_size(width: u16, height: u16, options: UiOptions) -> (u16, u16) {
 
 /// Renders one complete UI frame.
 ///
-/// The sequence is significant: bars and the PTY are painted first, then the
-/// modal and which-key popup. Overlays can therefore obscure terminal content
-/// without changing the terminal model.
-/// Lua-configured bar styles are applied before painting. A Lua error is
-/// returned to the caller so the event loop can decide whether it is
-/// recoverable.
+/// The sequence is significant: retained Bars and the PTY are painted first,
+/// then UI overlays, the modal, and the which-key popup. Overlays can obscure
+/// terminal content without changing the terminal model.
 pub fn draw(frame: &mut Frame<'_>, view: &UiRender<'_>) -> mlua::Result<()> {
   let frame_started = Instant::now();
   let area = frame.area();
@@ -349,9 +300,11 @@ pub fn draw(frame: &mut Frame<'_>, view: &UiRender<'_>) -> mlua::Result<()> {
     )
   };
   view.trace.mark(&format!(
-    "ui-frame-layout area={}x{} pty={} pane={}",
+    "ui-frame-layout area={}x{} top_bars={} bottom_bars={} pty={} pane={}",
     area.width,
     area.height,
+    view.options.top_bars,
+    view.options.bottom_bars,
     rect_detail(Some(layout.pty)),
     rect_detail(Some(layout.pane)),
   ));
@@ -366,37 +319,35 @@ pub fn draw(frame: &mut Frame<'_>, view: &UiRender<'_>) -> mlua::Result<()> {
     which_key_visible,
     rect_detail(which_key_area),
   ));
-  let mut top_contents = defaulted_parts(
-    view.bars.top.clone(),
-    default_top_parts(view.tab_count, view.active_tab, view.leader_mode),
-  );
-  let mut bottom_contents = defaulted_parts(
-    view.bars.bottom.clone(),
-    default_bottom_parts(view.active_title, view.active_exit_code, area.width, area.height),
-  );
-  apply_styles(view.lua, &mut top_contents, "top", view.trace)?;
-  apply_styles(view.lua, &mut bottom_contents, "bottom", view.trace)?;
-  if let Some(warning) = view.key_warning {
-    bottom_contents.right = Some(vec![BarSegment {
-      text: format!(" {warning} "),
-      role: None,
-      style: Some(
-        Style::default()
-          .fg(Color::Yellow)
-          .add_modifier(Modifier::BOLD),
-      ),
-    }]);
-  }
   let screen_started = Instant::now();
   let screen = view.screen;
   let buffer_started = Instant::now();
   {
     let buffer = frame.buffer_mut();
-    if !layout.top_anchor.is_empty() {
-      draw_bar(buffer, layout.top_anchor, &top_contents);
-    }
-    if !layout.bottom_anchor.is_empty() {
-      draw_bar(buffer, layout.bottom_anchor, &bottom_contents);
+    view
+      .lua
+      .render_ui_bars(layout.top_anchor, layout.bottom_anchor, buffer);
+    if let Some(warning) = view.key_warning
+      && !layout.bottom_anchor.is_empty()
+    {
+      let text = format!(" {warning} ");
+      let width =
+        UnicodeWidthStr::width(text.as_str()).min(usize::from(layout.bottom_anchor.width)) as u16;
+      let x = layout
+        .bottom_anchor
+        .x
+        .saturating_add(layout.bottom_anchor.width.saturating_sub(width));
+      let y = layout.bottom_anchor.y + layout.bottom_anchor.height - 1;
+      draw_styled_text(
+        buffer,
+        layout.bottom_anchor,
+        y,
+        x,
+        &text,
+        Style::default()
+          .fg(Color::Yellow)
+          .add_modifier(Modifier::BOLD),
+      );
     }
     Block::default()
       .borders(view.options.pty.border.borders())
@@ -419,6 +370,9 @@ pub fn draw(frame: &mut Frame<'_>, view: &UiRender<'_>) -> mlua::Result<()> {
   if which_key_visible {
     (&view.which_key).render(area, frame.buffer_mut());
   }
+  if let Some(warning) = view.reload_warning {
+    render_reload_warning(area, warning, frame.buffer_mut());
+  }
   if view.modal.is_none()
     && let Some((true, row, column)) = cursor
   {
@@ -437,6 +391,34 @@ pub fn draw(frame: &mut Frame<'_>, view: &UiRender<'_>) -> mlua::Result<()> {
   );
 
   Ok(())
+}
+
+fn render_reload_warning(area: Rect, warning: &str, buffer: &mut ratatui::buffer::Buffer) {
+  if area.is_empty() {
+    return;
+  }
+  let width = UnicodeWidthStr::width(warning)
+    .saturating_add(2)
+    .clamp(24, 64)
+    .min(usize::from(area.width)) as u16;
+  let width = width.max(1);
+  let height = 4.min(area.height);
+  let popup =
+    Rect::new(area.x.saturating_add(area.width.saturating_sub(width)), area.y, width, height);
+  Clear.render(popup, buffer);
+  Paragraph::new(warning)
+    .wrap(Wrap { trim: true })
+    .block(
+      Block::default()
+        .title("Config reload failed")
+        .borders(Borders::ALL)
+        .border_style(
+          Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+        ),
+    )
+    .render(popup, buffer);
 }
 
 impl Widget for &ModalOverlay<'_> {
@@ -486,11 +468,14 @@ impl Widget for &ModalOverlay<'_> {
     if let Some(query) = modal.query
       && y < inner.y.saturating_add(inner.height)
     {
-      draw_segments(buffer, inner, y, inner.x, &[BarSegment {
-        text: format!("> {query}"),
-        role: None,
-        style: Some(Style::default().fg(Color::Yellow).bg(Color::Black)),
-      }]);
+      draw_styled_text(
+        buffer,
+        inner,
+        y,
+        inner.x,
+        &format!("> {query}"),
+        Style::default().fg(Color::Yellow).bg(Color::Black),
+      );
       y += 1;
     }
     let bottom = inner.y.saturating_add(inner.height);
@@ -519,209 +504,52 @@ impl Widget for &ModalOverlay<'_> {
       } else {
         Style::default().fg(Color::White).bg(Color::Black)
       };
-      draw_segments(buffer, inner, y, inner.x, &[BarSegment {
-        text: text.clone(),
-        role: None,
-        style: Some(style),
-      }]);
+      draw_styled_text(buffer, inner, y, inner.x, text, style);
       y += 1;
     }
     if y < bottom {
-      draw_segments(buffer, inner, bottom - 1, inner.x, &[BarSegment {
-        text: modal.footer.to_owned(),
-        role: None,
-        style: Some(Style::default().fg(Color::Gray).bg(Color::Black)),
-      }]);
+      draw_styled_text(
+        buffer,
+        inner,
+        bottom - 1,
+        inner.x,
+        modal.footer,
+        Style::default().fg(Color::Gray).bg(Color::Black),
+      );
     }
   }
 }
 
-/// Resolves Lua-defined default styles for every segment in a bar.
-fn apply_styles(
-  lua: &LuaConfig,
-  parts: &mut BarParts,
-  anchor: &str,
-  trace: &Trace,
-) -> mlua::Result<()> {
-  for (part_name, segments) in [
-    ("left", parts.left.as_mut()),
-    ("center", parts.center.as_mut()),
-    ("right", parts.right.as_mut()),
-  ] {
-    if let Some(segments) = segments {
-      for (index, segment) in segments.iter_mut().enumerate() {
-        if let Err(error) = lua.apply_default_style(segment) {
-          trace.error(
-            &format!(
-              "ui.default_style anchor={anchor} part={part_name} segment={} role={:?}",
-              index + 1,
-              segment.role
-            ),
-            &error,
-          );
-          return Err(error);
-        }
-      }
-    }
-  }
-  Ok(())
-}
-
-/// Fills only missing bar groups, preserving explicitly empty groups.
-fn defaulted_parts(mut configured: BarParts, defaults: BarParts) -> BarParts {
-  if configured.left.is_none() {
-    configured.left = defaults.left;
-  }
-  if configured.center.is_none() {
-    configured.center = defaults.center;
-  }
-  if configured.right.is_none() {
-    configured.right = defaults.right;
-  }
-  configured
-}
-
-/// Builds the built-in tab and leader indicators for the top bar.
-fn default_top_parts(tab_count: usize, active_tab: usize, leader_mode: bool) -> BarParts {
-  let tabs = (1..=tab_count)
-    .map(|index| BarSegment {
-      text: format!(" {index} "),
-      role: Some(if index == active_tab + 1 {
-        "selected_tab".to_owned()
-      } else {
-        "tab".to_owned()
-      }),
-      style: None,
-    })
-    .collect();
-  BarParts {
-    left: Some(tabs),
-    right: leader_mode.then(|| {
-      vec![BarSegment {
-        text: " LEADER ".to_owned(),
-        role: Some("leader".to_owned()),
-        style: None,
-      }]
-    }),
-    ..BarParts::default()
-  }
-}
-
-/// Builds the built-in active-terminal and terminal-size indicators.
-fn default_bottom_parts(
-  active_title: &str,
-  exit_code: Option<u32>,
-  width: u16,
-  height: u16,
-) -> BarParts {
-  let status = exit_code.map_or_else(String::new, |code| format!(" exited ({code})"));
-  BarParts {
-    left: Some(vec![BarSegment {
-      text: format!(" {active_title}{status} "),
-      role: Some("active_terminal".to_owned()),
-      style: None,
-    }]),
-    right: Some(vec![BarSegment {
-      text: format!(" {width}x{height} "),
-      role: Some("terminal_size".to_owned()),
-      style: None,
-    }]),
-    ..BarParts::default()
-  }
-}
-
-/// Clears and paints all bar rows, aligning left, center, and right groups.
-fn draw_bar(buffer: &mut ratatui::buffer::Buffer, area: Rect, parts: &BarParts) {
-  for row in area.y..area.y + area.height {
-    for column in area.x..area.x + area.width {
-      buffer[(column, row)]
-        .set_symbol(" ")
-        .set_style(Style::default());
-    }
-  }
-  for row in 0..area.height {
-    let y = area.y + row;
-    let left = line_segments(parts.left.as_deref(), row);
-    let center = line_segments(parts.center.as_deref(), row);
-    let right = line_segments(parts.right.as_deref(), row);
-    let left_width = segments_width(&left);
-    let center_width = segments_width(&center);
-    let right_width = segments_width(&right);
-    draw_segments(buffer, area, y, area.x, &left);
-    let center_x = area.x + area.width.saturating_sub(center_width) / 2;
-    draw_segments(buffer, area, y, center_x, &center);
-    let right_x = area.x + area.width.saturating_sub(right_width);
-    draw_segments(buffer, area, y, right_x.max(area.x + left_width), &right);
-  }
-}
-
-/// Selects one line from each possibly multiline segment.
-fn line_segments(segments: Option<&[BarSegment]>, line: u16) -> Vec<BarSegment> {
-  segments
-    .unwrap_or_default()
-    .iter()
-    .filter_map(|segment| {
-      let text = segment.text.lines().nth(usize::from(line))?;
-      Some(BarSegment {
-        text: text.to_owned(),
-        role: segment.role.clone(),
-        style: segment.style,
-      })
-    })
-    .collect()
-}
-
-/// Calculates display width using terminal columns, saturating at `u16::MAX`.
-fn segments_width(segments: &[BarSegment]) -> u16 {
-  segments
-    .iter()
-    .map(|segment| UnicodeWidthStr::width(segment.text.as_str()).min(usize::from(u16::MAX)) as u16)
-    .fold(0_u16, u16::saturating_add)
-}
-
-/// Draws segments left-to-right, clipping at the area's right edge.
+/// Draws styled text within a rectangular area, clipping at its right edge.
 ///
 /// Zero-width graphemes (for example combining accents) are appended to the
 /// preceding cell rather than consuming another terminal column.
-fn draw_segments(
+fn draw_styled_text(
   buffer: &mut ratatui::buffer::Buffer,
   area: Rect,
   y: u16,
   mut x: u16,
-  segments: &[BarSegment],
+  text: &str,
+  style: Style,
 ) {
   let end = area.x.saturating_add(area.width);
-  for segment in segments {
-    let style = segment.style.unwrap_or_else(|| default_style(segment));
-    for grapheme in segment.text.graphemes(true) {
-      let width = UnicodeWidthStr::width(grapheme) as u16;
-      if width == 0 {
-        if x > area.x {
-          let previous = buffer[(x - 1, y)].symbol().to_owned();
-          buffer[(x - 1, y)].set_symbol(&format!("{previous}{grapheme}"));
-        }
-        continue;
+  for grapheme in text.graphemes(true) {
+    let width = UnicodeWidthStr::width(grapheme) as u16;
+    if width == 0 {
+      if x > area.x {
+        let previous = buffer[(x - 1, y)].symbol().to_owned();
+        buffer[(x - 1, y)].set_symbol(&format!("{previous}{grapheme}"));
       }
-      if x.saturating_add(width) > end {
-        return;
-      }
-      buffer[(x, y)].set_symbol(grapheme).set_style(style);
-      x += width;
+      continue;
     }
-  }
-}
-
-/// Supplies the built-in style for a segment without an explicit style.
-fn default_style(segment: &BarSegment) -> Style {
-  match segment.role.as_deref() {
-    Some("selected_tab") => Style::default()
-      .fg(Color::Yellow)
-      .add_modifier(Modifier::BOLD),
-    Some("leader") => Style::default()
-      .fg(Color::Black)
-      .bg(Color::Yellow)
-      .add_modifier(Modifier::BOLD),
-    _ => Style::default().fg(Color::Gray),
+    if x.saturating_add(width) > end {
+      return;
+    }
+    let inherited = buffer[(x, y)].style();
+    buffer[(x, y)]
+      .set_symbol(grapheme)
+      .set_style(inherited.patch(style));
+    x += width;
   }
 }
 
@@ -781,25 +609,17 @@ mod tests {
     UiOptions,
     layout,
     pane_size,
+    render_reload_warning,
     render_screen,
   };
-  use crate::{
-    lua::AnchorOptions,
-    terminal_emulator::TerminalEmulator,
-  };
+  use crate::terminal_emulator::TerminalEmulator;
 
   // Developer approved: do not remove.
   #[test]
   fn anchors_reserve_rows_without_a_workspace_drawer() {
     let options = UiOptions {
-      top: AnchorOptions {
-        height: 2,
-        visible: true,
-      },
-      bottom: AnchorOptions {
-        height: 3,
-        visible: true,
-      },
+      top_bars: 2,
+      bottom_bars: 3,
       ..UiOptions::default()
     };
     let parts = layout(Rect::new(0, 0, 100, 30), options);
@@ -813,7 +633,23 @@ mod tests {
   #[test]
   fn drawer_overlays_do_not_reduce_the_pty_viewport() {
     let options = UiOptions::default();
-    assert_eq!(pane_size(80, 24, options), (20, 78));
+    assert_eq!(pane_size(80, 24, options), (22, 78));
+  }
+
+  #[test]
+  fn reload_warnings_render_as_a_bordered_popup() {
+    let area = Rect::new(0, 0, 40, 8);
+    let mut buffer = Buffer::empty(area);
+
+    render_reload_warning(area, "invalid Lua config", &mut buffer);
+
+    let rendered = buffer
+      .content()
+      .iter()
+      .map(|cell| cell.symbol())
+      .collect::<String>();
+    assert!(rendered.contains("Config reload failed"));
+    assert!(rendered.contains("invalid Lua config"));
   }
 
   #[test]
@@ -826,8 +662,8 @@ mod tests {
       ..UiOptions::default()
     };
     let parts = layout(Rect::new(0, 0, 80, 24), options);
-    assert_eq!((parts.pane.width, parts.pane.height), (80, 22));
-    assert_eq!(pane_size(80, 24, options), (22, 80));
+    assert_eq!((parts.pane.width, parts.pane.height), (80, 24));
+    assert_eq!(pane_size(80, 24, options), (24, 80));
   }
 
   // Developer approved: do not remove.

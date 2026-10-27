@@ -113,6 +113,7 @@ use zmux::{
   },
 };
 
+use super::config_reload::ConfigReloader;
 use crate::{
   clipboard::{
     ClipboardProvider,
@@ -160,6 +161,8 @@ pub fn run(
   launch: lua::LaunchState,
   startup_commands: Vec<RuntimeCommand>,
   config: lua::AppConfig,
+  config_path: Option<PathBuf>,
+  config_arguments: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
   let trace = Trace::from_environment();
   trace.mark("client-start");
@@ -199,6 +202,9 @@ pub fn run(
   let result = run_event_loop(
     &mut terminal,
     config,
+    config_path,
+    config_arguments,
+    launch.clone(),
     receiver,
     request_sender,
     ClientSession::new(connection.session, connection.terminals, viewport),
@@ -715,19 +721,6 @@ impl ClientSession {
       .find(|tab| tab.id == workspace.active_tab_id)
   }
 
-  /// Returns the active tab's zero-based index for UI selection.
-  fn active_tab_index(&self) -> usize {
-    self
-      .active_workspace()
-      .and_then(|workspace| {
-        workspace
-          .tabs
-          .iter()
-          .position(|tab| tab.id == workspace.active_tab_id)
-      })
-      .unwrap_or_default()
-  }
-
   /// Returns the parsed terminal belonging to the active tab.
   fn active_terminal(&self) -> Option<&TerminalView> { self.terminals.get(&self.active_tab()?.id) }
 
@@ -749,6 +742,15 @@ impl ClientSession {
         .insert(id, TerminalView::from_snapshot(terminal));
     }
     self.snapshot = snapshot;
+  }
+
+  /// Updates the error shown in the status Bar and reports whether it changed.
+  fn set_last_error(&mut self, error: Option<String>) -> bool {
+    if self.last_error == error {
+      return false;
+    }
+    self.last_error = error;
+    true
   }
 
   /// Feeds terminal output into a tab's Alacritty emulator.
@@ -1067,6 +1069,26 @@ impl Effects {
   }
 }
 
+fn client_ready_events() -> Vec<UiEvent> {
+  vec![
+    UiEvent {
+      name: "ConfigLoaded".to_owned(),
+      ..UiEvent::default()
+    },
+    UiEvent {
+      name: "ClientLoaded".to_owned(),
+      ..UiEvent::default()
+    },
+  ]
+}
+
+fn last_error_changed_event() -> UiEvent {
+  UiEvent {
+    name: "last_error_changed".to_owned(),
+    ..UiEvent::default()
+  }
+}
+
 /// Mutable services shared by event handlers and runtime-command execution.
 struct ClientContext<'a> {
   /// Mutable application/session state.
@@ -1084,6 +1106,16 @@ struct ClientContext<'a> {
   /// Lua configuration and callback interface.
   lua: &'a LuaConfig,
   /// Trace sink for event and performance diagnostics.
+  trace: &'a Trace,
+}
+
+struct ConfigReloadContext<'a> {
+  session: &'a mut ClientSession,
+  outer_size: &'a mut (u16, u16),
+  viewport: &'a mut Viewport,
+  dispatcher: &'a mut KeyDispatcher,
+  sender: &'a Sender<ClientMessage>,
+  next_request_id: &'a mut u64,
   trace: &'a Trace,
 }
 
@@ -1186,7 +1218,10 @@ struct ClientStartup {
 #[allow(clippy::too_many_arguments)] // The shared trace sink spans the loop and caller-side cleanup.
 fn run_event_loop(
   terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-  config: lua::AppConfig,
+  mut config: lua::AppConfig,
+  config_path: Option<PathBuf>,
+  config_arguments: Vec<String>,
+  reload_launch: lua::LaunchState,
   receiver: Receiver<ClientEvent>,
   sender: Sender<ClientMessage>,
   mut session: ClientSession,
@@ -1204,8 +1239,10 @@ fn run_event_loop(
     columns: initial_pane.1.max(1),
   };
   let mut next_request_id = 1;
+  let mut reloader =
+    config_path.map(|path| ConfigReloader::new(path, config_arguments, reload_launch));
   let mut dispatcher =
-    KeyDispatcher::new(config.prefix_key, config.sequence_timeout, config.keymap);
+    KeyDispatcher::new(config.prefix_key, config.sequence_timeout, config.keymap.clone());
   let initial_events = initial_session_events(&session.snapshot, startup.created_session);
   let mut startup_effects = dispatch_ui_events(
     Effects {
@@ -1233,10 +1270,7 @@ fn run_event_loop(
   if startup_requests.is_empty() {
     let loaded = dispatch_ui_events(
       Effects {
-        events: vec![UiEvent {
-          name: "ClientLoaded".to_owned(),
-          ..UiEvent::default()
-        }],
+        events: client_ready_events(),
         ..Effects::default()
       },
       &mut ClientContext {
@@ -1256,8 +1290,69 @@ fn run_event_loop(
   }
   let mut needs_draw = client_loaded && startup_requests.is_empty();
   let mut last_draw = Instant::now();
+  let mut reload_warning: Option<(String, Instant)> = None;
 
   'event_loop: loop {
+    let now = Instant::now();
+    if reload_warning
+      .as_ref()
+      .is_some_and(|(_, deadline)| now >= *deadline)
+    {
+      reload_warning = None;
+      needs_draw = true;
+    }
+    let client_ready = client_loaded && startup_requests.is_empty();
+    let reload_result = if client_ready {
+      if config.lua.take_config_reload_request() {
+        Some(reloader.as_mut().map_or_else(
+          || Err(mlua::Error::external("no file-backed config is available to reload")),
+          ConfigReloader::reload,
+        ))
+      } else if config.live_reload {
+        reloader
+          .as_mut()
+          .and_then(|reloader| reloader.poll(true, now))
+      } else {
+        None
+      }
+    } else {
+      None
+    };
+    if let Some(reload_result) = reload_result {
+      match reload_result {
+        Ok(candidate) => {
+          match activate_reloaded_config(candidate, &mut config, ConfigReloadContext {
+            session: &mut session,
+            outer_size: &mut outer_size,
+            viewport: &mut viewport,
+            dispatcher: &mut dispatcher,
+            sender: &sender,
+            next_request_id: &mut next_request_id,
+            trace: &trace,
+          }) {
+            Ok(effects) => {
+              reload_warning = None;
+              needs_draw |= effects.redraw;
+              if effects.quit {
+                break 'event_loop;
+              }
+            }
+            Err(error) => {
+              trace.error("client.config_reload_callback", error.as_ref());
+              reload_warning =
+                Some((format!("Config reload failed: {error}"), now + Duration::from_secs(4)));
+              needs_draw = true;
+            }
+          }
+        }
+        Err(error) => {
+          trace.error("client.config_reload", &error);
+          reload_warning =
+            Some((format!("Config reload failed: {error}"), now + Duration::from_secs(4)));
+          needs_draw = true;
+        }
+      }
+    }
     if !client_loaded || !startup_requests.is_empty() {
       needs_draw = false;
     }
@@ -1285,7 +1380,6 @@ fn run_event_loop(
           outer_size.1,
         )),
       )?;
-      let bars = render_bars(&config.lua, &trace)?;
       let active_terminal = session
         .active_terminal()
         .ok_or("active Tab has no terminal snapshot")?;
@@ -1302,20 +1396,15 @@ fn run_event_loop(
         .as_ref()
         .filter(|(_, deadline)| Instant::now() < *deadline)
         .map(|(warning, _)| warning.as_str());
+      let reload_warning = reload_warning
+        .as_ref()
+        .filter(|(_, deadline)| Instant::now() < *deadline)
+        .map(|(warning, _)| warning.as_str());
       let ui_frame = ui::UiRender {
         screen: active_terminal.emulator.grid(),
         cursor_visible: config.lua.focused_ui().is_none()
           && active_terminal.emulator.cursor_visible(),
         leader_mode: dispatcher.is_leader(),
-        tab_count: session
-          .active_workspace()
-          .map_or(0, |workspace| workspace.tabs.len()),
-        active_tab: session.active_tab_index(),
-        active_title: session
-          .last_error
-          .as_deref()
-          .unwrap_or(active_terminal.title.as_str()),
-        active_exit_code: active_terminal.exit_code,
         modal,
         which_key: WhichKeyPopup {
           prefix: dispatcher.sequence().to_vec(),
@@ -1328,8 +1417,8 @@ fn run_event_loop(
           options: ui_options.which,
         },
         key_warning,
+        reload_warning,
         options: ui_options,
-        bars,
         lua: &config.lua,
         trace: &trace,
       };
@@ -1441,10 +1530,7 @@ fn run_event_loop(
         if !client_loaded && startup_requests.is_empty() {
           let loaded = dispatch_ui_events(
             Effects {
-              events: vec![UiEvent {
-                name: "ClientLoaded".to_owned(),
-                ..UiEvent::default()
-              }],
+              events: client_ready_events(),
               ..Effects::default()
             },
             &mut ClientContext {
@@ -1674,12 +1760,14 @@ fn handle_server_message(message: ServerMessage, session: &mut ClientSession) ->
       session: snapshot,
       terminals,
     } => {
-      let events = diff_session_state(&session.snapshot, &snapshot);
+      let mut events = diff_session_state(&session.snapshot, &snapshot);
       if session.session_picker.is_some() && session.snapshot.number != snapshot.number {
         session.session_picker = None;
       }
       session.set_snapshot(snapshot, terminals);
-      session.last_error = None;
+      if session.set_last_error(None) {
+        events.push(last_error_changed_event());
+      }
       Effects {
         redraw: true,
         events,
@@ -1687,13 +1775,16 @@ fn handle_server_message(message: ServerMessage, session: &mut ClientSession) ->
       }
     }
     ServerMessage::ClipboardStore { text, .. } => {
-      if let Err(error) = SystemClipboard.write(&text) {
-        session.last_error = Some(format!("clipboard: {error}"));
-      }
-      Effects {
+      let mut effects = Effects {
         redraw: true,
         ..Effects::default()
+      };
+      if let Err(error) = SystemClipboard.write(&text)
+        && session.set_last_error(Some(format!("clipboard: {error}")))
+      {
+        effects.events.push(last_error_changed_event());
       }
+      effects
     }
     ServerMessage::TerminalOutput { tab_id, bytes } => {
       let active = session.active_tab().is_some_and(|tab| tab.id == tab_id);
@@ -1716,18 +1807,24 @@ fn handle_server_message(message: ServerMessage, session: &mut ClientSession) ->
     ServerMessage::Reply {
       result: Err(error), ..
     } => {
-      session.last_error = Some(error);
-      Effects {
+      let mut effects = Effects {
         redraw: true,
         ..Effects::default()
+      };
+      if session.set_last_error(Some(error)) {
+        effects.events.push(last_error_changed_event());
       }
+      effects
     }
     ServerMessage::Reply { result: Ok(()), .. } => {
-      session.last_error = None;
-      Effects {
+      let mut effects = Effects {
         redraw: true,
         ..Effects::default()
+      };
+      if session.set_last_error(None) {
+        effects.events.push(last_error_changed_event());
       }
+      effects
     }
     ServerMessage::SessionList { sessions } => {
       if let Some(picker) = &mut session.session_picker {
@@ -2448,13 +2545,14 @@ fn handle_workspace_modal_key(
       crossterm::event::KeyCode::Char(_)
         if !form.editing && key_notation::text_character(key) == Some('e') =>
       {
+        let mut last_error_changed = false;
         match form.field {
           WorkspaceField::Directory => match DirectoryPicker::new(form) {
             Ok(picker) => {
               context.session.workspace_modal = Some(WorkspaceModal::Directory(picker));
             }
             Err(error) => {
-              context.session.last_error = Some(error.to_string());
+              last_error_changed = context.session.set_last_error(Some(error.to_string()));
               context.session.workspace_modal = None;
             }
           },
@@ -2463,10 +2561,14 @@ fn handle_workspace_modal_key(
             context.session.workspace_modal = Some(WorkspaceModal::Form(form));
           }
         }
-        Ok(Effects {
+        let mut effects = Effects {
           redraw: true,
           ..Effects::default()
-        })
+        };
+        if last_error_changed {
+          effects.events.push(last_error_changed_event());
+        }
+        Ok(effects)
       }
       crossterm::event::KeyCode::Enter => {
         let name = (!form.name.trim().is_empty()).then_some(form.name);
@@ -2483,11 +2585,15 @@ fn handle_workspace_modal_key(
         };
         send_request(context.sender, context.next_request_id, request)?;
         context.session.workspace_modal = None;
-        context.session.last_error = None;
-        Ok(Effects {
+        let last_error_changed = context.session.set_last_error(None);
+        let mut effects = Effects {
           redraw: true,
           ..Effects::default()
-        })
+        };
+        if last_error_changed {
+          effects.events.push(last_error_changed_event());
+        }
+        Ok(effects)
       }
       crossterm::event::KeyCode::Backspace
         if form.field == WorkspaceField::Name && form.editing =>
@@ -2561,12 +2667,16 @@ fn handle_workspace_modal_key(
           })
         }
         Err(error) => {
-          context.session.last_error = Some(error.to_string());
+          let last_error_changed = context.session.set_last_error(Some(error.to_string()));
           context.session.workspace_modal = Some(WorkspaceModal::Directory(picker));
-          Ok(Effects {
+          let mut effects = Effects {
             redraw: true,
             ..Effects::default()
-          })
+          };
+          if last_error_changed {
+            effects.events.push(last_error_changed_event());
+          }
+          Ok(effects)
         }
       },
       crossterm::event::KeyCode::Backspace => {
@@ -2697,7 +2807,9 @@ fn dispatch_ui_events(
         send_tracked_request(context, &mut effects, ClientRequest::Resize(next_viewport))?;
         effects.redraw = true;
       }
-      effects.merge(execute_runtime_commands(commands, context)?);
+      let mut command_effects = execute_runtime_commands(commands, context)?;
+      pending.extend(command_effects.events.drain(..));
+      effects.merge(command_effects);
     }
   }
   Ok(effects)
@@ -2721,7 +2833,12 @@ fn execute_runtime_commands(
       }
       RuntimeCommand::OpenPicker(id) => {
         let Some(labels) = context.lua.picker_labels(id) else {
-          context.session.last_error = Some("picker request expired".to_owned());
+          if context
+            .session
+            .set_last_error(Some("picker request expired".to_owned()))
+          {
+            effects.events.push(last_error_changed_event());
+          }
           effects.redraw = true;
           continue;
         };
@@ -2799,33 +2916,79 @@ fn execute_runtime_commands(
       RuntimeCommand::SelectTab(index) => {
         send_tracked_request(context, &mut effects, ClientRequest::SelectTab(index))?
       }
+      RuntimeCommand::ReloadConfig => context.lua.request_config_reload(),
     }
   }
   Ok(effects)
 }
 
-/// Evaluates the six configured Lua bar parts for the next frame.
-///
-/// Missing parts remain `None`, allowing [`ui::draw`] to supply its built-in
-/// defaults; an explicitly empty Lua result suppresses that group.
+fn activate_reloaded_config(
+  candidate: lua::AppConfig,
+  config: &mut lua::AppConfig,
+  context: ConfigReloadContext<'_>,
+) -> Result<Effects, Box<dyn std::error::Error>> {
+  let ConfigReloadContext {
+    session,
+    outer_size,
+    viewport,
+    dispatcher,
+    sender,
+    next_request_id,
+    trace,
+  } = context;
+  let options = traced_lua(trace, "lua.sync_options config reload", candidate.lua.sync_options())?;
+  let was_leader = dispatcher.is_leader();
+  execute!(io::stdout(), candidate.cursor_shape.terminal_style())?;
+  *dispatcher =
+    KeyDispatcher::new(candidate.prefix_key, candidate.sequence_timeout, candidate.keymap.clone());
+  *config = candidate;
+  session.which_key_options = options.which;
+
+  let pane = ui::pane_size(outer_size.0, outer_size.1, options);
+  let next_viewport = Viewport {
+    rows: pane.0.max(1),
+    columns: pane.1.max(1),
+  };
+  if next_viewport != *viewport {
+    *viewport = next_viewport;
+    session.resize(next_viewport);
+    send_request(sender, next_request_id, ClientRequest::Resize(next_viewport))?;
+  }
+
+  let mut events = Vec::new();
+  if was_leader {
+    events.push(UiEvent {
+      name: "leader_mode_changed".to_owned(),
+      active: Some(false),
+      ..UiEvent::default()
+    });
+  }
+  events.push(UiEvent {
+    name: "ConfigLoaded".to_owned(),
+    ..UiEvent::default()
+  });
+  dispatch_ui_events(
+    Effects {
+      redraw: true,
+      events,
+      ..Effects::default()
+    },
+    &mut ClientContext {
+      session,
+      outer_size,
+      viewport,
+      dispatcher,
+      sender,
+      next_request_id,
+      lua: &config.lua,
+      trace,
+    },
+  )
+}
+
 fn traced_lua<T>(trace: &Trace, context: &str, result: mlua::Result<T>) -> mlua::Result<T> {
   result.inspect_err(|error| {
     trace.error(context, error);
-  })
-}
-
-fn render_bars(lua: &LuaConfig, trace: &Trace) -> mlua::Result<ui::BarContents> {
-  Ok(ui::BarContents {
-    top: ui::BarParts {
-      left: traced_lua(trace, "lua.bar top.left", lua.render_bar_part("top", "left"))?,
-      center: traced_lua(trace, "lua.bar top.center", lua.render_bar_part("top", "center"))?,
-      right: traced_lua(trace, "lua.bar top.right", lua.render_bar_part("top", "right"))?,
-    },
-    bottom: ui::BarParts {
-      left: traced_lua(trace, "lua.bar bottom.left", lua.render_bar_part("bottom", "left"))?,
-      center: traced_lua(trace, "lua.bar bottom.center", lua.render_bar_part("bottom", "center"))?,
-      right: traced_lua(trace, "lua.bar bottom.right", lua.render_bar_part("bottom", "right"))?,
-    },
   })
 }
 
@@ -2835,6 +2998,7 @@ mod tests {
     protocol::{
       ClientMessage,
       ClientRequest,
+      ServerMessage,
       SessionSnapshot,
       TabSnapshot,
       TerminalSnapshot,
@@ -2854,8 +3018,11 @@ mod tests {
     WorkspaceDialogMode,
     WorkspaceField,
     WorkspaceModal,
+    client_ready_events,
     dispatch_ui_events,
+    execute_runtime_commands,
     handle_input,
+    handle_server_message,
     run_pre_client,
     run_pre_client_with_picker,
   };
@@ -2871,6 +3038,114 @@ mod tests {
       RuntimeCommand,
     },
   };
+
+  #[test]
+  fn startup_load_events_report_config_before_client_loaded() {
+    assert_eq!(
+      client_ready_events()
+        .into_iter()
+        .map(|event| event.name)
+        .collect::<Vec<_>>(),
+      vec!["ConfigLoaded", "ClientLoaded"]
+    );
+  }
+
+  #[test]
+  fn manual_reload_commands_set_a_client_reload_request() {
+    let config = lua::load_config("").expect("default config");
+    let snapshot = SessionSnapshot {
+      number: "1".to_owned(),
+      workspaces: Vec::new(),
+      active_workspace_id: 0,
+    };
+    let mut session = ClientSession::new(snapshot, Vec::new(), Viewport {
+      rows: 24,
+      columns: 80,
+    });
+    let mut outer_size = (80, 24);
+    let mut viewport = Viewport {
+      rows: 24,
+      columns: 80,
+    };
+    let mut dispatcher = KeyDispatcher::new(
+      normalize_prefix_key("<C-Space>").expect("prefix"),
+      std::time::Duration::from_millis(700),
+      KeyMap::default(),
+    );
+    let (sender, _) = std::sync::mpsc::channel();
+    let mut next_request_id = 1;
+    let trace = crate::trace::Trace::from_environment();
+    let mut context = ClientContext {
+      session: &mut session,
+      outer_size: &mut outer_size,
+      viewport: &mut viewport,
+      dispatcher: &mut dispatcher,
+      sender: &sender,
+      next_request_id: &mut next_request_id,
+      lua: &config.lua,
+      trace: &trace,
+    };
+
+    execute_runtime_commands(vec![RuntimeCommand::ReloadConfig], &mut context)
+      .expect("execute manual reload command");
+
+    assert!(config.lua.take_config_reload_request());
+    assert!(!config.lua.take_config_reload_request());
+  }
+
+  #[test]
+  fn last_error_changes_emit_targeted_ui_events() {
+    let snapshot = SessionSnapshot {
+      number: "1".to_owned(),
+      workspaces: Vec::new(),
+      active_workspace_id: 0,
+    };
+    let mut session = ClientSession::new(snapshot, Vec::new(), Viewport {
+      rows: 24,
+      columns: 80,
+    });
+
+    let failed = handle_server_message(
+      ServerMessage::Reply {
+        id: 1,
+        result: Err("command failed".to_owned()),
+      },
+      &mut session,
+    );
+    assert_eq!(
+      failed
+        .events
+        .iter()
+        .map(|event| event.name.as_str())
+        .collect::<Vec<_>>(),
+      vec!["last_error_changed"]
+    );
+
+    let repeated = handle_server_message(
+      ServerMessage::Reply {
+        id: 2,
+        result: Err("command failed".to_owned()),
+      },
+      &mut session,
+    );
+    assert!(repeated.events.is_empty(), "unchanged errors should not emit events");
+
+    let cleared = handle_server_message(
+      ServerMessage::Reply {
+        id: 3,
+        result: Ok(()),
+      },
+      &mut session,
+    );
+    assert_eq!(
+      cleared
+        .events
+        .iter()
+        .map(|event| event.name.as_str())
+        .collect::<Vec<_>>(),
+      vec!["last_error_changed"]
+    );
+  }
 
   // Developer approved: do not remove.
   #[test]

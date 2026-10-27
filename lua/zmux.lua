@@ -9,6 +9,9 @@
 ---@field italic? boolean
 ---@field underline? boolean
 ---@field reverse? boolean
+---@field remove? ZmuxStyleModifier[] Modifiers to remove from inherited styles.
+
+---@alias ZmuxStyleModifier "bold"|"italic"|"underline"|"reverse"
 
 ---@class ZmuxTerminalState
 ---@field rows integer Current terminal row count.
@@ -51,9 +54,11 @@
 ---@alias ZmuxEventName
 ---| "PreClient"
 ---| "ClientLoaded"
+---| "ConfigLoaded"
 ---| "session_created"
 ---| "session_selected"
 ---| "session_closed"
+---| "last_error_changed"
 ---| "workspace_created"
 ---| "workspace_closed"
 ---| "workspace_selected"
@@ -100,12 +105,16 @@
 ---@alias ZmuxDrawerWidth ZmuxElementSize
 ---@alias ZmuxDrawerBorder "none"|"plain"|"rounded"|"double"|"thick"|"light_double_dashed"|"heavy_double_dashed"|"light_triple_dashed"|"heavy_triple_dashed"|"light_quadruple_dashed"|"heavy_quadruple_dashed"|"quadrant_inside"|"quadrant_outside"
 ---@alias ZmuxToastPosition "top_right"|"top_center"|"bottom_right"|"bottom_center"
----@alias ZmuxUiElementProperty "side"|"width"|"height"|"x"|"y"|"position"|"duration"|"title"|"border"|"border_style"|"keys"
----@alias ZmuxUiElementPropertyValue ZmuxDrawerSide|ZmuxElementSize|integer|string|ZmuxDrawerBorder|ZmuxStyle|table<string, fun(element: ZmuxUiElementHandle, key: ZmuxUiKey)>
+---@alias ZmuxBarPosition "top"|"bottom"
+---@alias ZmuxHorizontalAlignment "left"|"center"|"right"
+---@alias ZmuxUiElementProperty "side"|"width"|"height"|"x"|"y"|"position"|"duration"|"title"|"border"|"border_style"|"style"|"visible"|"content"|"keys"
+---@alias ZmuxUiElementPropertyValue ZmuxDrawerSide|ZmuxElementSize|integer|string|boolean|ZmuxDrawerBorder|ZmuxStyle|ZmuxUiNodeHandle|table<string, fun(element: ZmuxUiElementHandle, key: ZmuxUiKey)>
 ---@alias ZmuxDrawerProperty ZmuxUiElementProperty
 ---@alias ZmuxDrawerPropertyValue ZmuxUiElementPropertyValue
 ---@alias ZmuxTextProperty "text"|"style"
 ---@alias ZmuxLayoutProperty "children"
+---@alias ZmuxSlicesProperty "slices"|"items"
+---@alias ZmuxAlignProperty "content"|"horizontal"
 
 ---@class ZmuxUiKey
 ---@field key string Neovim-notation key that triggered the binding.
@@ -115,7 +124,7 @@
 ---@field is_repeat boolean Whether this is a repeated key event.
 
 ---@class ZmuxUiNodeHandle Lua keeps detached nodes alive while this handle is reachable; a parent Layout or Element owns attached nodes.
----@field set fun(property: ZmuxTextProperty|ZmuxLayoutProperty, value: string|ZmuxStyle|ZmuxLayoutChild[]) Set a typed property; mutations automatically schedule a redraw.
+---@field set fun(property: ZmuxTextProperty|ZmuxLayoutProperty|ZmuxSlicesProperty|ZmuxAlignProperty, value: string|ZmuxStyle|ZmuxLayoutChild[]|ZmuxSlicesItems|integer|ZmuxUiNodeHandle|ZmuxHorizontalAlignment) Set a typed property; mutations automatically schedule a redraw.
 
 ---@class ZmuxTextOptions
 ---@field text string Initial text; newlines create additional unwrapped lines.
@@ -128,6 +137,34 @@
 
 ---@class ZmuxLayoutHandle: ZmuxUiNodeHandle
 ---@field set fun(property: ZmuxLayoutProperty, value: ZmuxLayoutChild[]) Replace this Layout's children.
+
+---@class ZmuxSlicesItem
+---@field index integer One-based first slice occupied by this item.
+---@field slice_width integer Number of consecutive slices occupied.
+---@field node ZmuxUiNodeHandle UI node rendered within the assigned slice range.
+
+---@alias ZmuxSlicesItems ZmuxSlicesItem[]
+
+---@class ZmuxSlicesOptions
+---@field slices integer Positive number of equal-width horizontal slices.
+---@field items ZmuxSlicesItems Slice ranges may be empty but cannot overlap or exceed the slice count.
+
+---@class ZmuxSlicesHandle: ZmuxUiNodeHandle
+---@field set fun(property: ZmuxSlicesProperty, value: ZmuxSlicesItems|integer) Replace the slice count or its items.
+
+---@class ZmuxAlignOptions
+---@field content ZmuxUiNodeHandle Child tree positioned within the full allocated area.
+---@field horizontal? ZmuxHorizontalAlignment Horizontal position; defaults to "left".
+
+---@class ZmuxAlignHandle: ZmuxUiNodeHandle
+---@field set fun(property: ZmuxAlignProperty, value: ZmuxUiNodeHandle|ZmuxHorizontalAlignment) Replace the child tree or its alignment.
+
+---@class ZmuxBarOptions
+---@field type "bar"
+---@field position? ZmuxBarPosition Top or bottom edge. Defaults to "top".
+---@field content ZmuxUiNodeHandle One-row UI tree; taller content is an error.
+---@field style? ZmuxStyle Base style applied across the full row and inherited by descendants.
+---@field visible? boolean Initial visibility. Defaults to false.
 
 ---@class ZmuxDrawerOptions
 ---@field type? "drawer" Element type; defaults to "drawer".
@@ -184,25 +221,30 @@
 ---@field content ZmuxUiNodeHandle Nested content tree.
 ---@field visible? boolean Initial visibility. Defaults to false.
 
----@alias ZmuxUiElementOptions ZmuxDrawerOptions|ZmuxModalOptions|ZmuxPopoverOptions|ZmuxBottomPanelOptions|ZmuxToastOptions
+---@alias ZmuxUiElementOptions ZmuxBarOptions|ZmuxDrawerOptions|ZmuxModalOptions|ZmuxPopoverOptions|ZmuxBottomPanelOptions|ZmuxToastOptions
 
----@class ZmuxUiElementHandle This Element is disposed after its handle becomes unreachable and Lua collects it; hiding it does not release it.
+---@class ZmuxUiElementHandle This UI Element is disposed after its handle becomes unreachable and Lua collects it; hiding it does not release it.
 ---@field set fun(property: ZmuxUiElementProperty, value: ZmuxUiElementPropertyValue) Set a typed property; visual changes automatically schedule a redraw.
 ---@field show fun() Show this element; Modal and Popover are focused automatically.
 ---@field hide fun() Hide this element and release its focus if needed.
 ---@field toggle fun() Toggle visibility; showing Modal and Popover focuses them.
----@field focus fun() Focus this element, showing it if necessary. Toasts cannot be focused.
+---@field focus fun() Focus this element, showing it if necessary. Bars and Toasts cannot be focused.
 ---@field blur fun() Return keyboard focus to the terminal; Modal and Popover elements must be hidden instead.
 
 ---@alias ZmuxDrawerHandle ZmuxUiElementHandle
 
----@class ZmuxUiApi Constructors are available during config loading and mutation-safe callbacks, but not bar or style render providers.
+---@class ZmuxUiApi Constructors are available during config loading and mutation-safe callbacks.
 ---@field pick fun(items: ZmuxPickerItem[], callback: fun(item: any|nil)) Open a generic fuzzy picker from a key or event callback and later call back with the chosen item or nil on Escape.
 ---@field redraw fun() Request a client redraw.
----@field create fun(options: ZmuxUiElementOptions): ZmuxUiElementHandle Create a Drawer, Modal, Popover, Bottom Panel, or Toast.
+---@field create fun(options: ZmuxUiElementOptions): ZmuxUiElementHandle Create a Bar, Drawer, Modal, Popover, Bottom Panel, or Toast.
 ---@field text fun(options: ZmuxTextOptions): ZmuxTextHandle Create a Text node.
 ---@field row fun(children: ZmuxLayoutChild[]): ZmuxLayoutHandle Create a horizontal Layout.
 ---@field column fun(children: ZmuxLayoutChild[]): ZmuxLayoutHandle Create a vertical Layout.
+---@field slices fun(options: ZmuxSlicesOptions): ZmuxSlicesHandle Partition an area into proportional horizontal slices and assign item ranges.
+---@field align fun(options: ZmuxAlignOptions): ZmuxAlignHandle Position a child tree within the full area allocated by its parent.
+
+---@class ZmuxConfigApi
+---@field reload fun() Reload the active Client's config file, even when automatic live reload is disabled.
 
 ---@class ZmuxClientApi
 ---@field detach fun() Detach the Client while preserving its Session.
@@ -241,38 +283,12 @@
 ---@field key ZmuxKeyApi
 ---@field event ZmuxEventApi
 ---@field ui ZmuxUiApi
+---@field config ZmuxConfigApi
 ---@field client ZmuxClientApi
 ---@field server ZmuxServerApi
 ---@field session ZmuxSessionApi
 ---@field workspace ZmuxWorkspaceApi
 ---@field tab ZmuxTabApi
-
----@class ZmuxBarSegment
----@field text string Text displayed by this segment.
----@field role? string Semantic role used by the default style function.
----@field style? ZmuxStyle|fun(segment: ZmuxBarSegment, g: ZmuxGlobalState): ZmuxStyle Static or state-dependent style override.
-
----@alias ZmuxBarContent string|ZmuxBarSegment|ZmuxBarSegment[]
----@alias ZmuxBarContentProvider fun(g: ZmuxGlobalState): ZmuxBarContent
----@alias ZmuxBarPartContent ZmuxBarContent|ZmuxBarContentProvider
----@alias ZmuxDefaultStyleProvider fun(segment: ZmuxBarSegment, g: ZmuxGlobalState): ZmuxStyle
-
----@class ZmuxAnchorOptions
----@field height? integer Reserved height in terminal rows. Defaults to one row.
----@field visible? boolean Whether this anchor is shown. Defaults to true.
-
----@class ZmuxBarOptions
----@field left? ZmuxBarPartContent
----@field center? ZmuxBarPartContent
----@field right? ZmuxBarPartContent
-
----@class ZmuxAnchors
----@field top? ZmuxAnchorOptions
----@field bottom? ZmuxAnchorOptions
-
----@class ZmuxBars
----@field top? ZmuxBarOptions
----@field bottom? ZmuxBarOptions
 
 ---@class ZmuxWhichOptions
 ---@field maxcolumns? integer Maximum number of which-key columns. Defaults to 7.
@@ -283,11 +299,8 @@
 ---@field border_style? ZmuxStyle Border color and modifiers.
 
 ---@class ZmuxUIOptions
----@field anchors? ZmuxAnchors
----@field bars? ZmuxBars
 ---@field which? ZmuxWhichOptions
 ---@field pty? ZmuxPtyOptions
----@field style? ZmuxDefaultStyleProvider Default style function, overridden by a segment's explicit style.
 
 ---@class ZmuxTerminalSizeOptions
 ---@field policy? "latest"|"largest"|"smallest"|"manual" Policy for choosing the Session's one shared PTY geometry; defaults to "latest".
@@ -296,6 +309,7 @@
 ---@class ZmuxOptions
 ---@field config_version integer Required config API version; must match `zmux.config_api_version`.
 ---@field cursor_shape? "block"|"underline"|"bar"
+---@field live_reload? boolean Watch the active Client's config file for changes; defaults to false.
 ---@field default_shell? string Shell executable for newly created sessions. Defaults to $SHELL.
 ---@field ignore_size? boolean Whether this Client's terminal dimensions are excluded from shared PTY sizing; defaults to false.
 ---@field terminal_size? ZmuxTerminalSizeOptions Server-wide shared PTY sizing policy and manual dimensions.
@@ -317,6 +331,9 @@ global = g
 
 ---@type string[] Raw command-line arguments passed to zmux, excluding the executable name.
 args = {}
+
+---@type fun(module: string): any Load a Lua module; prefix with "./" to resolve relative to the importing file.
+import = function(module) end
 
 ---@type ZmuxLaunchState
 launch = {}

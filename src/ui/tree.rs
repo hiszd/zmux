@@ -82,6 +82,26 @@ pub(crate) enum DrawerSide {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BarPosition {
+  Top,
+  Bottom,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HorizontalAlignment {
+  Left,
+  Center,
+  Right,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct UiSlice {
+  pub index: u16,
+  pub slice_width: u16,
+  pub node_id: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UiSize {
   Auto,
   Fixed(u16),
@@ -97,6 +117,9 @@ pub(crate) enum ToastPosition {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UiElementType {
+  Bar {
+    position: BarPosition,
+  },
   Drawer {
     side: DrawerSide,
     width: UiSize,
@@ -124,6 +147,8 @@ impl UiElementType {
   fn auto_focus(self) -> bool { matches!(self, Self::Modal { .. } | Self::Popover { .. }) }
 
   fn captures_input(self) -> bool { matches!(self, Self::Modal { .. } | Self::Popover { .. }) }
+
+  fn can_focus(self) -> bool { !matches!(self, Self::Bar { .. } | Self::Toast { .. }) }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -188,6 +213,14 @@ pub(crate) enum UiNodeKind {
     axis: LayoutAxis,
     children: Vec<UiChild>,
   },
+  Slices {
+    slices: u16,
+    items: Vec<UiSlice>,
+  },
+  Align {
+    child_id: u64,
+    horizontal: HorizontalAlignment,
+  },
 }
 
 #[derive(Clone, Debug)]
@@ -203,6 +236,7 @@ pub(crate) struct UiElementOptions {
   pub title: String,
   pub border: DrawerBorder,
   pub border_style: Style,
+  pub style: Style,
   pub content_id: u64,
   pub visible: bool,
 }
@@ -214,6 +248,7 @@ pub(crate) struct UiElement {
   pub title: String,
   pub border: DrawerBorder,
   pub border_style: Style,
+  pub style: Style,
   pub content_id: u64,
   pub visible: bool,
   previous_focus: Option<u64>,
@@ -238,6 +273,7 @@ pub(crate) enum UiElementProperty {
   Title,
   Border,
   BorderStyle,
+  Style,
 }
 
 pub(crate) struct UiTree {
@@ -314,7 +350,72 @@ impl UiTree {
     Ok(id)
   }
 
+  pub(crate) fn create_slices(&mut self, slices: u16, items: Vec<UiSlice>) -> Result<u64, String> {
+    let id = self.next_id()?;
+    self.validate_slices(id, slices, &items)?;
+    for item in &items {
+      self
+        .nodes
+        .get_mut(&item.node_id)
+        .ok_or_else(|| "UI slice item handle is no longer valid".to_owned())?
+        .parent = Some(id);
+    }
+    self.nodes.insert(id, UiNode {
+      kind: UiNodeKind::Slices { slices, items },
+      parent: None,
+      element_root: None,
+      lua_handle_alive: true,
+    });
+    self.layout_dirty = true;
+    Ok(id)
+  }
+
+  pub(crate) fn create_align(
+    &mut self,
+    child_id: u64,
+    horizontal: HorizontalAlignment,
+  ) -> Result<u64, String> {
+    let id = self.next_id()?;
+    self.validate_children(id, &[UiChild {
+      node_id: child_id,
+      size: ChildSize::Auto,
+    }])?;
+    self
+      .nodes
+      .get_mut(&child_id)
+      .ok_or_else(|| "UI alignment child handle is no longer valid".to_owned())?
+      .parent = Some(id);
+    self.nodes.insert(id, UiNode {
+      kind: UiNodeKind::Align {
+        child_id,
+        horizontal,
+      },
+      parent: None,
+      element_root: None,
+      lua_handle_alive: true,
+    });
+    self.layout_dirty = true;
+    Ok(id)
+  }
+
   pub(crate) fn create_element(&mut self, options: UiElementOptions) -> Result<u64, String> {
+    if let UiElementType::Bar { position } = options.element_type {
+      let count = self
+        .elements
+        .iter()
+        .filter(|element| matches!(element.element_type, UiElementType::Bar { position: existing } if existing == position))
+        .count();
+      if count >= 2 {
+        let edge = match position {
+          BarPosition::Top => "top",
+          BarPosition::Bottom => "bottom",
+        };
+        return Err(format!("at most two bars may be created at the {edge} edge"));
+      }
+      if self.intrinsic_size(options.content_id)?.height > 1 {
+        return Err("Bar content must fit in one row".to_owned());
+      }
+    }
     let id = self.next_id()?;
     let content = self
       .nodes
@@ -341,6 +442,7 @@ impl UiTree {
       title: options.title,
       border: options.border,
       border_style: options.border_style,
+      style: options.style,
       content_id: options.content_id,
       visible: options.visible,
       previous_focus,
@@ -406,18 +508,55 @@ impl UiTree {
     };
     self.intrinsic_cache.remove(&id);
     self.node_rects.remove(&id);
-    if let UiNodeKind::Layout { children, .. } = node.kind {
-      for child in children {
-        if let Some(node) = self.nodes.get_mut(&child.node_id)
-          && node.parent == Some(id)
-        {
-          node.parent = None;
-        }
-        self.prune_unowned_node(child.node_id);
+    let children = match node.kind {
+      UiNodeKind::Layout { children, .. } => children
+        .into_iter()
+        .map(|child| child.node_id)
+        .collect::<Vec<_>>(),
+      UiNodeKind::Slices { items, .. } => items
+        .into_iter()
+        .map(|item| item.node_id)
+        .collect::<Vec<_>>(),
+      UiNodeKind::Align { child_id, .. } => vec![child_id],
+      UiNodeKind::Text { .. } => Vec::new(),
+    };
+    for child_id in children {
+      if let Some(node) = self.nodes.get_mut(&child_id)
+        && node.parent == Some(id)
+      {
+        node.parent = None;
       }
+      self.prune_unowned_node(child_id);
     }
     self.layout_dirty = true;
     true
+  }
+
+  fn validate_slices(&self, parent_id: u64, slices: u16, items: &[UiSlice]) -> Result<(), String> {
+    if slices == 0 {
+      return Err("slice layouts require at least one slice".to_owned());
+    }
+    let mut occupied = vec![false; usize::from(slices)];
+    let mut children = Vec::with_capacity(items.len());
+    for item in items {
+      if item.index == 0 || item.slice_width == 0 {
+        return Err("slice index and slice_width must be positive".to_owned());
+      }
+      let start = usize::from(item.index - 1);
+      let end = start + usize::from(item.slice_width);
+      if end > occupied.len() {
+        return Err("slice item extends beyond the configured slice count".to_owned());
+      }
+      if occupied[start..end].iter().any(|cell| *cell) {
+        return Err("slice items cannot overlap".to_owned());
+      }
+      occupied[start..end].fill(true);
+      children.push(UiChild {
+        node_id: item.node_id,
+        size: ChildSize::Auto,
+      });
+    }
+    self.validate_children(parent_id, &children)
   }
 
   fn validate_children(&self, parent_id: u64, children: &[UiChild]) -> Result<(), String> {
@@ -448,18 +587,36 @@ impl UiTree {
   }
 
   pub(crate) fn set_text(&mut self, id: u64, text: String) -> Result<bool, String> {
+    let current = match &self
+      .nodes
+      .get(&id)
+      .ok_or_else(|| "UI text handle is no longer valid".to_owned())?
+      .kind
+    {
+      UiNodeKind::Text { text, .. } => text.clone(),
+      _ => return Err("text can only be set on a Text node".to_owned()),
+    };
+    if current == text {
+      return Ok(false);
+    }
     let node = self
       .nodes
       .get_mut(&id)
       .ok_or_else(|| "UI text handle is no longer valid".to_owned())?;
-    let UiNodeKind::Text { text: current, .. } = &mut node.kind else {
+    let UiNodeKind::Text { text: stored, .. } = &mut node.kind else {
       return Err("text can only be set on a Text node".to_owned());
     };
-    if *current == text {
-      return Ok(false);
-    }
-    *current = text;
+    *stored = text;
     self.invalidate_node(id);
+    if let Err(error) = self.validate_bar_ancestor(id) {
+      if let Some(node) = self.nodes.get_mut(&id)
+        && let UiNodeKind::Text { text, .. } = &mut node.kind
+      {
+        *text = current;
+      }
+      self.invalidate_node(id);
+      return Err(error);
+    }
     Ok(true)
   }
 
@@ -485,32 +642,28 @@ impl UiTree {
     children: Vec<UiChild>,
   ) -> Result<bool, String> {
     self.validate_children(parent_id, &children)?;
-    let old_children: Vec<u64> = match &self
+    let old_layout_children = match &self
       .nodes
       .get(&parent_id)
       .ok_or_else(|| "Layout handle is no longer valid".to_owned())?
       .kind
     {
-      UiNodeKind::Layout { children, .. } => children.iter().map(|child| child.node_id).collect(),
-      UiNodeKind::Text { .. } => {
-        return Err("children can only be set on a Layout node".to_owned());
-      }
+      UiNodeKind::Layout { children, .. } => children.clone(),
+      _ => return Err("children can only be set on a row or column Layout node".to_owned()),
     };
+    let old_children: Vec<u64> = old_layout_children
+      .iter()
+      .map(|child| child.node_id)
+      .collect();
     let new_children: HashSet<_> = children.iter().map(|child| child.node_id).collect();
     if old_children.iter().copied().collect::<HashSet<_>>() == new_children
       && old_children.len() == children.len()
-    {
-      let current = match &self.nodes[&parent_id].kind {
-        UiNodeKind::Layout { children, .. } => children,
-        UiNodeKind::Text { .. } => unreachable!(),
-      };
-      if current
+      && old_layout_children
         .iter()
         .zip(&children)
         .all(|(left, right)| left.node_id == right.node_id && left.size == right.size)
-      {
-        return Ok(false);
-      }
+    {
+      return Ok(false);
     }
 
     let detached: Vec<_> = old_children
@@ -542,10 +695,322 @@ impl UiTree {
     };
     *current = children;
     self.invalidate_node(parent_id);
+    if let Err(error) = self.validate_bar_ancestor(parent_id) {
+      let new_ids: Vec<_> = self
+        .nodes
+        .get(&parent_id)
+        .and_then(|node| match &node.kind {
+          UiNodeKind::Layout { children, .. } => {
+            Some(children.iter().map(|child| child.node_id).collect())
+          }
+          _ => None,
+        })
+        .unwrap_or_default();
+      for child_id in new_ids {
+        if !old_children.contains(&child_id)
+          && let Some(node) = self.nodes.get_mut(&child_id)
+        {
+          node.parent = None;
+        }
+      }
+      for child_id in &old_children {
+        if let Some(node) = self.nodes.get_mut(child_id) {
+          node.parent = Some(parent_id);
+        }
+      }
+      if let Some(node) = self.nodes.get_mut(&parent_id)
+        && let UiNodeKind::Layout { children, .. } = &mut node.kind
+      {
+        *children = old_layout_children;
+      }
+      self.invalidate_node(parent_id);
+      return Err(error);
+    }
     for detached_id in detached {
       self.prune_unowned_node(detached_id);
     }
     Ok(true)
+  }
+
+  pub(crate) fn set_slices(
+    &mut self,
+    id: u64,
+    slices: u16,
+    items: Vec<UiSlice>,
+  ) -> Result<bool, String> {
+    self.validate_slices(id, slices, &items)?;
+    let (old_slices, old_items) = match &self
+      .nodes
+      .get(&id)
+      .ok_or_else(|| "slice Layout handle is no longer valid".to_owned())?
+      .kind
+    {
+      UiNodeKind::Slices { slices, items } => (*slices, items.clone()),
+      _ => return Err("slice properties can only be set on a Slices node".to_owned()),
+    };
+    if old_slices == slices && old_items == items {
+      return Ok(false);
+    }
+    let old_ids: Vec<_> = old_items.iter().map(|item| item.node_id).collect();
+    let new_ids: HashSet<_> = items.iter().map(|item| item.node_id).collect();
+    for old_id in old_ids.iter().filter(|old_id| !new_ids.contains(old_id)) {
+      if let Some(node) = self.nodes.get_mut(old_id) {
+        node.parent = None;
+      }
+    }
+    for item in &items {
+      self
+        .nodes
+        .get_mut(&item.node_id)
+        .ok_or_else(|| "UI slice item handle is no longer valid".to_owned())?
+        .parent = Some(id);
+    }
+    let node = self
+      .nodes
+      .get_mut(&id)
+      .ok_or_else(|| "slice Layout handle is no longer valid".to_owned())?;
+    let UiNodeKind::Slices {
+      slices: current_slices,
+      items: current_items,
+    } = &mut node.kind
+    else {
+      return Err("slice properties can only be set on a Slices node".to_owned());
+    };
+    *current_slices = slices;
+    *current_items = items;
+    self.invalidate_node(id);
+    if let Err(error) = self.validate_bar_ancestor(id) {
+      let new_ids: Vec<_> = self
+        .nodes
+        .get(&id)
+        .and_then(|node| match &node.kind {
+          UiNodeKind::Slices { items, .. } => Some(items.iter().map(|item| item.node_id).collect()),
+          _ => None,
+        })
+        .unwrap_or_default();
+      for child_id in new_ids {
+        if !old_ids.contains(&child_id)
+          && let Some(node) = self.nodes.get_mut(&child_id)
+        {
+          node.parent = None;
+        }
+      }
+      for child_id in &old_ids {
+        if let Some(node) = self.nodes.get_mut(child_id) {
+          node.parent = Some(id);
+        }
+      }
+      if let Some(node) = self.nodes.get_mut(&id)
+        && let UiNodeKind::Slices {
+          slices: current_slices,
+          items: current_items,
+        } = &mut node.kind
+      {
+        *current_slices = old_slices;
+        *current_items = old_items;
+      }
+      self.invalidate_node(id);
+      return Err(error);
+    }
+    for old_id in old_ids.iter().filter(|old_id| !new_ids.contains(old_id)) {
+      self.prune_unowned_node(*old_id);
+    }
+    Ok(true)
+  }
+
+  pub(crate) fn set_slice_items(&mut self, id: u64, items: Vec<UiSlice>) -> Result<bool, String> {
+    let slices = match &self
+      .nodes
+      .get(&id)
+      .ok_or_else(|| "slice Layout handle is no longer valid".to_owned())?
+      .kind
+    {
+      UiNodeKind::Slices { slices, .. } => *slices,
+      _ => return Err("items can only be set on a Slices node".to_owned()),
+    };
+    self.set_slices(id, slices, items)
+  }
+
+  pub(crate) fn set_slice_count(&mut self, id: u64, slices: u16) -> Result<bool, String> {
+    let items = match &self
+      .nodes
+      .get(&id)
+      .ok_or_else(|| "slice Layout handle is no longer valid".to_owned())?
+      .kind
+    {
+      UiNodeKind::Slices { items, .. } => items.clone(),
+      _ => return Err("slices can only be set on a Slices node".to_owned()),
+    };
+    self.set_slices(id, slices, items)
+  }
+
+  pub(crate) fn set_alignment_child(&mut self, id: u64, child_id: u64) -> Result<bool, String> {
+    self.validate_children(id, &[UiChild {
+      node_id: child_id,
+      size: ChildSize::Auto,
+    }])?;
+    let old_id = match self
+      .nodes
+      .get(&id)
+      .ok_or_else(|| "alignment handle is no longer valid".to_owned())?
+      .kind
+    {
+      UiNodeKind::Align { child_id, .. } => child_id,
+      _ => return Err("content can only be set on an Align node".to_owned()),
+    };
+    if old_id == child_id {
+      return Ok(false);
+    }
+    self
+      .nodes
+      .get_mut(&old_id)
+      .ok_or_else(|| "UI alignment child handle is no longer valid".to_owned())?
+      .parent = None;
+    self
+      .nodes
+      .get_mut(&child_id)
+      .ok_or_else(|| "UI alignment child handle is no longer valid".to_owned())?
+      .parent = Some(id);
+    let node = self
+      .nodes
+      .get_mut(&id)
+      .ok_or_else(|| "alignment handle is no longer valid".to_owned())?;
+    let UiNodeKind::Align {
+      child_id: current, ..
+    } = &mut node.kind
+    else {
+      return Err("content can only be set on an Align node".to_owned());
+    };
+    *current = child_id;
+    self.invalidate_node(id);
+    if let Err(error) = self.validate_bar_ancestor(id) {
+      if let Some(node) = self.nodes.get_mut(&child_id) {
+        node.parent = None;
+      }
+      if let Some(node) = self.nodes.get_mut(&old_id) {
+        node.parent = Some(id);
+      }
+      if let Some(node) = self.nodes.get_mut(&id)
+        && let UiNodeKind::Align {
+          child_id: current, ..
+        } = &mut node.kind
+      {
+        *current = old_id;
+      }
+      self.invalidate_node(id);
+      return Err(error);
+    }
+    self.prune_unowned_node(old_id);
+    Ok(true)
+  }
+
+  pub(crate) fn set_alignment(
+    &mut self,
+    id: u64,
+    horizontal: HorizontalAlignment,
+  ) -> Result<bool, String> {
+    let node = self
+      .nodes
+      .get_mut(&id)
+      .ok_or_else(|| "alignment handle is no longer valid".to_owned())?;
+    let UiNodeKind::Align {
+      horizontal: current,
+      ..
+    } = &mut node.kind
+    else {
+      return Err("horizontal can only be set on an Align node".to_owned());
+    };
+    if *current == horizontal {
+      return Ok(false);
+    }
+    *current = horizontal;
+    self.layout_dirty = true;
+    Ok(true)
+  }
+
+  pub(crate) fn replace_element_content(
+    &mut self,
+    id: u64,
+    content_id: u64,
+  ) -> Result<bool, String> {
+    let (is_bar, old_content_id) = {
+      let element = self.element(id)?;
+      (matches!(element.element_type, UiElementType::Bar { .. }), element.content_id)
+    };
+    if !is_bar {
+      return Err("content can only be replaced on a Bar".to_owned());
+    }
+    if old_content_id == content_id {
+      return Ok(false);
+    }
+    let new_content = self
+      .nodes
+      .get(&content_id)
+      .ok_or_else(|| "UI element content handle is no longer valid".to_owned())?;
+    if new_content.parent.is_some() || new_content.element_root.is_some() {
+      return Err("a UI node can only belong to one parent".to_owned());
+    }
+    if self.intrinsic_size(content_id)?.height > 1 {
+      return Err("Bar content must fit in one row".to_owned());
+    }
+    self
+      .nodes
+      .get_mut(&old_content_id)
+      .ok_or_else(|| "UI element content handle is no longer valid".to_owned())?
+      .element_root = None;
+    self
+      .nodes
+      .get_mut(&content_id)
+      .ok_or_else(|| "UI element content handle is no longer valid".to_owned())?
+      .element_root = Some(id);
+    self
+      .element_mut(id)
+      .ok_or_else(|| "UI element handle is no longer valid".to_owned())?
+      .content_id = content_id;
+    self.layout_dirty = true;
+    self.prune_unowned_node(old_content_id);
+    Ok(true)
+  }
+
+  pub(crate) fn bar_counts(&self) -> (u16, u16) {
+    let mut top = 0;
+    let mut bottom = 0;
+    for element in self.elements.iter().filter(|element| element.visible) {
+      match element.element_type {
+        UiElementType::Bar {
+          position: BarPosition::Top,
+        } => top += 1,
+        UiElementType::Bar {
+          position: BarPosition::Bottom,
+        } => bottom += 1,
+        _ => {}
+      }
+    }
+    (top, bottom)
+  }
+
+  fn validate_bar_ancestor(&mut self, id: u64) -> Result<(), String> {
+    let mut current = Some(id);
+    while let Some(node_id) = current {
+      let (parent, element_root) = self
+        .nodes
+        .get(&node_id)
+        .map(|node| (node.parent, node.element_root))
+        .ok_or_else(|| "UI node handle is no longer valid".to_owned())?;
+      if let Some(element_id) = element_root
+        && let Some(content_id) = self
+          .elements
+          .iter()
+          .find(|element| element.id == element_id)
+          .filter(|element| matches!(element.element_type, UiElementType::Bar { .. }))
+          .map(|element| element.content_id)
+        && self.intrinsic_size(content_id)?.height > 1
+      {
+        return Err("Bar content must fit in one row".to_owned());
+      }
+      current = parent;
+    }
+    Ok(())
   }
 
   fn invalidate_node(&mut self, id: u64) {
@@ -657,6 +1122,17 @@ impl UiTree {
         element.border_style = value;
         true
       }
+      (UiElementProperty::Style, UiElementValue::Style(value)) => {
+        if !matches!(element.element_type, UiElementType::Bar { .. }) {
+          return Err("'style' is only valid for a Bar".to_owned());
+        }
+        if element.style == value {
+          false
+        } else {
+          element.style = value;
+          true
+        }
+      }
       (UiElementProperty::Title, UiElementValue::Title(_))
       | (UiElementProperty::Border, UiElementValue::Border(_))
       | (UiElementProperty::BorderStyle, UiElementValue::Style(_)) => false,
@@ -734,8 +1210,8 @@ impl UiTree {
     if self.focused_element != Some(id) && self.focused_element_captures_input() {
       return Err("hide the active Modal or Popover before focusing another element".to_owned());
     }
-    if matches!(self.element(id)?.element_type, UiElementType::Toast { .. }) {
-      return Err("Toast elements cannot receive focus".to_owned());
+    if !self.element(id)?.element_type.can_focus() {
+      return Err("Bars and Toast elements cannot receive focus".to_owned());
     }
     let was_focused = self.focused_element == Some(id);
     let shown = self.show(id)?;
@@ -858,9 +1334,72 @@ impl UiTree {
           },
         }
       }
+      UiNodeKind::Slices { items, .. } => {
+        let mut size = IntrinsicSize::default();
+        for item in items {
+          let child = self.intrinsic_size(item.node_id)?;
+          size.width = size.width.max(child.width);
+          size.height = size.height.max(child.height);
+        }
+        size
+      }
+      UiNodeKind::Align { child_id, .. } => self.intrinsic_size(child_id)?,
     };
     self.intrinsic_cache.insert(id, size);
     Ok(size)
+  }
+
+  pub(crate) fn render_bars(&mut self, top: Rect, bottom: Rect, buffer: &mut Buffer) {
+    let bars: Vec<_> = self
+      .elements
+      .iter()
+      .filter_map(|element| {
+        if !element.visible {
+          return None;
+        }
+        let position = match element.element_type {
+          UiElementType::Bar { position } => position,
+          _ => return None,
+        };
+        Some((element.id, position, element.content_id, element.style))
+      })
+      .collect();
+    let mut top_index = 0_u16;
+    let mut bottom_index = 0_u16;
+    for (id, position, content_id, style) in bars {
+      let area = match position {
+        BarPosition::Top => {
+          let y = top.y.saturating_add(top_index);
+          top_index = top_index.saturating_add(1);
+          (y < top.y.saturating_add(top.height)).then(|| Rect::new(top.x, y, top.width, 1))
+        }
+        BarPosition::Bottom => {
+          let offset = bottom_index;
+          bottom_index = bottom_index.saturating_add(1);
+          (offset < bottom.height).then(|| {
+            Rect::new(
+              bottom.x,
+              bottom
+                .y
+                .saturating_add(bottom.height.saturating_sub(1 + offset)),
+              bottom.width,
+              1,
+            )
+          })
+        }
+      };
+      let Some(area) = area else {
+        continue;
+      };
+      self.element_rects.insert(id, area);
+      self.layout_node(content_id, area);
+      for y in area.y..area.y.saturating_add(area.height) {
+        for x in area.x..area.x.saturating_add(area.width) {
+          buffer[(x, y)].set_symbol(" ").set_style(style);
+        }
+      }
+      self.render_node(content_id, area, style, buffer);
+    }
   }
 
   pub(crate) fn render(&mut self, area: Rect, buffer: &mut Buffer) {
@@ -868,7 +1407,7 @@ impl UiTree {
       self.rebuild_layout(area);
     }
     for element in &self.elements {
-      if !element.visible {
+      if !element.visible || matches!(element.element_type, UiElementType::Bar { .. }) {
         continue;
       }
       let Some(element_area) = self.element_rects.get(&element.id).copied() else {
@@ -899,7 +1438,7 @@ impl UiTree {
         .copied()
         .unwrap_or_else(|| block.inner(element_area));
       block.render(element_area, buffer);
-      self.render_node(element.content_id, content_area, buffer);
+      self.render_node(element.content_id, content_area, Style::default(), buffer);
     }
   }
 
@@ -911,7 +1450,9 @@ impl UiTree {
     let visible: Vec<_> = self
       .elements
       .iter()
-      .filter(|element| element.visible)
+      .filter(|element| {
+        element.visible && !matches!(element.element_type, UiElementType::Bar { .. })
+      })
       .map(|element| {
         (
           element.id,
@@ -931,6 +1472,7 @@ impl UiTree {
       let auto_width = intrinsic.width.max(title_width).saturating_add(border_x);
       let auto_height = intrinsic.height.saturating_add(border_y);
       let element_area = match element_type {
+        UiElementType::Bar { .. } => continue,
         UiElementType::Drawer { side, width } => {
           let desired = match width {
             UiSize::Auto => auto_width,
@@ -1026,39 +1568,73 @@ impl UiTree {
     let Some(node) = self.nodes.get(&id).map(|node| node.kind.clone()) else {
       return;
     };
-    let UiNodeKind::Layout { axis, children } = node else {
-      return;
-    };
-    let mut measures = Vec::with_capacity(children.len());
-    for child in &children {
-      let intrinsic = self.intrinsic_size(child.node_id).unwrap_or_default();
-      measures.push(ChildMeasure {
-        size: child.size,
-        intrinsic: match axis {
-          LayoutAxis::Horizontal => intrinsic.width,
-          LayoutAxis::Vertical => intrinsic.height,
-        },
-      });
-    }
-    let available = match axis {
-      LayoutAxis::Horizontal => area.width,
-      LayoutAxis::Vertical => area.height,
-    };
-    let sizes = allocate_main_axis(available, &measures);
-    let mut offset = 0_u16;
-    for (child, size) in children.into_iter().zip(sizes) {
-      let child_area = match axis {
-        LayoutAxis::Horizontal => {
-          Rect::new(area.x.saturating_add(offset), area.y, size, area.height)
+    match node {
+      UiNodeKind::Layout { axis, children } => {
+        let mut measures = Vec::with_capacity(children.len());
+        for child in &children {
+          let intrinsic = self.intrinsic_size(child.node_id).unwrap_or_default();
+          measures.push(ChildMeasure {
+            size: child.size,
+            intrinsic: match axis {
+              LayoutAxis::Horizontal => intrinsic.width,
+              LayoutAxis::Vertical => intrinsic.height,
+            },
+          });
         }
-        LayoutAxis::Vertical => Rect::new(area.x, area.y.saturating_add(offset), area.width, size),
-      };
-      offset = offset.saturating_add(size);
-      self.layout_node(child.node_id, child_area);
+        let available = match axis {
+          LayoutAxis::Horizontal => area.width,
+          LayoutAxis::Vertical => area.height,
+        };
+        let sizes = allocate_main_axis(available, &measures);
+        let mut offset = 0_u16;
+        for (child, size) in children.into_iter().zip(sizes) {
+          let child_area = match axis {
+            LayoutAxis::Horizontal => {
+              Rect::new(area.x.saturating_add(offset), area.y, size, area.height)
+            }
+            LayoutAxis::Vertical => {
+              Rect::new(area.x, area.y.saturating_add(offset), area.width, size)
+            }
+          };
+          offset = offset.saturating_add(size);
+          self.layout_node(child.node_id, child_area);
+        }
+      }
+      UiNodeKind::Slices { slices, items } => {
+        for item in items {
+          let start = (u32::from(area.width) * u32::from(item.index - 1)) / u32::from(slices);
+          let end = (u32::from(area.width) * u32::from(item.index - 1 + item.slice_width))
+            / u32::from(slices);
+          let child_area = Rect::new(
+            area.x.saturating_add(start as u16),
+            area.y,
+            end.saturating_sub(start) as u16,
+            area.height,
+          );
+          self.layout_node(item.node_id, child_area);
+        }
+      }
+      UiNodeKind::Align {
+        child_id,
+        horizontal,
+      } => {
+        let intrinsic = self.intrinsic_size(child_id).unwrap_or_default();
+        let width = intrinsic.width.min(area.width);
+        let offset = match horizontal {
+          HorizontalAlignment::Left => 0,
+          HorizontalAlignment::Center => area.width.saturating_sub(width) / 2,
+          HorizontalAlignment::Right => area.width.saturating_sub(width),
+        };
+        self.layout_node(
+          child_id,
+          Rect::new(area.x.saturating_add(offset), area.y, width, area.height),
+        );
+      }
+      UiNodeKind::Text { .. } => {}
     }
   }
 
-  fn render_node(&self, id: u64, area: Rect, buffer: &mut Buffer) {
+  fn render_node(&self, id: u64, area: Rect, inherited_style: Style, buffer: &mut Buffer) {
     if area.is_empty() {
       return;
     }
@@ -1066,12 +1642,26 @@ impl UiTree {
       return;
     };
     match &node.kind {
-      UiNodeKind::Text { text, style } => draw_text(buffer, area, text, *style),
+      UiNodeKind::Text { text, style } => {
+        draw_text(buffer, area, text, inherited_style.patch(*style))
+      }
       UiNodeKind::Layout { children, .. } => {
         for child in children {
           if let Some(child_area) = self.node_rects.get(&child.node_id).copied() {
-            self.render_node(child.node_id, child_area, buffer);
+            self.render_node(child.node_id, child_area, inherited_style, buffer);
           }
+        }
+      }
+      UiNodeKind::Slices { items, .. } => {
+        for item in items {
+          if let Some(child_area) = self.node_rects.get(&item.node_id).copied() {
+            self.render_node(item.node_id, child_area, inherited_style, buffer);
+          }
+        }
+      }
+      UiNodeKind::Align { child_id, .. } => {
+        if let Some(child_area) = self.node_rects.get(child_id).copied() {
+          self.render_node(*child_id, child_area, inherited_style, buffer);
         }
       }
     }

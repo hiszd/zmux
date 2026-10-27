@@ -1,15 +1,133 @@
 -- User configuration for zmux.
 -- `opt.config_version` must be the first executable statement.
 -- Run `zmux config init` to install LuaLS definitions as `defs.lua`.
-opt.config_version = 1
+opt.config_version = 2
 
 -- Uncomment to customize the prefix key, sequence timeout, or default shell.
 -- opt.prefix_key = "<C-Space>"
 -- opt.sequence_timeout_ms = 700
+-- Set true to watch this file and reload client configuration after edits.
+-- opt.live_reload = true
 -- opt.default_shell = "/bin/bash"
+
+-- Bars are retained UI Elements. Slices divide each row into tab/status and
+-- right-aligned indicator areas; Align positions content within its slice.
+local ui = cmd.ui
+-- Tab labels are arranged horizontally in the left-hand part of the top Bar.
+local tabs = ui.row({})
+-- Reuse a Text handle per Tab ID so state refreshes mutate rather than rebuild it.
+local tab_nodes = {}
+-- This indicator is empty outside leader mode; when shown it is bold black on yellow.
+local leader = ui.text({ text = "", style = { fg = "black", bg = "yellow", bold = true } })
+-- Three equal slices: tabs span the first two; the leader indicator uses the
+-- rightmost slice and Align places it against that slice's right edge.
+local top_content = ui.slices({
+    slices = 3,
+    items = {
+        { index = 1, slice_width = 2, node = tabs },
+        { index = 3, slice_width = 1, node = ui.align({ content = leader, horizontal = "right" }) },
+    },
+})
+
+-- The bottom Bar uses two slices for status and one for right-aligned session
+-- and terminal-size information.
+local status = ui.text({ text = "" })
+local session_info = ui.text({ text = "" })
+local bottom_content = ui.slices({
+    slices = 3,
+    items = {
+        { index = 1, slice_width = 2, node = status },
+        { index = 3, slice_width = 1, node = ui.align({ content = session_info, horizontal = "right" }) },
+    },
+})
+
+-- A visible Bar reserves one row. Its style paints the whole row and provides
+-- inherited colors for Text nodes that don't override them.
+local top_bar = cmd.ui.create({
+    type = "bar",
+    position = "top",
+    content = top_content,
+    style = { fg = "gray", bg = "black" },
+    visible = true,
+})
+local bottom_bar = cmd.ui.create({
+    type = "bar",
+    position = "bottom",
+    content = bottom_content,
+    style = { fg = "gray", bg = "black" },
+    visible = true,
+})
+
+-- Update the Tab row only when its membership, order, selection, or titles change.
+local function update_tabs()
+    local children = {}
+    local active_tabs = {}
+    for _, tab in ipairs(g.tabs) do
+        local node = tab_nodes[tab.id]
+        if not node then
+            node = ui.text({ text = "" })
+            tab_nodes[tab.id] = node
+        end
+        table.insert(children, node)
+        active_tabs[tab.id] = true
+        node.set("text", string.format(" %d %s ", tab.index, tab.title))
+        -- The selected Tab is emphasized; other labels inherit the Bar style.
+        node.set("style", tab.selected and { fg = "black", bg = "cyan", bold = true } or { fg = "gray" })
+    end
+    for id in pairs(tab_nodes) do
+        if not active_tabs[id] then
+            tab_nodes[id] = nil
+        end
+    end
+    tabs.set("children", children)
+end
+cmd.event.on({
+    "ClientLoaded",
+    "session_created", "session_selected", "session_closed",
+    "workspace_created", "workspace_closed", "workspace_selected",
+    "tab_created", "tab_closed", "tab_selected", "terminal_title_changed",
+}, update_tabs)
+
+-- The leader label and top Bar background depend only on leader mode.
+local function update_leader()
+    leader.set("text", g.leader_mode and " LEADER " or "")
+    top_bar.set("style", { fg = "gray", bg = g.leader_mode and "blue" or "black" })
+end
+cmd.event.on({ "ClientLoaded", "leader_mode_changed" }, update_leader)
+
+-- Update the active-Tab line only when session/workspace/tab status or errors change.
+local function update_status()
+    if g.last_error then
+        status.set("text", string.format(" Error: %s ", g.last_error))
+    elseif not g.active_tab then
+        status.set("text", " No active tab ")
+    else
+        local state = g.active_tab.running and "running" or "exited"
+        status.set("text", string.format(" %s · %s ", g.active_tab.title, state))
+    end
+    bottom_bar.set("style", { fg = g.last_error and "red" or "gray", bg = "black" })
+end
+cmd.event.on({
+    "ClientLoaded",
+    "last_error_changed", "session_created", "session_selected", "session_closed",
+    "workspace_selected", "tab_created", "tab_closed", "tab_selected",
+    "terminal_title_changed", "process_exited",
+}, update_status)
+
+-- Session number changes on session events; terminal dimensions change on resize.
+local function update_session_info()
+    local session = g.session and g.session.number or "?"
+    session_info.set("text", string.format(" Session %s · %dx%d ", session, g.terminal.columns, g.terminal.rows))
+end
+cmd.event.on({
+    "ClientLoaded", "session_created", "session_selected", "session_closed", "terminal_resized",
+}, update_session_info)
 
 -- Add bindings after the configured prefix. LuaLS completions are available
 -- when this directory is opened as a workspace in your editor.
 -- cmd.key.bind("tc", function()
 --     cmd.tab.create()
 -- end, { desc = "Create a tab" })
+-- cmd.key.bind("r", function()
+--     cmd.config.reload()
+-- end, { desc = "Reload config" })

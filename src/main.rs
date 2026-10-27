@@ -655,19 +655,27 @@ fn ensure_server(endpoint: &Endpoint) -> Result<(), Box<dyn std::error::Error>> 
   )
 }
 
+struct LoadedConfiguration {
+  config: lua::AppConfig,
+  source: Option<PathBuf>,
+  watch_path: Option<PathBuf>,
+}
+
 fn launch_client(
   endpoint: &Endpoint,
   arguments: &[String],
   launch: lua::LaunchState,
 ) -> Result<(), Box<dyn std::error::Error>> {
-  let config = configuration(arguments, launch)?;
+  let loaded = configuration_with_source(arguments, launch.clone())?;
+  let config = loaded.config;
+  let watch_path = loaded.watch_path;
   let (launch, startup_commands) = client::run_pre_client(endpoint, &config)?;
   if launch.require_session && launch.session_name.is_none() {
     println!("no active sessions");
     return Ok(());
   }
   ensure_server(endpoint)?;
-  client::run(endpoint.clone(), launch, startup_commands, config)
+  client::run(endpoint.clone(), launch, startup_commands, config, watch_path, arguments.to_vec())
 }
 
 #[derive(serde::Serialize)]
@@ -723,21 +731,26 @@ fn configuration(
   arguments: &[String],
   launch: lua::LaunchState,
 ) -> Result<lua::AppConfig, Box<dyn std::error::Error>> {
-  configuration_with_source(arguments, launch).map(|(config, _)| config)
+  configuration_with_source(arguments, launch).map(|loaded| loaded.config)
 }
 
 fn configuration_with_source(
   arguments: &[String],
   launch: lua::LaunchState,
-) -> Result<(lua::AppConfig, Option<PathBuf>), Box<dyn std::error::Error>> {
+) -> Result<LoadedConfiguration, Box<dyn std::error::Error>> {
   let explicit_path = std::env::var_os("ZMUX_CONFIG").map(PathBuf::from);
   let path = resolve_config_path(explicit_path.clone(), default_config_path());
+  let watch_path = path.clone();
   if let Some(path) = path {
     match fs::metadata(&path) {
       Ok(_) => {
         let config = lua::load_file_with_context(&path, arguments, launch)
           .map_err(|error| format!("could not load {}: {error}", path.display()))?;
-        return Ok((config, Some(path)));
+        return Ok(LoadedConfiguration {
+          config,
+          source: Some(path.clone()),
+          watch_path: Some(path),
+        });
       }
       Err(error) if error.kind() == io::ErrorKind::NotFound && explicit_path.is_none() => {}
       Err(error) => {
@@ -749,7 +762,11 @@ fn configuration_with_source(
     }
   }
   let config = lua::load_config_with_context(lua::DEFAULT_CONFIG_SOURCE, arguments, launch)?;
-  Ok((config, None))
+  Ok(LoadedConfiguration {
+    config,
+    source: None,
+    watch_path,
+  })
 }
 
 const LUA_LS_DEFINITIONS: &str = include_str!("../lua/zmux.lua");
@@ -775,8 +792,12 @@ fn run_config_command(
         working_directory: std::env::current_dir()?,
         ..lua::LaunchState::default()
       };
-      let (config, source) = configuration_with_source(arguments, launch)?;
-      let version = config.config_api_version.unwrap_or(lua::CONFIG_API_VERSION);
+      let loaded = configuration_with_source(arguments, launch)?;
+      let version = loaded
+        .config
+        .config_api_version
+        .unwrap_or(lua::CONFIG_API_VERSION);
+      let source = loaded.source;
       if let Some(source) = source {
         println!("Configuration is valid (API version {version}): {}", source.display());
       } else {
