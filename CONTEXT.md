@@ -49,8 +49,8 @@ Shutting down the Server and all its Sessions, causing every attached Client to 
 _Avoid_: Detach or Kill Session (which affect a Client or one Session)
 
 **UI Anchor**:
-A top- or bottom-attached region that reserves space for interface content. A side-attached Drawer overlays the terminal view rather than reserving space.
-_Avoid_: Bar (when referring to the reserved region)
+The top or bottom screen edge at which visible Bars reserve one row each. A side-attached Drawer overlays the terminal view rather than reserving space.
+_Avoid_: Bar (when referring to the screen edge)
 
 **UI Element**:
 A user-configurable, Client-local interface region that displays information and can receive configured keyboard input. Its visibility and focus belong to the Client, while its callbacks may request Application Commands.
@@ -65,12 +65,8 @@ A nested arrangement of UI content that allocates available space among its chil
 _Avoid_: Screen layout (when referring to content inside a UI Element)
 
 **Bar**:
-The rendered content placed in a UI Anchor. A bar can contain user-configurable content and styling.
-_Avoid_: Anchor (when referring to the rendered content)
-
-**Bar Part**:
-A distinct content position within a bar: left, center, or right.
-_Avoid_: Widget (when referring to configurable bar content)
+A retained, client-local UI Element attached to the top or bottom edge. Each visible Bar reserves one row and owns a styled UI Layout tree; at most two Bars may be created at either edge.
+_Avoid_: UI Anchor (when referring to the configurable element)
 
 **UI State**:
 Current application values that describe interface conditions, such as the active Workspace, active Tab, leader mode, and terminal status. Session-level selections, including the active Workspace and Tab, are server-authoritative and shared across Clients; client-local presentation state, such as UI Element visibility and focus, belongs to that Client.
@@ -85,12 +81,12 @@ A request from Lua to perform a supported application operation, such as creatin
 _Avoid_: Event (a command requests a change; an event reports an occurrence)
 
 **Bar Content**:
-Text and styled text segments supplied by the built-in defaults or a user-defined Lua function for a Bar Part.
+The nested UI Layout tree attached as the root content of a Bar.
 _Avoid_: Status text (when referring to arbitrary bar content)
 
 **Bar Style**:
-The presentation properties chosen for bar content, normally from a default style function and optionally overridden by user configuration using current UI State.
-_Avoid_: Theme (when referring to the style resolved for a particular bar part)
+The base foreground, background, and modifier style applied across a Bar's full row and inherited by its child Text nodes unless overridden.
+_Avoid_: Theme (when referring to one Bar's style)
 
 **Fuzzy Picker**:
 A generic focus-taking overlay that fuzzy-filters a supplied list of items and invokes its completion callback with the selected item on Enter, or no item on Escape.
