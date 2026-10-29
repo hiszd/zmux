@@ -161,7 +161,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
   let arguments: Vec<String> = std::env::args().skip(1).collect();
   let options = parse_args(arguments.clone().into_iter())?;
   if options.server_process {
-    return server::run(Endpoint::new(Some(&options.socket_instance))?);
+    return server::run(Endpoint::try_new(Some(&options.socket_instance))?);
   }
   if let Command::Keybinds { json } = &options.command {
     let config = keybinds_configuration(&arguments)?;
@@ -170,7 +170,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
   if let Command::Config(command) = &options.command {
     return run_config_command(*command, &arguments);
   }
-  let endpoint = Endpoint::new(Some(&options.socket_instance))?;
+  let endpoint = Endpoint::try_new(Some(&options.socket_instance))?;
 
   match options.command {
     Command::New {

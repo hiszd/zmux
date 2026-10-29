@@ -11,6 +11,7 @@ use interprocess::local_socket::{
   ListenerOptions,
 };
 
+/// A server instance's local IPC address.
 #[derive(Clone, Debug)]
 pub struct Endpoint {
   instance: String,
@@ -21,7 +22,13 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
-  pub fn new(instance: Option<&str>) -> io::Result<Self> {
+  /// Constructs an endpoint for the named instance or the default instance.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error for an invalid instance name or when no secure runtime directory is
+  /// available.
+  pub fn try_new(instance: Option<&str>) -> io::Result<Self> {
     let instance = instance.unwrap_or("default");
     validate_instance_name(instance)?;
     #[cfg(unix)]
@@ -57,8 +64,10 @@ impl Endpoint {
     }
   }
 
+  /// Returns the instance name used to construct this endpoint.
   pub fn instance(&self) -> &str { &self.instance }
 
+  /// Returns the Unix socket path.
   #[cfg(unix)]
   pub fn path(&self) -> &std::path::Path { &self.path }
 
@@ -74,6 +83,13 @@ impl Endpoint {
   }
 }
 
+/// Binds a listener to `endpoint`.
+///
+/// On Unix, an inactive socket file at the endpoint is reclaimed.
+///
+/// # Errors
+///
+/// Returns an error if the address cannot be prepared or the listener cannot be created.
 pub fn bind(endpoint: &Endpoint) -> io::Result<LocalSocketListener> {
   #[cfg(windows)]
   {
@@ -113,12 +129,22 @@ pub fn bind(endpoint: &Endpoint) -> io::Result<LocalSocketListener> {
   }
 }
 
+/// Connects to a server listening at `endpoint`.
+///
+/// # Errors
+///
+/// Returns an error if no server is reachable or the local socket cannot be opened.
 pub fn connect(endpoint: &Endpoint) -> io::Result<LocalSocketStream> {
   interprocess::local_socket::ConnectOptions::new()
     .name(endpoint.local_socket_name()?)
     .connect_sync()
 }
 
+/// Accepts one incoming connection from `listener`.
+///
+/// # Errors
+///
+/// Returns an error if accepting the connection fails.
 pub fn accept(listener: &LocalSocketListener) -> io::Result<LocalSocketStream> { listener.accept() }
 
 #[cfg(windows)]
@@ -157,6 +183,7 @@ fn runtime_directory() -> io::Result<(PathBuf, bool)> {
     return Ok((path, false));
   }
 
+  // SAFETY: `geteuid` takes no pointers and has no memory-safety preconditions.
   let user_id = unsafe { libc::geteuid() };
   let fallback = std::env::temp_dir().join(format!("zmux-{user_id}"));
   create_private_directory(&fallback)?;
@@ -172,6 +199,7 @@ fn is_secure_runtime_directory(path: &std::path::Path) -> io::Result<bool> {
     Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
     Err(error) => return Err(error),
   };
+  // SAFETY: `geteuid` takes no pointers and has no memory-safety preconditions.
   let user_id = unsafe { libc::geteuid() };
   Ok(metadata.file_type().is_dir() && metadata.uid() == user_id && metadata.mode() & 0o777 == 0o700)
 }
@@ -189,6 +217,7 @@ fn create_private_directory(path: &std::path::Path) -> io::Result<()> {
     Err(error) => return Err(error),
   }
   let metadata = std::fs::symlink_metadata(path)?;
+  // SAFETY: `geteuid` takes no pointers and has no memory-safety preconditions.
   let user_id = unsafe { libc::geteuid() };
   if !metadata.file_type().is_dir() || metadata.uid() != user_id || metadata.mode() & 0o777 != 0o700
   {
@@ -212,8 +241,8 @@ mod tests {
   // Developer approved: do not remove.
   #[test]
   fn independent_server_instances_have_distinct_socket_paths() {
-    let default = Endpoint::new(None).expect("default endpoint");
-    let named = Endpoint::new(Some("project-1")).expect("named endpoint");
+    let default = Endpoint::try_new(None).expect("default endpoint");
+    let named = Endpoint::try_new(Some("project-1")).expect("named endpoint");
 
     assert_ne!(default.path(), named.path());
     assert_eq!(default.instance(), "default");
@@ -231,6 +260,7 @@ mod tests {
     create_private_directory(&path).expect("create private runtime directory");
     let metadata = std::fs::symlink_metadata(&path).expect("inspect runtime directory");
 
+    // SAFETY: `geteuid` takes no pointers and has no memory-safety preconditions.
     assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
     assert_eq!(metadata.mode() & 0o777, 0o700);
 

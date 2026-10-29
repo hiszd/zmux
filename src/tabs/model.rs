@@ -1,3 +1,4 @@
+/// Ordered Tabs with an index identifying the active item.
 #[derive(Debug)]
 pub struct TabSet<T> {
   tabs: Vec<T>,
@@ -14,23 +15,31 @@ impl<T> Default for TabSet<T> {
 }
 
 impl<T> TabSet<T> {
+  /// Adds a Tab and makes it active.
   pub fn push(&mut self, tab: T) {
     self.tabs.push(tab);
     self.active = self.tabs.len() - 1;
   }
 
+  /// Returns the active Tab, if the set is nonempty.
   pub fn active(&self) -> Option<&T> { self.tabs.get(self.active) }
 
+  /// Returns mutable access to the active Tab, if the set is nonempty.
   pub fn active_mut(&mut self) -> Option<&mut T> { self.tabs.get_mut(self.active) }
 
+  /// Returns the zero-based active index.
   pub fn active_index(&self) -> usize { self.active }
 
+  /// Returns the number of Tabs.
   pub fn len(&self) -> usize { self.tabs.len() }
 
+  /// Iterates over Tabs in order.
   pub fn iter(&self) -> impl Iterator<Item = &T> { self.tabs.iter() }
 
+  /// Iterates mutably over Tabs in order.
   pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> { self.tabs.iter_mut() }
 
+  /// Selects the next Tab, wrapping to the first; returns `false` for fewer than two Tabs.
   pub fn next_item(&mut self) -> bool {
     if self.tabs.len() < 2 {
       return false;
@@ -39,6 +48,7 @@ impl<T> TabSet<T> {
     true
   }
 
+  /// Selects the previous Tab, wrapping to the last; returns `false` for fewer than two Tabs.
   pub fn previous_item(&mut self) -> bool {
     if self.tabs.len() < 2 {
       return false;
@@ -51,6 +61,7 @@ impl<T> TabSet<T> {
     true
   }
 
+  /// Removes and returns the active Tab, selecting a remaining Tab if possible.
   pub fn remove_active(&mut self) -> Option<T> {
     if self.tabs.is_empty() {
       return None;
@@ -62,8 +73,12 @@ impl<T> TabSet<T> {
     Some(removed)
   }
 
+  /// Returns whether the set contains no Tabs.
   pub fn is_empty(&self) -> bool { self.tabs.is_empty() }
 
+  /// Selects a Tab by its one-based index.
+  ///
+  /// Returns `false` if the index is out of range or already active.
   pub fn select(&mut self, one_based_index: usize) -> bool {
     if one_based_index == 0 || one_based_index > self.tabs.len() {
       return false;

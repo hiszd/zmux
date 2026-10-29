@@ -173,7 +173,7 @@ pub fn run(
     trace.error("client.terminal_size", error);
   })?;
   let options = traced_lua(&trace, "lua.sync_options initial", config.lua.sync_options())?;
-  let pane_size = ui::pane_size(size.0, size.1, options);
+  let pane_size = ui::pane_size(size.0, size.1, &options);
   let viewport = Viewport {
     rows: pane_size.0.max(1),
     columns: pane_size.1.max(1),
@@ -1273,7 +1273,7 @@ fn run_event_loop(
   let size = terminal.size()?;
   let mut outer_size = (size.width, size.height);
   let mut ui_options = traced_lua(&trace, "lua.sync_options initial", config.lua.sync_options())?;
-  let initial_pane = ui::pane_size(outer_size.0, outer_size.1, ui_options);
+  let initial_pane = ui::pane_size(outer_size.0, outer_size.1, &ui_options);
   let mut viewport = Viewport {
     rows: initial_pane.0.max(1),
     columns: initial_pane.1.max(1),
@@ -1401,7 +1401,7 @@ fn run_event_loop(
       outer_size = (size.width, size.height);
       ui_options = traced_lua(&trace, "lua.sync_options redraw", config.lua.sync_options())?;
       session.which_key_options = ui_options.which;
-      let pane = ui::pane_size(outer_size.0, outer_size.1, ui_options.clone());
+      let pane = ui::pane_size(outer_size.0, outer_size.1, &ui_options);
       let new_viewport = Viewport {
         rows: pane.0.max(1),
         columns: pane.1.max(1),
@@ -2380,7 +2380,7 @@ fn handle_input(
       *context.outer_size = (width, height);
       let options =
         traced_lua(context.trace, "lua.sync_options terminal resize", context.lua.sync_options())?;
-      let pane = ui::pane_size(width, height, options);
+      let pane = ui::pane_size(width, height, &options);
       let viewport = Viewport {
         rows: pane.0.max(1),
         columns: pane.1.max(1),
@@ -2694,7 +2694,7 @@ fn dispatch_ui_events(
         .mark(&format!("{callback_context} complete commands={}", commands.len()));
       let options =
         traced_lua(context.trace, "lua.sync_options event callback", context.lua.sync_options())?;
-      let pane = ui::pane_size(context.outer_size.0, context.outer_size.1, options);
+      let pane = ui::pane_size(context.outer_size.0, context.outer_size.1, &options);
       let next_viewport = Viewport {
         rows: pane.0.max(1),
         columns: pane.1.max(1),
@@ -2798,7 +2798,7 @@ fn activate_reloaded_config(
   *config = candidate;
   session.which_key_options = options.which;
 
-  let pane = ui::pane_size(outer_size.0, outer_size.1, options);
+  let pane = ui::pane_size(outer_size.0, outer_size.1, &options);
   let next_viewport = Viewport {
     rows: pane.0.max(1),
     columns: pane.1.max(1),
@@ -3605,8 +3605,9 @@ mod tests {
 
     use zmux::transport::Endpoint;
 
-    let endpoint = Endpoint::new(Some(&format!("pre-attach-server-test-{}", std::process::id())))
-      .expect("test endpoint");
+    let endpoint =
+      Endpoint::try_new(Some(&format!("pre-attach-server-test-{}", std::process::id())))
+        .expect("test endpoint");
     let server_endpoint = endpoint.clone();
     let server = thread::spawn(move || crate::server::run(server_endpoint).expect("server loop"));
     let mut connected = false;

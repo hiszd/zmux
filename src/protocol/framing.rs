@@ -10,62 +10,100 @@ use serde::{
   de::DeserializeOwned,
 };
 
+/// Wire protocol version required by connected Clients.
 pub const PROTOCOL_VERSION: u16 = 9;
+/// Maximum payload size accepted for one framed IPC message.
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
+/// Terminal dimensions, expressed in character cells.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub struct Viewport {
+  /// Number of rows.
   pub rows: u16,
+  /// Number of columns.
   pub columns: u16,
 }
 
+/// TUI Client parameters sent when opening a connection.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ClientHello {
+  /// Protocol version the Client implements.
   pub protocol_version: u16,
+  /// Session to attach to, or `None` to choose one according to the flags.
   pub session_name: Option<String>,
+  /// Whether the Server may create the Session when it is missing.
   pub create_if_missing: bool,
+  /// Whether the Server should reject an already-existing Session.
   pub fail_if_exists: bool,
+  /// Shell executable used for newly created Tabs.
   pub shell: std::path::PathBuf,
+  /// Environment variables supplied to newly created shells.
   pub environment: Vec<(String, String)>,
+  /// Initial working directory for a newly created Session.
   pub working_directory: std::path::PathBuf,
+  /// Initial PTY dimensions requested by the Client.
   pub viewport: Viewport,
 }
 
+/// Server-authoritative state for one Workspace.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct WorkspaceSnapshot {
+  /// Stable Workspace identifier.
   pub id: u64,
+  /// Display name, explicit or derived from the working directory.
   pub name: String,
+  /// User-assigned name, if the Workspace has one.
   pub explicit_name: Option<String>,
+  /// Directory used when creating Tabs in the Workspace.
   pub working_directory: std::path::PathBuf,
+  /// Tabs in Workspace order.
   pub tabs: Vec<TabSnapshot>,
+  /// Identifier of the active Tab.
   pub active_tab_id: u64,
 }
 
+/// Server-authoritative state for one Tab.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct TabSnapshot {
+  /// Stable Tab identifier.
   pub id: u64,
+  /// User-visible Tab name.
   pub name: String,
+  /// Current terminal title.
   pub title: String,
+  /// Process exit code, or `None` while the process is running.
   pub exit_code: Option<u32>,
 }
 
+/// Server-authoritative state for one Session.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct SessionSnapshot {
+  /// Session's user-visible name.
   pub number: String,
+  /// Workspaces in Session order.
   pub workspaces: Vec<WorkspaceSnapshot>,
+  /// Identifier of the active Workspace.
   pub active_workspace_id: u64,
 }
 
+/// Terminal-emulator contents and geometry for one Tab.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct TerminalSnapshot {
+  /// Identifier of the Tab represented by this snapshot.
   pub tab_id: u64,
+  /// Terminal row count.
   pub rows: u16,
+  /// Terminal column count.
   pub columns: u16,
+  /// Escape-sequence replay data used to reconstruct the terminal screen.
   pub bytes: Vec<u8>,
+  /// Current terminal title.
   pub title: String,
+  /// Process exit code, or `None` while the process is running.
   pub exit_code: Option<u32>,
 }
 
+/// Top-level message sent by an attached Client.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum ClientMessage {
   Hello(ClientHello),
@@ -75,14 +113,20 @@ pub enum ClientMessage {
   HeadlessRequest { id: u64, request: HeadlessRequest },
 }
 
+/// Connection parameters for a headless Lua client.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct HeadlessHello {
+  /// Protocol version the client implements.
   pub protocol_version: u16,
+  /// Working directory used when the script creates a Session.
   pub working_directory: std::path::PathBuf,
+  /// Shell executable used for newly created Tabs.
   pub shell: std::path::PathBuf,
+  /// Environment variables supplied to newly created shells.
   pub environment: Vec<(String, String)>,
 }
 
+/// Server operation requested by a headless Lua client.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum HeadlessRequest {
   SessionCreate {
@@ -142,6 +186,7 @@ pub enum HeadlessRequest {
   StopServer,
 }
 
+/// Successful result returned by a headless operation.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum HeadlessResult {
   Accepted,
@@ -150,29 +195,46 @@ pub enum HeadlessResult {
   Tabs(Vec<HeadlessTab>),
 }
 
+/// Summary of a Session returned to a headless client.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct HeadlessSession {
+  /// Session selector.
   pub id: String,
+  /// User-visible Session name.
   pub name: String,
+  /// Number of Workspaces in the Session.
   pub workspaces: usize,
+  /// Number of Tabs across the Session.
   pub tabs: usize,
 }
+/// Workspace details returned to a headless client.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct HeadlessWorkspace {
+  /// Qualified Workspace selector.
   pub id: String,
+  /// User-visible Workspace name.
   pub name: String,
+  /// Directory used when creating Tabs in the Workspace.
   pub working_directory: std::path::PathBuf,
+  /// Whether this Workspace is active in its Session.
   pub active: bool,
 }
+/// Tab details returned to a headless client.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct HeadlessTab {
+  /// Qualified Tab selector.
   pub id: String,
+  /// User-visible Tab name.
   pub name: String,
+  /// Current terminal title.
   pub title: String,
+  /// Process exit code, or `None` while the process is running.
   pub exit_code: Option<u32>,
+  /// Whether this Tab is active in its Workspace.
   pub active: bool,
 }
 
+/// Administrative operation sent to the Server process.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum AdminRequest {
   ListSessions,
@@ -190,14 +252,20 @@ pub enum AdminRequest {
   },
 }
 
+/// Summary of a Session returned by an administrative query.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct SessionSummary {
+  /// User-visible Session name.
   pub number: String,
+  /// Number of attached TUI Clients.
   pub clients: usize,
+  /// Number of Workspaces in the Session.
   pub workspaces: usize,
+  /// Number of Tabs across the Session.
   pub tabs: usize,
 }
 
+/// Response to an administrative request.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum AdminResponse {
   Sessions(Vec<SessionSummary>),
@@ -206,6 +274,7 @@ pub enum AdminResponse {
   SessionReady { name: String, created: bool },
 }
 
+/// Operation requested by an attached TUI Client.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum ClientRequest {
   Input(Vec<u8>),
@@ -231,6 +300,7 @@ pub enum ClientRequest {
   StopServer,
 }
 
+/// Message sent by the Server to a connected Client.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum ServerMessage {
   HelloAccepted {
@@ -277,6 +347,13 @@ pub enum ServerMessage {
   ServerStopping,
 }
 
+/// Serializes and writes one length-prefixed IPC message.
+///
+/// The encoded payload is limited to [`MAX_FRAME_BYTES`].
+///
+/// # Errors
+///
+/// Returns an error if serialization fails, the payload exceeds the limit, or writing fails.
 pub fn write_frame<W, T>(writer: &mut W, message: &T) -> io::Result<()>
 where
   W: Write,
@@ -296,6 +373,13 @@ where
   writer.flush()
 }
 
+/// Reads and deserializes one length-prefixed IPC message.
+///
+/// Rejects payloads larger than [`MAX_FRAME_BYTES`] and trailing bytes after the decoded value.
+///
+/// # Errors
+///
+/// Returns an error if reading, validation, or deserialization fails.
 pub fn read_frame<R, T>(reader: &mut R) -> io::Result<T>
 where
   R: Read,

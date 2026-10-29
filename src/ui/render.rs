@@ -251,10 +251,10 @@ fn render_screen(buffer: &mut ratatui::buffer::Buffer, area: Rect, screen: &Grid
 ///     bottom_bars: 1,
 ///     ..UiOptions::default()
 /// };
-/// let parts = layout(Rect::new(0, 0, 80, 24), options);
+/// let parts = layout(Rect::new(0, 0, 80, 24), &options);
 /// assert_eq!((parts.pane.width, parts.pane.height), (78, 21));
 /// ```
-pub fn layout(area: Rect, options: UiOptions) -> UiLayout {
+pub fn layout(area: Rect, options: &UiOptions) -> UiLayout {
   let top_height = options.top_bars.min(area.height);
   let bottom_height = options
     .bottom_bars
@@ -280,7 +280,7 @@ pub fn layout(area: Rect, options: UiOptions) -> UiLayout {
 /// Returns the PTY's inner `(height, width)` for a terminal resize request.
 ///
 /// The order matches the common PTY resize API rather than [`ratatui::layout::Rect`].
-pub fn pane_size(width: u16, height: u16, options: UiOptions) -> (u16, u16) {
+pub fn pane_size(width: u16, height: u16, options: &UiOptions) -> (u16, u16) {
   let layout = layout(Rect::new(0, 0, width, height), options);
   (layout.pane.height, layout.pane.width)
 }
@@ -293,7 +293,7 @@ pub fn pane_size(width: u16, height: u16, options: UiOptions) -> (u16, u16) {
 pub fn draw(frame: &mut Frame<'_>, view: &UiRender<'_>) -> mlua::Result<()> {
   let frame_started = Instant::now();
   let area = frame.area();
-  let layout = layout(area, view.options.clone());
+  let layout = layout(area, &view.options);
   let rect_detail = |rect: Option<Rect>| {
     rect.map_or_else(
       || "none".to_owned(),
@@ -627,7 +627,7 @@ mod tests {
       bottom_bars: 3,
       ..UiOptions::default()
     };
-    let parts = layout(Rect::new(0, 0, 100, 30), options);
+    let parts = layout(Rect::new(0, 0, 100, 30), &options);
     assert_eq!(parts.top_anchor.height, 2);
     assert_eq!(parts.bottom_anchor.height, 3);
     assert_eq!(parts.pane.width, 98);
@@ -638,7 +638,7 @@ mod tests {
   #[test]
   fn drawer_overlays_do_not_reduce_the_pty_viewport() {
     let options = UiOptions::default();
-    assert_eq!(pane_size(80, 24, options), (22, 78));
+    assert_eq!(pane_size(80, 24, &options), (22, 78));
   }
 
   #[test]
@@ -667,9 +667,9 @@ mod tests {
       },
       ..UiOptions::default()
     };
-    let parts = layout(Rect::new(0, 0, 80, 24), options.clone());
+    let parts = layout(Rect::new(0, 0, 80, 24), &options);
     assert_eq!((parts.pane.width, parts.pane.height), (80, 24));
-    assert_eq!(pane_size(80, 24, options), (24, 80));
+    assert_eq!(pane_size(80, 24, &options), (24, 80));
   }
 
   // Developer approved: do not remove.

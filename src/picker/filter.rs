@@ -1,3 +1,6 @@
+/// Returns input indices whose labels contain `query` as a case-insensitive subsequence.
+///
+/// Results are ordered by match tightness, then by their original input order.
 pub fn fuzzy_filter(query: &str, labels: &[String]) -> Vec<usize> {
   let query: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
   let mut matches: Vec<(usize, usize)> = labels

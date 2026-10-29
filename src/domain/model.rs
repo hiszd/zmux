@@ -5,57 +5,80 @@ use std::{
 
 use thiserror::Error;
 
+/// The user-visible name that identifies a Session.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SessionName(String);
 
 impl SessionName {
+  /// Creates a Session name from any string-like value.
   pub fn new(value: impl Into<String>) -> Self { Self(value.into()) }
 
+  /// Returns the Session name as a string slice.
   pub fn get(&self) -> &str { &self.0 }
 }
 
+/// Stable identifier for a Workspace within the application.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct WorkspaceId(u64);
 
 impl WorkspaceId {
+  /// Wraps a numeric Workspace identifier.
   pub const fn new(value: u64) -> Self { Self(value) }
 
+  /// Returns the underlying numeric identifier.
   pub const fn get(self) -> u64 { self.0 }
 }
 
+/// Stable identifier for a Tab within the application.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TabId(u64);
 
 impl TabId {
+  /// Wraps a numeric Tab identifier.
   pub const fn new(value: u64) -> Self { Self(value) }
 
+  /// Returns the underlying numeric identifier.
   pub const fn get(self) -> u64 { self.0 }
 }
 
+/// Failure to maintain Session membership invariants.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum SessionError {
+  /// A Session or added Workspace must contain at least one Tab.
   #[error("a Session requires a Workspace containing at least one Tab")]
   EmptyWorkspace,
+  /// The Session already contains a Workspace with the supplied identifier.
   #[error("Workspace ID already exists in this Session")]
   DuplicateWorkspace,
 }
 
+/// Describes the effect of closing a Tab through its Session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionTabCloseOutcome {
+  /// No Workspace contained the requested Tab.
   NotFound,
+  /// The Tab closed while its Workspace remained open.
   TabClosed,
+  /// Closing the Tab also removed its now-empty Workspace.
   WorkspaceClosed,
+  /// Closing the Tab also removed the final Workspace and Session.
   SessionClosed,
 }
 
+/// Describes the effect of closing a Tab within a Workspace.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TabCloseOutcome {
+  /// The Workspace did not contain the requested Tab.
   NotFound,
+  /// The removed Tab was the Workspace's final Tab.
   WorkspaceEmpty,
+  /// The active Tab was closed; the payload is the newly active Tab.
   ActiveTabChanged(TabId),
+  /// An inactive Tab was closed; the payload remains active.
   ActiveTabUnchanged(TabId),
 }
 
+/// A grouping of Tabs with a working directory and active Tab.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Workspace {
   id: WorkspaceId,
@@ -65,6 +88,7 @@ pub struct Workspace {
   active_tab: Option<TabId>,
 }
 
+/// A collection of Workspaces with one active Workspace.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Session {
   name: SessionName,
@@ -73,7 +97,12 @@ pub struct Session {
 }
 
 impl Session {
-  pub fn new(name: SessionName, initial_workspace: Workspace) -> Result<Self, SessionError> {
+  /// Creates a Session whose initial Workspace becomes active.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`SessionError::EmptyWorkspace`] if the initial Workspace has no Tabs.
+  pub fn try_new(name: SessionName, initial_workspace: Workspace) -> Result<Self, SessionError> {
     if initial_workspace.tabs.is_empty() {
       return Err(SessionError::EmptyWorkspace);
     }
@@ -85,14 +114,19 @@ impl Session {
     })
   }
 
+  /// Returns this Session's name.
   pub fn name(&self) -> &SessionName { &self.name }
 
+  /// Replaces this Session's name.
   pub fn set_name(&mut self, name: SessionName) { self.name = name; }
 
+  /// Returns all Workspaces in insertion order.
   pub fn workspaces(&self) -> &[Workspace] { &self.workspaces }
 
+  /// Returns the active Workspace identifier, if the Session has one.
   pub const fn active_workspace_id(&self) -> Option<WorkspaceId> { self.active_workspace }
 
+  /// Returns the active Workspace, if the Session has one.
   pub fn active_workspace(&self) -> Option<&Workspace> {
     let active_workspace = self.active_workspace?;
     self
@@ -101,6 +135,7 @@ impl Session {
       .find(|workspace| workspace.id == active_workspace)
   }
 
+  /// Returns mutable access to the active Workspace, if the Session has one.
   pub fn active_workspace_mut(&mut self) -> Option<&mut Workspace> {
     let active_workspace = self.active_workspace?;
     self
@@ -109,6 +144,7 @@ impl Session {
       .find(|workspace| workspace.id == active_workspace)
   }
 
+  /// Returns mutable access to a Workspace with the given identifier.
   pub fn workspace_mut(&mut self, workspace_id: WorkspaceId) -> Option<&mut Workspace> {
     self
       .workspaces
@@ -116,8 +152,15 @@ impl Session {
       .find(|workspace| workspace.id == workspace_id)
   }
 
+  /// Returns the active Tab in the active Workspace, if one exists.
   pub fn active_tab(&self) -> Option<TabId> { self.active_workspace()?.active_tab() }
 
+  /// Adds a Workspace and makes it active.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`SessionError::EmptyWorkspace`] if the Workspace has no Tabs, or
+  /// [`SessionError::DuplicateWorkspace`] if its identifier is already present.
   pub fn add_workspace(&mut self, workspace: Workspace) -> Result<(), SessionError> {
     if workspace.tabs.is_empty() {
       return Err(SessionError::EmptyWorkspace);
@@ -134,6 +177,9 @@ impl Session {
     Ok(())
   }
 
+  /// Makes the identified Workspace active.
+  ///
+  /// Returns `true` only when the active Workspace changes.
   pub fn select_workspace(&mut self, workspace_id: WorkspaceId) -> bool {
     if !self
       .workspaces
@@ -147,6 +193,9 @@ impl Session {
     true
   }
 
+  /// Selects a Tab in the active Workspace.
+  ///
+  /// Returns `true` only when the active Tab changes.
   pub fn select_tab(&mut self, tab_id: TabId) -> bool {
     let Some(active_workspace) = self.active_workspace else {
       return false;
@@ -158,6 +207,9 @@ impl Session {
       .is_some_and(|workspace| workspace.select_tab(tab_id))
   }
 
+  /// Adds a Tab to the active Workspace and selects it.
+  ///
+  /// Returns `false` if there is no active Workspace or the identifier is already in use.
   pub fn add_tab_to_active_workspace(&mut self, tab_id: TabId) -> bool {
     if self
       .workspaces
@@ -176,6 +228,7 @@ impl Session {
       .is_some_and(|workspace| workspace.add_tab(tab_id))
   }
 
+  /// Closes a Tab and removes its Workspace or Session if that becomes empty.
   pub fn close_tab(&mut self, tab_id: TabId) -> SessionTabCloseOutcome {
     let Some(workspace_index) = self
       .workspaces
@@ -205,6 +258,7 @@ impl Session {
     SessionTabCloseOutcome::WorkspaceClosed
   }
 
+  /// Removes a Workspace and reports whether that also closes the Session.
   pub fn close_workspace(&mut self, workspace_id: WorkspaceId) -> SessionTabCloseOutcome {
     let Some(workspace_index) = self
       .workspaces
@@ -227,6 +281,9 @@ impl Session {
 }
 
 impl Workspace {
+  /// Creates an empty Workspace.
+  ///
+  /// An empty or absent explicit name is derived from the working directory.
   pub fn new(id: WorkspaceId, working_directory: PathBuf, explicit_name: Option<String>) -> Self {
     Self {
       id,
@@ -237,20 +294,26 @@ impl Workspace {
     }
   }
 
+  /// Returns this Workspace's identifier.
   pub const fn id(&self) -> WorkspaceId { self.id }
 
+  /// Returns the directory used when creating Tabs in this Workspace.
   pub fn working_directory(&self) -> &std::path::Path { &self.working_directory }
 
+  /// Returns the explicitly assigned name, if any.
   pub fn explicit_name(&self) -> Option<&str> { self.explicit_name.as_deref() }
 
+  /// Changes the directory used when creating future Tabs.
   pub fn set_working_directory(&mut self, working_directory: PathBuf) {
     self.working_directory = working_directory;
   }
 
+  /// Sets an explicit name, or restores the directory-derived name for `None` or an empty string.
   pub fn set_name(&mut self, name: Option<String>) {
     self.explicit_name = name.filter(|name| !name.is_empty());
   }
 
+  /// Adds and selects a Tab unless its identifier is already present.
   pub fn add_tab(&mut self, tab_id: TabId) -> bool {
     if self.tabs.contains(&tab_id) {
       return false;
@@ -260,8 +323,12 @@ impl Workspace {
     true
   }
 
+  /// Returns the active Tab identifier, if one exists.
   pub const fn active_tab(&self) -> Option<TabId> { self.active_tab }
 
+  /// Selects a Tab in this Workspace.
+  ///
+  /// Returns `true` only when the active Tab changes.
   pub fn select_tab(&mut self, tab_id: TabId) -> bool {
     if !self.tabs.contains(&tab_id) || self.active_tab == Some(tab_id) {
       return false;
@@ -270,6 +337,7 @@ impl Workspace {
     true
   }
 
+  /// Removes a Tab and selects a remaining Tab when needed.
   pub fn close_tab(&mut self, tab_id: TabId) -> TabCloseOutcome {
     let Some(index) = self.tabs.iter().position(|candidate| *candidate == tab_id) else {
       return TabCloseOutcome::NotFound;
@@ -289,8 +357,10 @@ impl Workspace {
     TabCloseOutcome::ActiveTabChanged(next_active)
   }
 
+  /// Returns Tab identifiers in Workspace order.
   pub fn tabs(&self) -> &[TabId] { &self.tabs }
 
+  /// Returns the explicit name or the working-directory basename.
   pub fn name(&self) -> Cow<'_, str> {
     if let Some(name) = &self.explicit_name {
       return Cow::Borrowed(name);
@@ -425,7 +495,7 @@ mod tests {
     let first_workspace_id = first_workspace.id();
     let second_workspace = workspace(2, &[3]);
     let second_workspace_id = second_workspace.id();
-    let mut session = Session::new(SessionName::new("7"), first_workspace)
+    let mut session = Session::try_new(SessionName::new("7"), first_workspace)
       .expect("a workspace with tabs can start a session");
 
     assert!(session.add_workspace(second_workspace).is_ok());
@@ -450,7 +520,7 @@ mod tests {
     let first_workspace = workspace(1, &[1, 2]);
     let first_workspace_id = first_workspace.id();
     let second_workspace = workspace(2, &[3]);
-    let mut session = Session::new(SessionName::new("8"), first_workspace)
+    let mut session = Session::try_new(SessionName::new("8"), first_workspace)
       .expect("a workspace with tabs can start a session");
     session
       .add_workspace(second_workspace)
