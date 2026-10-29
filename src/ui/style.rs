@@ -44,13 +44,11 @@ pub(crate) struct StyleRegistry {
 
 impl Default for StyleRegistry {
   fn default() -> Self {
-    let groups = default_groups();
-    let resolved = resolve_all(&groups).expect("built-in style groups are valid");
     Self {
-      themes: HashMap::from([("default".to_owned(), groups.clone())]),
-      groups,
-      resolved,
-      active_theme: "default".to_owned(),
+      groups: HashMap::new(),
+      themes: HashMap::new(),
+      resolved: HashMap::new(),
+      active_theme: String::new(),
     }
   }
 }
@@ -225,46 +223,6 @@ fn resolve_attribute_inner<T: Copy>(
   }
 }
 
-fn default_groups() -> HashMap<String, StyleDefinition> {
-  let mut groups = HashMap::new();
-  let mut insert = |name: &str, definition| {
-    groups.insert(name.to_owned(), definition);
-  };
-  insert("Pty.Border", StyleDefinition::default());
-  insert("Bar", style(Some(Color::Gray), Some(Color::Black), false));
-  insert("Bar.Tab", style(Some(Color::Gray), None, false));
-  insert("Bar.TabActive", style(Some(Color::Black), Some(Color::Cyan), true));
-  insert("Bar.Leader", style(Some(Color::Gray), Some(Color::Blue), false));
-  insert("Bar.LeaderIndicator", style(Some(Color::Black), Some(Color::Yellow), true));
-  insert("Bar.Status", style(Some(Color::Gray), Some(Color::Black), false));
-  insert("Bar.Error", style(Some(Color::Red), Some(Color::Black), false));
-  insert("Modal.Border", StyleDefinition::default());
-  insert("Modal.Background", style(Some(Color::Gray), Some(Color::Black), false));
-  insert("Modal.Query", style(Some(Color::Yellow), Some(Color::Black), false));
-  insert("Modal.Selected", style(Some(Color::Black), Some(Color::Cyan), true));
-  insert("Modal.Item", style(Some(Color::White), Some(Color::Black), false));
-  insert("Modal.Footer", style(Some(Color::Gray), Some(Color::Black), false));
-  insert("Warning.Key", style(Some(Color::Yellow), None, true));
-  insert("Warning.Reload", style(Some(Color::Yellow), None, true));
-  insert("WhichKey.Border", style(Some(Color::Cyan), None, false));
-  insert("WhichKey.Background", style(None, Some(Color::Black), false));
-  insert("WhichKey.Header", style(Some(Color::Gray), None, false));
-  insert("WhichKey.Prefix", style(Some(Color::Cyan), None, true));
-  insert("WhichKey.Footer", style(Some(Color::Gray), None, false));
-  insert("WhichKey.Key", style(Some(Color::Yellow), None, true));
-  insert("WhichKey.Description", style(Some(Color::White), None, false));
-  groups
-}
-
-fn style(fg: Option<Color>, bg: Option<Color>, bold: bool) -> StyleDefinition {
-  StyleDefinition {
-    fg: fg.map(StyleAttribute::Value),
-    bg: bg.map(StyleAttribute::Value),
-    bold: Some(StyleAttribute::Value(bold)),
-    ..StyleDefinition::default()
-  }
-}
-
 #[cfg(test)]
 mod tests {
   use std::collections::HashMap;
@@ -315,8 +273,8 @@ mod tests {
         ..StyleDefinition::default()
       })
       .expect("define custom group");
-    let original = styles.resolve("Modal.Selected");
-    let theme = HashMap::from([("Modal.Selected".to_owned(), StyleDefinition {
+    let original = styles.resolve("custom");
+    let theme = HashMap::from([("custom".to_owned(), StyleDefinition {
       fg: Some(StyleAttribute::Value(Color::Magenta)),
       ..StyleDefinition::default()
     })]);
@@ -324,16 +282,21 @@ mod tests {
     styles
       .define_theme("violet".to_owned(), theme)
       .expect("define theme");
-    assert_eq!(styles.resolve("Modal.Selected"), original);
+    assert_eq!(styles.resolve("custom"), original);
     styles.apply_theme("violet").expect("apply theme");
 
-    assert_eq!(styles.resolve("Modal.Selected").fg, Some(Color::Magenta));
-    assert_eq!(styles.resolve("custom").fg, Some(Color::Green));
+    assert_eq!(styles.resolve("custom").fg, Some(Color::Magenta));
   }
 
   #[test]
   fn invalid_theme_definition_does_not_change_active_groups() {
     let mut styles = StyleRegistry::default();
+    styles
+      .create_group("Modal.Selected".to_owned(), StyleDefinition {
+        fg: Some(StyleAttribute::Value(Color::Green)),
+        ..StyleDefinition::default()
+      })
+      .expect("define initial group");
     let before = styles.resolve("Modal.Selected");
     styles
       .define_theme(

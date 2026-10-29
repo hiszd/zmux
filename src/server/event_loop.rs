@@ -641,8 +641,6 @@ impl ServerState {
     };
     let session_name = connection.session_name.clone();
     let request_label = match &request {
-      ClientRequest::PreviousTab => "previous-tab",
-      ClientRequest::NextTab => "next-tab",
       ClientRequest::SelectTab(_) => "select-tab",
       _ => "other",
     };
@@ -675,8 +673,6 @@ impl ServerState {
       }
       ClientRequest::NewTab => self.create_tab(&session_name),
       ClientRequest::CloseTab => self.close_active_tab(&session_name),
-      ClientRequest::NextTab => self.navigate_tab(&session_name, 1),
-      ClientRequest::PreviousTab => self.navigate_tab(&session_name, -1),
       ClientRequest::SelectTab(index) => self.select_tab(&session_name, index),
       ClientRequest::CreateWorkspace {
         working_directory,
@@ -815,33 +811,6 @@ impl ServerState {
         .map_err(|error| error.to_string());
     }
     self.broadcast_state(number)
-  }
-
-  fn navigate_tab(&mut self, number: &str, direction: i32) -> Result<(), String> {
-    let workspace_tabs = self
-      .session(number)
-      .and_then(|session| session.model.active_workspace())
-      .map(|workspace| workspace.tabs().to_vec())
-      .ok_or_else(|| "Session has no active Workspace".to_owned())?;
-    if workspace_tabs.len() < 2 {
-      return Ok(());
-    }
-    let active = self
-      .session(number)
-      .and_then(|session| session.model.active_tab())
-      .ok_or_else(|| "Session has no active Tab".to_owned())?;
-    let current = workspace_tabs
-      .iter()
-      .position(|candidate| *candidate == active)
-      .ok_or_else(|| "active Tab is not in the active Workspace".to_owned())?;
-    let next = if direction > 0 {
-      (current + 1) % workspace_tabs.len()
-    } else if current == 0 {
-      workspace_tabs.len() - 1
-    } else {
-      current - 1
-    };
-    self.select_tab(number, next + 1)
   }
 
   fn select_tab(&mut self, number: &str, one_based_index: usize) -> Result<(), String> {
@@ -1679,17 +1648,17 @@ mod tests {
     })
     .expect("create second Tab");
     let state = read_state_with_active_tab_count(&mut client, 2);
-    let previous_tab = state.workspaces[0].tabs[0].id;
+    let first_tab = state.workspaces[0].tabs[0].id;
 
     write_frame(&mut client, &ClientMessage::Request {
       id: 2,
-      request: ClientRequest::PreviousTab,
+      request: ClientRequest::SelectTab(1),
     })
-    .expect("select previous Tab");
+    .expect("select first Tab");
     let terminals = loop {
-      match read_frame::<_, ServerMessage>(&mut client).expect("read previous Tab update") {
+      match read_frame::<_, ServerMessage>(&mut client).expect("read Tab selection update") {
         ServerMessage::StateChanged { session, terminals } => {
-          assert_eq!(session.workspaces[0].active_tab_id, previous_tab);
+          assert_eq!(session.workspaces[0].active_tab_id, first_tab);
           break terminals;
         }
         ServerMessage::TerminalOutput { .. }

@@ -148,14 +148,10 @@ pub enum RuntimeCommand {
   StopServer,
   CreateWorkspace,
   EditWorkspace,
-  NextWorkspace,
-  PreviousWorkspace,
   SelectWorkspace(u64),
   CloseWorkspace,
   NewTab,
   CloseTab,
-  NextTab,
-  PreviousTab,
   SelectTab(usize),
   ReloadConfig,
   PreAttachServer(HeadlessRequest),
@@ -1269,22 +1265,6 @@ fn load_config_with_source_path(
     "close",
     RuntimeCommand::CloseWorkspace,
   )?;
-  register_command(
-    &lua,
-    &workspace,
-    &commands,
-    &in_event_callback,
-    "next",
-    RuntimeCommand::NextWorkspace,
-  )?;
-  register_command(
-    &lua,
-    &workspace,
-    &commands,
-    &in_event_callback,
-    "previous",
-    RuntimeCommand::PreviousWorkspace,
-  )?;
   {
     let commands = Rc::clone(&commands);
     let in_event_callback = Rc::clone(&in_event_callback);
@@ -1301,15 +1281,6 @@ fn load_config_with_source_path(
   }
   register_command(&lua, &tab, &commands, &in_event_callback, "create", RuntimeCommand::NewTab)?;
   register_command(&lua, &tab, &commands, &in_event_callback, "close", RuntimeCommand::CloseTab)?;
-  register_command(&lua, &tab, &commands, &in_event_callback, "next", RuntimeCommand::NextTab)?;
-  register_command(
-    &lua,
-    &tab,
-    &commands,
-    &in_event_callback,
-    "previous",
-    RuntimeCommand::PreviousTab,
-  )?;
   {
     let commands = Rc::clone(&commands);
     let in_event_callback = Rc::clone(&in_event_callback);
@@ -3311,26 +3282,41 @@ mod tests {
   #[test]
   fn lua_receives_server_authoritative_session_and_workspace_state() {
     let config = load_config(
-            "cmd.event.on('TabSelected', function()\n  assert(g.session.number == '9')\n  assert(g.active_workspace.name == 'project')\n  assert(g.active_workspace.tabs[1].selected)\n  assert(g.active_workspace.tabs[1].name == '2')\n  cmd.tab.next()\nend)",
+            "cmd.event.on('TabSelected', function()\n  assert(g.session.number == '9')\n  assert(g.active_workspace.name == 'project')\n  assert(g.active_workspace.tabs[1].selected)\n  assert(g.active_workspace.tabs[1].name == '2')\n  cmd.tab.next()\n  cmd.workspace.next()\nend)",
         )
         .expect("session-aware callback config");
     let mut state = snapshot();
     state.session = Some(zmux::protocol::SessionSnapshot {
       number: "9".to_owned(),
       active_workspace_id: 4,
-      workspaces: vec![zmux::protocol::WorkspaceSnapshot {
-        id: 4,
-        name: "project".to_owned(),
-        explicit_name: None,
-        working_directory: "/work/project".into(),
-        tabs: vec![zmux::protocol::TabSnapshot {
-          id: 20,
-          name: "2".to_owned(),
-          title: "shell-two".to_owned(),
-          exit_code: None,
-        }],
-        active_tab_id: 20,
-      }],
+      workspaces: vec![
+        zmux::protocol::WorkspaceSnapshot {
+          id: 4,
+          name: "project".to_owned(),
+          explicit_name: None,
+          working_directory: "/work/project".into(),
+          tabs: vec![zmux::protocol::TabSnapshot {
+            id: 20,
+            name: "2".to_owned(),
+            title: "shell-two".to_owned(),
+            exit_code: None,
+          }],
+          active_tab_id: 20,
+        },
+        zmux::protocol::WorkspaceSnapshot {
+          id: 8,
+          name: "other".to_owned(),
+          explicit_name: None,
+          working_directory: "/work/other".into(),
+          tabs: vec![zmux::protocol::TabSnapshot {
+            id: 30,
+            name: "1".to_owned(),
+            title: "shell-one".to_owned(),
+            exit_code: None,
+          }],
+          active_tab_id: 30,
+        },
+      ],
     });
     config.lua.sync_state(&state).expect("sync Session state");
     let callbacks = config.lua.event_handlers("TabSelected");
@@ -3339,7 +3325,45 @@ mod tests {
       .invoke_event_handler(&callbacks[0], &AppEvent::default())
       .expect("invoke Session-aware callback");
 
-    assert_eq!(commands, vec![RuntimeCommand::NextTab]);
+    assert_eq!(commands, vec![RuntimeCommand::SelectTab(1), RuntimeCommand::SelectWorkspace(8)]);
+  }
+
+  #[test]
+  fn previous_navigation_helpers_wrap_from_first_to_last() {
+    let config = load_config(
+      "cmd.event.on('TabSelected', function()\n  cmd.tab.previous()\n  cmd.workspace.previous()\nend)",
+    )
+    .expect("navigation callbacks");
+    let mut state = snapshot();
+    state.active_tab = Some(0);
+    state.tabs[0].selected = true;
+    state.tabs[1].selected = false;
+    let workspace = |id, name: &str, tab_id| zmux::protocol::WorkspaceSnapshot {
+      id,
+      name: name.to_owned(),
+      explicit_name: None,
+      working_directory: format!("/work/{name}").into(),
+      tabs: vec![zmux::protocol::TabSnapshot {
+        id: tab_id,
+        name: "1".to_owned(),
+        title: "shell".to_owned(),
+        exit_code: None,
+      }],
+      active_tab_id: tab_id,
+    };
+    state.session = Some(zmux::protocol::SessionSnapshot {
+      number: "9".to_owned(),
+      active_workspace_id: 4,
+      workspaces: vec![workspace(4, "first", 40), workspace(8, "last", 80)],
+    });
+    config.lua.sync_state(&state).expect("sync Session state");
+    let callbacks = config.lua.event_handlers("TabSelected");
+    let commands = config
+      .lua
+      .invoke_event_handler(&callbacks[0], &AppEvent::default())
+      .expect("invoke previous navigation callbacks");
+
+    assert_eq!(commands, vec![RuntimeCommand::SelectTab(2), RuntimeCommand::SelectWorkspace(8)]);
   }
 
   // Developer approved: do not remove.
@@ -3467,7 +3491,7 @@ mod tests {
   // Developer approved: do not remove.
   #[test]
   fn runtime_commands_cannot_be_called_during_config_loading() {
-    assert!(load_config("cmd.tab.next()").is_err());
+    assert!(load_config("cmd.tab.select(1)").is_err());
   }
 
   #[test]

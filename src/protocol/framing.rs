@@ -10,7 +10,7 @@ use serde::{
   de::DeserializeOwned,
 };
 
-pub const PROTOCOL_VERSION: u16 = 8;
+pub const PROTOCOL_VERSION: u16 = 9;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -214,8 +214,6 @@ pub enum ClientRequest {
   Resize(Viewport),
   NewTab,
   CloseTab,
-  NextTab,
-  PreviousTab,
   SelectTab(usize),
   CreateWorkspace {
     working_directory: std::path::PathBuf,

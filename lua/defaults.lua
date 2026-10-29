@@ -2,6 +2,67 @@
 -- composes them into behaviors that user configuration may replace.
 
 local ui = cmd.ui
+local style = cmd.style
+
+style.define_theme("default", {
+    ["Pty.Border"] = {},
+    Bar = { fg = "gray", bg = "black" },
+    ["Bar.Tab"] = { fg = "gray" },
+    ["Bar.TabActive"] = { fg = "black", bg = "cyan", bold = true },
+    ["Bar.Leader"] = { fg = "gray", bg = "blue" },
+    ["Bar.LeaderIndicator"] = { fg = "black", bg = "yellow", bold = true },
+    ["Bar.Status"] = { fg = "gray", bg = "black" },
+    ["Bar.Error"] = { fg = "red", bg = "black" },
+    ["Modal.Border"] = {},
+    ["Modal.Background"] = { fg = "gray", bg = "black" },
+    ["Modal.Query"] = { fg = "yellow", bg = "black" },
+    ["Modal.Selected"] = { fg = "black", bg = "cyan", bold = true },
+    ["Modal.Item"] = { fg = "white", bg = "black" },
+    ["Modal.Footer"] = { fg = "gray", bg = "black" },
+    ["Warning.Key"] = { fg = "yellow", bold = true },
+    ["Warning.Reload"] = { fg = "yellow", bold = true },
+    ["WhichKey.Border"] = { fg = "cyan" },
+    ["WhichKey.Background"] = { bg = "black" },
+    ["WhichKey.Header"] = { fg = "gray" },
+    ["WhichKey.Prefix"] = { fg = "cyan", bold = true },
+    ["WhichKey.Footer"] = { fg = "gray" },
+    ["WhichKey.Key"] = { fg = "yellow", bold = true },
+    ["WhichKey.Description"] = { fg = "white" },
+})
+style.apply_theme("default")
+
+local function adjacent_index(items, direction)
+    if #items < 2 then return nil end
+    local current = 1
+    for index, item in ipairs(items) do
+        if item.selected then
+            current = index
+            break
+        end
+    end
+    return (current + direction - 1) % #items + 1
+end
+
+cmd.tab.next = function()
+    local items = g.tabs or {}
+    local index = adjacent_index(items, 1)
+    if index then cmd.tab.select(items[index].index) end
+end
+cmd.tab.previous = function()
+    local items = g.tabs or {}
+    local index = adjacent_index(items, -1)
+    if index then cmd.tab.select(items[index].index) end
+end
+cmd.workspace.next = function()
+    local items = g.workspaces or {}
+    local index = adjacent_index(items, 1)
+    if index then cmd.workspace.select(items[index].id) end
+end
+cmd.workspace.previous = function()
+    local items = g.workspaces or {}
+    local index = adjacent_index(items, -1)
+    if index then cmd.workspace.select(items[index].id) end
+end
 
 local function item_label(item)
     if type(item) == "string" then

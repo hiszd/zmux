@@ -2633,8 +2633,6 @@ fn send_tracked_request(
   request: ClientRequest,
 ) -> Result<(), Box<dyn std::error::Error>> {
   let request_label = match &request {
-    ClientRequest::PreviousTab => "previous-tab",
-    ClientRequest::NextTab => "next-tab",
     ClientRequest::SelectTab(_) => "select-tab",
     _ => "other",
   };
@@ -2742,25 +2740,6 @@ fn execute_runtime_commands(
         context.session.open_edit_workspace()?;
         effects.redraw = true;
       }
-      command @ (RuntimeCommand::NextWorkspace | RuntimeCommand::PreviousWorkspace) => {
-        let workspaces = &context.session.snapshot.workspaces;
-        if workspaces.len() > 1 {
-          let current = workspaces
-            .iter()
-            .position(|workspace| workspace.id == context.session.snapshot.active_workspace_id)
-            .unwrap_or_default();
-          let next = if matches!(command, RuntimeCommand::NextWorkspace) {
-            (current + 1) % workspaces.len()
-          } else {
-            (current + workspaces.len() - 1) % workspaces.len()
-          };
-          send_tracked_request(
-            context,
-            &mut effects,
-            ClientRequest::SelectWorkspace(workspaces[next].id),
-          )?;
-        }
-      }
       RuntimeCommand::SelectWorkspace(id) => {
         send_tracked_request(context, &mut effects, ClientRequest::SelectWorkspace(id))?;
       }
@@ -2784,12 +2763,6 @@ fn execute_runtime_commands(
       RuntimeCommand::NewTab => send_tracked_request(context, &mut effects, ClientRequest::NewTab)?,
       RuntimeCommand::CloseTab => {
         send_tracked_request(context, &mut effects, ClientRequest::CloseTab)?
-      }
-      RuntimeCommand::NextTab => {
-        send_tracked_request(context, &mut effects, ClientRequest::NextTab)?
-      }
-      RuntimeCommand::PreviousTab => {
-        send_tracked_request(context, &mut effects, ClientRequest::PreviousTab)?
       }
       RuntimeCommand::SelectTab(index) => {
         send_tracked_request(context, &mut effects, ClientRequest::SelectTab(index))?
@@ -3129,12 +3102,20 @@ mod tests {
         name: "project".to_owned(),
         explicit_name: None,
         working_directory: "/work/project".into(),
-        tabs: vec![TabSnapshot {
-          id: 20,
-          name: "1".to_owned(),
-          title: "shell-one".to_owned(),
-          exit_code: None,
-        }],
+        tabs: vec![
+          TabSnapshot {
+            id: 20,
+            name: "1".to_owned(),
+            title: "shell-one".to_owned(),
+            exit_code: None,
+          },
+          TabSnapshot {
+            id: 21,
+            name: "2".to_owned(),
+            title: "shell-two".to_owned(),
+            exit_code: None,
+          },
+        ],
         active_tab_id: 20,
       }],
       active_workspace_id: 4,
@@ -3182,7 +3163,7 @@ mod tests {
       requests
         .iter()
         .any(|message| matches!(message, ClientMessage::Request {
-          request: ClientRequest::NextTab,
+          request: ClientRequest::SelectTab(2),
           ..
         }))
     );
@@ -3438,8 +3419,28 @@ mod tests {
     };
     let snapshot = SessionSnapshot {
       number: "1".to_owned(),
-      workspaces: Vec::new(),
-      active_workspace_id: 0,
+      workspaces: vec![WorkspaceSnapshot {
+        id: 1,
+        name: "main".to_owned(),
+        explicit_name: None,
+        working_directory: std::path::PathBuf::from("."),
+        tabs: vec![
+          TabSnapshot {
+            id: 1,
+            name: "1".to_owned(),
+            title: "first".to_owned(),
+            exit_code: None,
+          },
+          TabSnapshot {
+            id: 2,
+            name: "2".to_owned(),
+            title: "second".to_owned(),
+            exit_code: None,
+          },
+        ],
+        active_tab_id: 1,
+      }],
+      active_workspace_id: 1,
     };
     let mut session = ClientSession::new(snapshot, Vec::new(), viewport);
     let mut outer_size = (80, 24);
@@ -3479,12 +3480,16 @@ mod tests {
       &mut context,
     )
     .expect("enter global leader mode");
+    config
+      .lua
+      .sync_state(&context.session.snapshot_for_lua(false, 80, 24))
+      .expect("sync initial state");
     handle_input(Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)), &mut context)
       .expect("main leader binding takes precedence");
     let requests = receiver.try_iter().collect::<Vec<_>>();
     assert_eq!(requests.len(), 1);
     assert!(matches!(requests[0], ClientMessage::Request {
-      request: ClientRequest::NextTab,
+      request: ClientRequest::SelectTab(2),
       ..
     }));
 
@@ -3519,8 +3524,28 @@ mod tests {
     };
     let snapshot = SessionSnapshot {
       number: "1".to_owned(),
-      workspaces: Vec::new(),
-      active_workspace_id: 0,
+      workspaces: vec![WorkspaceSnapshot {
+        id: 1,
+        name: "main".to_owned(),
+        explicit_name: None,
+        working_directory: std::path::PathBuf::from("."),
+        tabs: vec![
+          TabSnapshot {
+            id: 1,
+            name: "1".to_owned(),
+            title: "first".to_owned(),
+            exit_code: None,
+          },
+          TabSnapshot {
+            id: 2,
+            name: "2".to_owned(),
+            title: "second".to_owned(),
+            exit_code: None,
+          },
+        ],
+        active_tab_id: 1,
+      }],
+      active_workspace_id: 1,
     };
     let mut session = ClientSession::new(snapshot, Vec::new(), viewport);
     let mut outer_size = (80, 24);
