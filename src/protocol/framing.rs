@@ -10,7 +10,7 @@ use serde::{
   de::DeserializeOwned,
 };
 
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 8;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -179,6 +179,15 @@ pub enum AdminRequest {
   KillSession(String),
   StopServer,
   Status,
+  PrepareSession {
+    session_name: Option<String>,
+    create_if_missing: bool,
+    fail_if_exists: bool,
+    working_directory: std::path::PathBuf,
+    shell: std::path::PathBuf,
+    environment: Vec<(String, String)>,
+    viewport: Viewport,
+  },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -194,6 +203,7 @@ pub enum AdminResponse {
   Sessions(Vec<SessionSummary>),
   Status { running: bool, sessions: usize },
   Success,
+  SessionReady { name: String, created: bool },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]

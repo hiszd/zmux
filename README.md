@@ -81,35 +81,73 @@ Workspace creation and editing use a directory selector and optional name field.
 
 ## Lua configuration
 
-The default user configuration is `zmux/zmux.lua` under the platform's standard config directory: `$XDG_CONFIG_HOME` (or `~/.config`) on Linux and other Unix-like systems, `~/Library/Application Support` on macOS, or `%APPDATA%` on Windows. If that file is absent, zmux uses its built-in defaults; it does not search the current working directory. Set `ZMUX_CONFIG` to select an explicit file (for example, `ZMUX_CONFIG=./zmux.lua`). User config files must declare the supported config API version with `opt.config_version = 2` as the first executable statement (comments may precede it). The program checks this before executing the file; missing or unsupported versions and other load errors stop startup rather than silently falling back. Version 2 replaces the version-1 `opt.ui.bars` and `opt.ui.anchors` configuration with retained Bar Elements; update your declaration and create Bars through `cmd.ui.create`. This API version changes when a breaking Lua config API change is introduced, while `zmux.version` reports the running program's release version. Run `zmux config init` to install LuaLS support files (`.luarc.json` and read-only `defs.lua`) and `zmux.lua.example` in the default config directory. All three support files are embedded in the zmux binary; no source checkout is needed. Init preserves existing support files. If `defs.lua` differs from the embedded definition, init asks before replacing it and saves the current version as `defs.old`; use `zmux config init --replace` to confirm non-interactively. Copy `zmux.lua.example` to `zmux.lua` to start customizing. Run `zmux config check` to validate the effective configuration (including `ZMUX_CONFIG`) without starting the Server. LuaLS support for this repository is configured in [`.luarc.json`](.luarc.json), with canonical definitions in [`lua/zmux.lua`](lua/zmux.lua).
+The default user configuration is `zmux/zmux.lua` under the platform's standard config directory: `$XDG_CONFIG_HOME` (or `~/.config`) on Linux and other Unix-like systems, `~/Library/Application Support` on macOS, or `%APPDATA%` on Windows. If that file is absent, zmux uses its built-in defaults; it does not search the current working directory. Set `ZMUX_CONFIG` to select an explicit file (for example, `ZMUX_CONFIG=./zmux.lua`). User config files must declare the supported config API version with `opt.config_version = 3` as the first executable statement (comments may precede it). The program checks this before executing the file; missing or unsupported versions and other load errors stop startup rather than silently falling back. Version 3 uses UpperCamelCase event names such as `TabSelected`, adds focused UI key and paste callbacks, and provides the embedded Lua picker default. When upgrading a version-2 config, change `opt.config_version` to `3`, convert snake_case event names to UpperCamelCase, rename `PreClient` to `PreAttach`, and replace `{ interrupt = true }` with `{ await = true }`. This API version changes when a breaking Lua config API change is introduced, while `zmux.version` reports the running program's release version. Run `zmux config init` to install LuaLS support files (`.luarc.json` and read-only `defs.lua`) and `zmux.lua.example` in the default config directory. All three support files are embedded in the zmux binary; no source checkout is needed. Init preserves existing support files. If `defs.lua` differs from the embedded definition, init asks before replacing it and saves the current version as `defs.old`; use `zmux config init --replace` to confirm non-interactively. Copy `zmux.lua.example` to `zmux.lua` to start customizing. Run `zmux config check` to validate the effective configuration (including `ZMUX_CONFIG`) without starting the Server. LuaLS support for this repository is configured in [`.luarc.json`](.luarc.json), with canonical definitions in [`lua/zmux.lua`](lua/zmux.lua).
 
-Live config reload is opt-in: set `opt.live_reload = true` before starting the Client to watch the effective config file; the default is `false`. Enabling it while watching is off requires a restart, and a successful reload that sets it to `false` stops further watching. Stable file changes reload client key bindings, prefix/sequence settings, UI options, event handlers, and configured UI Elements. You can also request a reload from a runtime callback or key binding with `cmd.config.reload()`, even when automatic watching is disabled. `ConfigLoaded` runs after the initial Client setup and after each successful reload; it receives the current `g` state. `ClientLoaded` remains startup-only, and `PreClient` is not rerun. Invalid edits leave the previous config active, are logged, and show a temporary warning popup. Changes that only affect startup or Server/session creation do not alter the running session.
+Live config reload is opt-in: set `opt.live_reload = true` before starting the Client to watch the effective config file; the default is `false`. Enabling it while watching is off requires a restart, and a successful reload that sets it to `false` stops further watching. Stable file changes reload client key bindings, prefix/sequence settings, UI options, event handlers, and configured UI Elements. You can also request a reload from a runtime callback or key binding with `cmd.config.reload()`, even when automatic watching is disabled. `ConfigLoaded` runs after the initial Client setup and after each successful reload; it receives the current `g` state. `ClientLoaded` remains startup-only, and `PreAttach` is not rerun. Invalid edits leave the previous config active, are logged, and show a temporary warning popup. Changes that only affect startup or Server/session creation do not alter the running session.
 
 Lua's `require("module.name")` search path starts with the directory containing the top-level config file, then falls back to Lua's normal search paths. `import("module.name")` delegates to `require`; prefix a name with `./` to resolve it relative to the importing file instead. For relative imports, dots map to directory separators, `.lua` is added, and modules are cached by resolved file. For example, `import("./keymaps")` loads `keymaps.lua` beside the current file, regardless of the process working directory.
 
-Commands are registered under `cmd`, options under `opt`, and Rust supplies the server-authoritative `g`/`global` snapshot. Register event handlers with `cmd.event.on`, passing either one event name or an array of event names to share a callback across events; commands requested by key and event callbacks are applied after the callback returns. The generic fuzzy picker is `cmd.ui.pick(items, callback)`: it calls back with the selected item on Enter or `nil` on Escape. The `last_error_changed` event is emitted when `g.last_error` is set or cleared, so a status element can update only when that value changes.
+Commands are registered under `cmd`, options under `opt`, and Rust supplies the server-authoritative `g`/`global` snapshot. Register event handlers with `cmd.event.on`, passing either one UpperCamelCase event name or an array of names to share a callback; commands requested by key and event callbacks are applied after the callback returns. The embedded Lua API defaults implement the generic fuzzy picker `cmd.ui.pick(items, callback)`, which users can replace by assigning their own function to `cmd.ui.pick`. It calls back with the selected item on Enter or `nil` on Escape. `LastErrorChanged` is emitted when `g.last_error` is set or cleared, so a status element can update only when that value changes.
 
-Startup customization uses two lifecycle events. `PreClient` runs before connecting and showing the interactive Client; the raw command-line arguments are available in `args`, and mutable launch settings are in `launch`. For example, `launch.session` selects the Session to attach to. Mark a `PreClient` handler with `{ interrupt = true }` when startup must wait for its built-in interactive work, such as `cmd.ui.pick` or `cmd.session.switch()`. Other runtime commands from `PreClient` are applied in order after the selected Session is connected and before the first normal frame. `ConfigLoaded` runs after the interactive Client has connected and its current state is available, before `ClientLoaded`. It runs at startup and after every successful live reload. `ClientLoaded` runs once, after startup commands have settled and before the first frame; it does not run again on reload.
+Startup customization uses the `PreAttach` lifecycle event. CLI preflight starts the Server and creates or resolves the requested Session using the loaded Lua options. The TUI is initialized next; `PreAttach` handlers then run before the Client attaches, with raw command-line arguments in `args` and the resolved launch settings in `launch`. Mark a handler with `{ await = true }` when attachment must wait for its UI interaction, such as `cmd.ui.pick` or `cmd.session.switch()`. `ConfigLoaded` runs after Client attachment and after each successful reload. `ClientLoaded` runs once after startup commands have settled and before the first normal frame.
 
 ```lua
-cmd.event.on("PreClient", function()
+cmd.event.on("PreAttach", function()
     if args[1] == "list" then
         cmd.session.switch()
     end
-end, { interrupt = true })
+end, { await = true })
 
 cmd.event.on("ClientLoaded", function()
     -- Client state is available through g; ordinary runtime commands work here.
 end)
+
+cmd.event.on("PreAttach", function()
+    cmd.pre_attach.workspace.create(launch.working_directory, "review")
+end, { await = true })
 ```
 
-Key bindings use neovim-style notation and Lua callbacks: `cmd.key.bind('tw', function() cmd.tab.close() end, { desc = 'Close the focused tab' })`; bind `cmd.config.reload()` to a key to reload on demand. Pass `nil` as the callback to unbind a sequence. Bindings are entered after the required prefix (`opt.prefix_key`, default `<C-Space>`); multi-key sequences are supported and `opt.sequence_timeout_ms` defaults to 700 ms; set it to `0` to disable leader/sequence timeouts. Completing a binding exits leader mode, including when timeouts are disabled; an unbound key also exits leader mode and shows a yellow warning. `<Esc>` cannot be bound in the global keymap because it is reserved for cancellation. A focused UI element may bind it; otherwise it blurs the element (or cancels an active global leader sequence). When a sequence has continuations, zmux displays a bottom-anchored, full-width which-key popup. Unknown keys and callback errors appear briefly in yellow at the bottom right.
+`cmd.pre_attach` provides server-owned Session, Workspace, and Tab mutations that execute before Client attachment. Workspace and Tab operations that identify existing objects use qualified IDs (`session:workspace` and `session:workspace:tab`). Requests run in order after each Lua callback returns; a server error aborts startup rather than silently attaching with a partially applied plan.
+
+Key bindings use neovim-style notation and Lua callbacks: `cmd.key.bind('tw', function() cmd.tab.close() end, { desc = 'Close the focused tab' })`; bind `cmd.config.reload()` to a key to reload on demand. Pass `nil` as the callback to unbind a sequence. Bindings are entered after the required prefix (`opt.prefix_key`, default `<C-Space>`); multi-key sequences are supported and `opt.sequence_timeout_ms` defaults to 700 ms; set it to `0` to disable leader/sequence timeouts. Completing a binding exits leader mode, including when timeouts are disabled; an unbound key also exits leader mode and shows a yellow warning. The Leader key and all subsequent sequence keys always take precedence over focused UI input, including Modal and Popover input. When a sequence has continuations, zmux displays a bottom-anchored, full-width which-key popup. Unknown keys and callback errors appear briefly in yellow at the bottom right.
+
+### Style groups and themes
+
+Each Client starts with the built-in `default` theme and named groups for native UI and the default Bars (`Bar`, `Bar.TabActive`, `Modal.Selected`, `WhichKey.Border`, and others). Rust- and Lua-managed UI resolve these groups through the same per-Client registry. Set a UI style to `cmd.style.ref("GroupName")` to keep a live reference; changing the group updates existing elements on the next redraw.
+
+Built-in groups are `Pty.Border`; `Bar`, `Bar.Tab`, `Bar.TabActive`, `Bar.Leader`, `Bar.LeaderIndicator`, `Bar.Status`, and `Bar.Error`; `Modal.Border`, `Modal.Background`, `Modal.Query`, `Modal.Selected`, `Modal.Item`, and `Modal.Footer`; `WhichKey.Border`, `WhichKey.Background`, `WhichKey.Header`, `WhichKey.Prefix`, `WhichKey.Footer`, `WhichKey.Key`, and `WhichKey.Description`; and `Warning.Key` and `Warning.Reload`.
+
+`cmd.style.create(name, definition)` creates or updates one active group. A property can be a literal color/boolean or `cmd.style.ref("OtherGroup")`, which reads that same property from the other group. Omitted properties resolve to neutral defaults. For example:
+
+```lua
+cmd.style.create("MyTab", { fg = "white", bg = "blue" })
+cmd.style.create("MyActiveTab", {
+    fg = cmd.style.ref("MyTab"),
+    bg = "cyan",
+    bold = true,
+})
+```
+
+`cmd.style.define_theme(name, groups)` registers a named set of group definitions but does not switch to it. `cmd.style.apply_theme(name)` applies that set atomically; groups omitted by the theme keep their current definitions. Applying a theme does not remove custom groups. The built-in config binds `<prefix> th` to a fuzzy picker over `cmd.style.themes()`; custom configs can use the same `cmd.ui.pick` pattern.
+
+```lua
+cmd.style.define_theme("ocean", {
+    ["Bar.TabActive"] = { fg = "black", bg = "#5fd7ff", bold = true },
+    ["MyActiveTab"] = { fg = cmd.style.ref("Bar.TabActive") },
+})
+
+cmd.key.bind("tm", function()
+    cmd.ui.pick(cmd.style.themes(), function(name)
+        if name then cmd.style.apply_theme(name) end
+    end)
+end, { desc = "Choose a style theme" })
+```
+
+The PTY border can be customized with `opt.ui.pty.border` using a Ratatui border preset (`"plain"`, `"rounded"`, `"double"`, `"thick"`, and the dashed/quadrant variants), or disabled with `"none"`. Set `opt.ui.pty.border_style` to a style table or `cmd.style.ref("Pty.Border")` to change its color and modifiers. A borderless PTY uses the full panel area for terminal cells.
 
 ### Configurable UI Elements
 
-The PTY border can be customized with `opt.ui.pty.border` using a Ratatui border preset (`"plain"`, `"rounded"`, `"double"`, `"thick"`, and the dashed/quadrant variants), or disabled with `"none"`. Set `opt.ui.pty.border_style` to a style table such as `{ fg = "cyan", bold = true }` to change its color and modifiers. A borderless PTY uses the full panel area for terminal cells.
-
-Bars are retained UI Elements created with `cmd.ui.create({ type = "bar", position = "top", content = node, style = style, visible = true })` (use `position = "bottom"` for a bottom Bar). A Bar occupies one row, and at most two can be created at either edge; visible Bars reserve rows in creation order from the edge inward. Hiding a Bar releases its row. Bar content must fit within one row; attempting to create or update a Bar with taller content raises a Lua error. The Bar style fills its entire row, including empty cells, and is inherited by descendant Text nodes. A child style overrides only the fields it specifies; use `remove = { "bold" }` to remove an inherited modifier. A Bar handle can replace its root content with `bar.set("content", node)`, update its style with `bar.set("style", style)`, and control visibility with `bar.set("visible", bool)`, `show()`, `hide()`, or `toggle()`.
+Bars are retained UI Elements created with `cmd.ui.create({ type = "bar", position = "top", content = node, style = style, visible = true })` (use `position = "bottom"` for a bottom Bar). A Bar occupies one row, and at most two can be created at either edge; visible Bars reserve rows in creation order from the edge inward. Hiding a Bar releases its row. Bar content must fit within one row; attempting to create or update a Bar with taller content raises a Lua error. The Bar style fills its entire row, including empty cells, and is inherited by descendant Text nodes. A child inline style overrides only the fields it specifies; use `remove = { "bold" }` to remove an inherited inline modifier. A style-group reference resolves dynamically. A Bar handle can replace its root content with `bar.set("content", node)`, update its style with `bar.set("style", style)`, and control visibility with `bar.set("visible", bool)`, `show()`, `hide()`, or `toggle()`.
 
 `ui.slices({ slices = N, items = { { index = 1, slice_width = 4, node = child } } })` divides its allocated width into N proportional slices. `index` is one-based; each item occupies `slice_width` consecutive slices. Gaps are allowed, but ranges cannot overlap or exceed N. Extra terminal columns are distributed proportionally across slices, and each child is clipped to its assigned range. `ui.align({ content = child, horizontal = "left"|"center"|"right" })` gives its child the full area allocated by its parent and positions the child within it. Both are ordinary nestable Layout nodes; in a `row`, use the existing child `size = "fill"` option when an alignment node should receive the remaining width.
 
@@ -145,7 +183,7 @@ Runtime-created Elements need a retained Lua handle for as long as they should r
 
 ```lua
 local active_dialog
-cmd.event.on("workspace_selected", function()
+cmd.event.on("WorkspaceSelected", function()
     if active_dialog then
         active_dialog.hide()
         active_dialog = nil
@@ -158,7 +196,7 @@ cmd.event.on("workspace_selected", function()
 end)
 ```
 
-`Text`, `row`, and `column` constructors return handles. Layout children may be auto-sized, fixed in terminal cells, or set to `"fill"` to share remaining space equally. `ui.create` also supports `modal`, `popover`, `bottom_panel`, and `toast` alongside `drawer`. Modals center over the terminal panel, dim its background, take focus when shown, and capture keys until Escape or `hide()`; a Popover is positioned by `x` and `y` cell offsets in that panel, clamps to fit, and also captures keys. A Bottom Panel overlays the bottom of the panel rather than reserving rows. Toasts are non-focusable and dismiss automatically after `duration` milliseconds (default 3000); positions are `top_right`, `top_center`, `bottom_right`, or `bottom_center`. All accept nested retained content, title, border, and border style.
+`Text`, `row`, and `column` constructors return handles. Layout children may be auto-sized, fixed in terminal cells, or set to `"fill"` to share remaining space equally. `ui.create` also supports `modal`, `popover`, `bottom_panel`, and `toast` alongside `drawer`. Modals center over the terminal panel, dim its background, take focus when shown, and capture keys until hidden; unhandled Escape dismisses them by default. A Popover is positioned by `x` and `y` cell offsets in that panel, clamps to fit, and also captures keys. A Bottom Panel overlays the bottom of the panel rather than reserving rows. Toasts are non-focusable and dismiss automatically after `duration` milliseconds (default 3000); positions are `top_right`, `top_center`, `bottom_right`, or `bottom_center`. All accept nested retained content, title, border, and border style.
 
 For example, all four patterns use the same constructor and handle lifecycle:
 
@@ -191,7 +229,7 @@ cmd.key.bind("o", function() output.show() end)
 cmd.key.bind("s", function() notice.show() end)
 ```
 
-A focused Drawer checks its direct key bindings before the global key dispatcher; unbound keys can invoke global leader mappings but are never sent to the PTY. Modal and Popover input is stricter: direct bindings run first, Escape hides the element by default, and every other key is consumed rather than sent to global bindings or the PTY. A no-op function consumes a local binding; omitting a key removes it. Setters such as `status.set("text", "Updated")` and `drawer.set("border", "double")` invalidate the retained UI and schedule a coalesced redraw.
+Focusable UI Elements may provide direct `keys` bindings, an `on_key(element, key)` fallback for otherwise-unbound keys, and an `on_paste(element, text)` callback for a complete paste payload. Direct bindings run before `on_key`. A capturing Modal or Popover consumes unhandled keys and paste; non-capturing Elements can let unhandled paste reach the PTY. Paste while Leader mode is active is swallowed, and key input remains with the global sequence dispatcher. When the PTY is focused, paste is sent as text, wrapped in bracketed-paste markers only when the terminal application has enabled that mode. A no-op function consumes a local binding; omitting a key removes it. Setters such as `status.set("text", "Updated")` and `drawer.set("border", "double")` invalidate the retained UI and schedule a coalesced redraw.
 
 List global bindings from the loaded configuration with `zmux keybinds`; use `--json` for pretty-printed JSON on stdout. Each entry includes its sequence and optional description, and the configured prefix is reported separately. Focus-scoped UI Element bindings are not included in this listing. This command loads the Lua config but does not connect to or start the Server.
 

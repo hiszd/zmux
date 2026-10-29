@@ -399,6 +399,52 @@ impl ServerState {
         .close_session(&name)
         .map(|()| AdminResponse::Success)
         .map_err(|error| error.to_string()),
+      AdminRequest::PrepareSession {
+        session_name,
+        create_if_missing,
+        fail_if_exists,
+        working_directory,
+        shell,
+        environment,
+        viewport,
+      } => {
+        let existing = session_name.as_deref().and_then(|name| {
+          self
+            .sessions
+            .iter()
+            .find(|session| session.model.name().get() == name)
+            .map(|session| session.model.name().get().to_owned())
+        });
+        if let Some(name) = existing {
+          if fail_if_exists {
+            Err(format!("Session {name} already exists"))
+          } else {
+            Ok(AdminResponse::SessionReady {
+              name,
+              created: false,
+            })
+          }
+        } else if !create_if_missing {
+          Err(session_name.map_or_else(
+            || "a Session name is required".to_owned(),
+            |name| format!("Session {name} does not exist"),
+          ))
+        } else {
+          self
+            .create_session(
+              session_name.unwrap_or_default(),
+              &working_directory,
+              &shell,
+              &environment,
+              viewport,
+            )
+            .map(|name| AdminResponse::SessionReady {
+              name,
+              created: true,
+            })
+            .map_err(|error| error.to_string())
+        }
+      }
       AdminRequest::StopServer => {
         self.stop_server();
         Ok(AdminResponse::Success)
@@ -1397,6 +1443,8 @@ mod tests {
 
   use zmux::{
     protocol::{
+      AdminRequest,
+      AdminResponse,
       ClientHello,
       ClientMessage,
       ClientRequest,
@@ -1918,6 +1966,98 @@ mod tests {
     drop(client);
     server.join().expect("Server stops cleanly");
     std::fs::remove_dir_all(root).expect("remove test directories");
+  }
+
+  #[test]
+  fn admin_prepares_a_session_before_client_attachment() {
+    let endpoint = Endpoint::new(Some(&format!("prepare-session-test-{}", std::process::id())))
+      .expect("test endpoint");
+    let server_endpoint = endpoint.clone();
+    let server = thread::spawn(move || run(server_endpoint).expect("server loop"));
+    let mut admin = connect_for_hello(&endpoint);
+    let request = || AdminRequest::PrepareSession {
+      session_name: Some("prepared".to_owned()),
+      create_if_missing: true,
+      fail_if_exists: false,
+      working_directory: std::env::current_dir().expect("current directory"),
+      shell: "/bin/sh".into(),
+      environment: vec![("SHELL".to_owned(), "/bin/sh".to_owned())],
+      viewport: Viewport {
+        rows: 24,
+        columns: 80,
+      },
+    };
+    write_frame(&mut admin, &ClientMessage::Admin(request())).expect("prepare Session");
+    assert!(matches!(
+      read_frame::<_, ServerMessage>(&mut admin).expect("read prepared Session response"),
+      ServerMessage::AdminResult {
+        result: Ok(AdminResponse::SessionReady { ref name, created: true }),
+      } if name == "prepared"
+    ));
+    drop(admin);
+
+    let mut attach = connect_for_hello(&endpoint);
+    write_frame(
+      &mut attach,
+      &ClientMessage::Hello(ClientHello {
+        protocol_version: zmux::protocol::PROTOCOL_VERSION,
+        session_name: Some("prepared".to_owned()),
+        create_if_missing: false,
+        fail_if_exists: false,
+        shell: "/bin/sh".into(),
+        environment: vec![("SHELL".to_owned(), "/bin/sh".to_owned())],
+        working_directory: std::env::current_dir().expect("current directory"),
+        viewport: Viewport {
+          rows: 24,
+          columns: 80,
+        },
+      }),
+    )
+    .expect("attach prepared Session");
+    let mut accepted = false;
+    let mut initial_state = false;
+    while !initial_state {
+      match read_frame::<_, ServerMessage>(&mut attach).expect("read attach handshake") {
+        ServerMessage::HelloAccepted { .. } => accepted = true,
+        ServerMessage::InitialState { session, .. } => {
+          assert!(accepted, "server accepts Client before sending initial state");
+          assert_eq!(session.number, "prepared");
+          initial_state = true;
+        }
+        other => panic!("unexpected attach message: {other:?}"),
+      }
+    }
+    drop(attach);
+
+    let mut admin = connect_for_hello(&endpoint);
+    write_frame(
+      &mut admin,
+      &ClientMessage::Admin(AdminRequest::PrepareSession {
+        session_name: Some("prepared".to_owned()),
+        create_if_missing: true,
+        fail_if_exists: true,
+        working_directory: std::env::current_dir().expect("current directory"),
+        shell: "/bin/sh".into(),
+        environment: vec![("SHELL".to_owned(), "/bin/sh".to_owned())],
+        viewport: Viewport {
+          rows: 24,
+          columns: 80,
+        },
+      }),
+    )
+    .expect("request strict duplicate");
+    assert!(matches!(
+      read_frame::<_, ServerMessage>(&mut admin).expect("read strict duplicate response"),
+      ServerMessage::AdminResult { result: Err(reason) } if reason.contains("already exists")
+    ));
+    drop(admin);
+
+    let mut admin = connect_for_hello(&endpoint);
+    write_frame(&mut admin, &ClientMessage::Admin(AdminRequest::StopServer))
+      .expect("stop prepared Session Server");
+    let _ = read_frame::<_, ServerMessage>(&mut admin).expect("read stop response");
+    drop(admin);
+    server.join().expect("Server stops cleanly");
   }
 
   // Developer approved: do not remove.

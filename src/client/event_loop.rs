@@ -70,6 +70,8 @@ use crossterm::{
   },
   event::{
     self,
+    DisableBracketedPaste,
+    EnableBracketedPaste,
     Event,
     KeyCode,
     KeyEventKind,
@@ -148,18 +150,19 @@ const SHUTDOWN_DELAY: Duration = Duration::from_millis(200);
 
 /// Starts the interactive client for a session.
 ///
-/// This function calculates the initial PTY viewport, connects to the server,
-/// starts the reader/writer/input worker threads, enters terminal mode, and
-/// hands control to [`run_event_loop`]. Terminal mode is restored on every
+/// This function initializes the interactive terminal, runs awaited PreAttach
+/// work, connects to the server, starts the reader/writer/input worker threads,
+/// and hands control to [`run_event_loop`]. Terminal mode is restored on every
 /// return path through [`TerminalModeGuard`] and the final cursor cleanup.
 ///
-/// `session_name` selects an existing session when present; `None` asks the
-/// server to create a new session. Errors from connection, terminal setup, or
-/// the event loop are propagated to the caller.
+/// The CLI preflight has already created or resolved the server-side Session.
+/// This function runs PreAttach in an initialized TUI, then attaches the Client
+/// to the resolved Session. Errors from connection, terminal setup, or the event
+/// loop are propagated to the caller.
 pub fn run(
   endpoint: Endpoint,
-  launch: lua::LaunchState,
-  startup_commands: Vec<RuntimeCommand>,
+  created_session: bool,
+  mut startup_commands: Vec<RuntimeCommand>,
   config: lua::AppConfig,
   config_path: Option<PathBuf>,
   config_arguments: Vec<String>,
@@ -175,6 +178,23 @@ pub fn run(
     rows: pane_size.0.max(1),
     columns: pane_size.1.max(1),
   };
+  let terminal_mode = TerminalModeGuard::enter(config.cursor_shape).inspect_err(|error| {
+    trace.error("client.terminal_mode", error);
+  })?;
+  let backend = CrosstermBackend::new(io::stdout());
+  let mut terminal = Terminal::new(backend)?;
+  let prepared_session = config.lua.launch_state()?.session_name;
+  let (launch, pre_attach_commands) = run_pre_attach_ui(&endpoint, &mut terminal, &config)?;
+  let created_session = created_session && prepared_session == launch.session_name;
+  startup_commands.extend(pre_attach_commands);
+  if launch.require_session && launch.session_name.is_none() {
+    println!("no active sessions");
+    terminal.show_cursor()?;
+    drop(terminal);
+    drop(terminal_mode);
+    return Ok(());
+  }
+
   let connection = connect(
     &endpoint,
     launch.session_name.clone(),
@@ -191,12 +211,6 @@ pub fn run(
   let (event_sender, receiver) = mpsc::channel();
   spawn_server_reader(reader, event_sender.clone())?;
   let request_sender = spawn_server_writer(writer, event_sender.clone())?;
-
-  let terminal_mode = TerminalModeGuard::enter(config.cursor_shape).inspect_err(|error| {
-    trace.error("client.terminal_mode", error);
-  })?;
-  let backend = CrosstermBackend::new(io::stdout());
-  let mut terminal = Terminal::new(backend)?;
   let input_stop = Arc::new(AtomicBool::new(false));
   let input_thread = spawn_input_reader(event_sender, input_stop.clone(), trace.clone())?;
   let result = run_event_loop(
@@ -210,7 +224,7 @@ pub fn run(
     ClientSession::new(connection.session, connection.terminals, viewport),
     connection.client_id,
     ClientStartup {
-      created_session: launch.session_name.is_none(),
+      created_session,
       commands: startup_commands,
     },
     trace.clone(),
@@ -237,99 +251,6 @@ pub fn run(
   result
 }
 
-/// Runs startup handlers before connecting the interactive client.
-///
-/// Interrupt handlers may use built-in pickers, which are completed before the
-/// next handler runs. Other runtime commands are returned for execution against
-/// the initialized client before its first frame is rendered.
-pub fn run_pre_client(
-  endpoint: &Endpoint,
-  config: &lua::AppConfig,
-) -> Result<(lua::LaunchState, Vec<RuntimeCommand>), Box<dyn std::error::Error>> {
-  run_pre_client_with_picker(endpoint, config, run_builtin_picker)
-}
-
-fn run_pre_client_with_picker(
-  endpoint: &Endpoint,
-  config: &lua::AppConfig,
-  mut pick: impl FnMut(
-    &str,
-    &[String],
-    &str,
-    ui::CursorShape,
-  ) -> Result<Option<usize>, Box<dyn std::error::Error>>,
-) -> Result<(lua::LaunchState, Vec<RuntimeCommand>), Box<dyn std::error::Error>> {
-  let mut deferred = Vec::new();
-  let mut session_picker_used = false;
-  for handler in config.lua.event_handlers("PreClient") {
-    let commands = config.lua.invoke_event_handler(&handler, &UiEvent {
-      name: "PreClient".to_owned(),
-      ..UiEvent::default()
-    })?;
-    let mut pending: VecDeque<_> = commands.into();
-    while let Some(command) = pending.pop_front() {
-      match command {
-        RuntimeCommand::OpenPicker(id) if handler.interrupt => {
-          let labels = config.lua.picker_labels(id).unwrap_or_default();
-          let selected = pick(
-            "Choose",
-            &labels,
-            "Arrows: move  Enter: select  Esc: cancel",
-            config.cursor_shape,
-          )?;
-          let completion = config.lua.complete_picker(id, selected)?;
-          for command in completion.into_iter().rev() {
-            pending.push_front(command);
-          }
-        }
-        RuntimeCommand::OpenSessionPicker => {
-          let launch = config.lua.launch_state()?;
-          if handler.interrupt || (launch.require_session && launch.session_name.is_none()) {
-            session_picker_used = true;
-            let sessions = list_sessions(endpoint)?;
-            let names: Vec<_> = sessions
-              .iter()
-              .map(|session| session.number.clone())
-              .collect();
-            let selected = pick(
-              "Switch Session",
-              &names,
-              "Arrows: move  Enter: select  Esc: cancel",
-              config.cursor_shape,
-            )?;
-            if let Some(session) = selected.and_then(|index| names.get(index)) {
-              config.lua.set_launch_session(Some(session))?;
-            }
-          } else {
-            deferred.push(RuntimeCommand::OpenSessionPicker);
-          }
-        }
-        command => deferred.push(command),
-      }
-    }
-  }
-
-  let mut launch = config.lua.launch_state()?;
-  if launch.require_session && launch.session_name.is_none() && !session_picker_used {
-    let sessions = list_sessions(endpoint)?;
-    let names: Vec<_> = sessions
-      .iter()
-      .map(|session| session.number.clone())
-      .collect();
-    let selected = pick(
-      "Attach to Session",
-      &names,
-      "Arrows: move  Enter: attach  Esc: cancel",
-      config.cursor_shape,
-    )?;
-    if let Some(session) = selected.and_then(|index| names.get(index)) {
-      config.lua.set_launch_session(Some(session))?;
-      launch = config.lua.launch_state()?;
-    }
-  }
-  Ok((launch, deferred))
-}
-
 fn list_sessions(endpoint: &Endpoint) -> Result<Vec<SessionSummary>, Box<dyn std::error::Error>> {
   let Ok(mut stream) = transport::connect(endpoint) else {
     return Ok(Vec::new());
@@ -344,65 +265,239 @@ fn list_sessions(endpoint: &Endpoint) -> Result<Vec<SessionSummary>, Box<dyn std
   Ok(sessions)
 }
 
-fn run_builtin_picker(
-  title: &str,
-  labels: &[String],
-  footer: &str,
-  cursor_shape: ui::CursorShape,
-) -> Result<Option<usize>, Box<dyn std::error::Error>> {
-  if labels.is_empty() {
-    return Ok(None);
-  }
-  let _terminal_mode = TerminalModeGuard::enter(cursor_shape)?;
-  let backend = CrosstermBackend::new(io::stdout());
-  let mut terminal = Terminal::new(backend)?;
-  let mut query = String::new();
-  let mut highlighted = 0;
-  loop {
-    let visible = zmux::picker::fuzzy_filter(&query, labels);
-    highlighted = highlighted.min(visible.len().saturating_sub(1));
-    let rows: Vec<String> = visible.iter().map(|index| labels[*index].clone()).collect();
-    let modal = ui::ModalOverlay {
-      title,
-      query: Some(&query),
-      rows: &rows,
-      selected_row: (!rows.is_empty()).then_some(highlighted),
-      footer,
-    };
-    terminal.draw(|frame| frame.render_widget(&modal, frame.area()))?;
+fn run_pre_attach_ui(
+  endpoint: &Endpoint,
+  terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+  config: &lua::AppConfig,
+) -> Result<(lua::LaunchState, Vec<RuntimeCommand>), Box<dyn std::error::Error>> {
+  let mut deferred = Vec::new();
+  let mut dispatcher =
+    KeyDispatcher::new(config.prefix_key, config.sequence_timeout, config.keymap.clone());
+  let mut needs_session_picker = false;
+  draw_pre_attach_ui(terminal, config)?;
 
+  for handler in config.lua.event_handlers("PreAttach") {
+    let commands = config.lua.invoke_event_handler(&handler, &UiEvent {
+      name: "PreAttach".to_owned(),
+      ..UiEvent::default()
+    })?;
+    for command in commands {
+      match command {
+        RuntimeCommand::OpenSessionPicker if handler.await_completion => {
+          needs_session_picker = true;
+        }
+        RuntimeCommand::PreAttachServer(request) => {
+          run_pre_attach_server_request(endpoint, config, request)?;
+        }
+        RuntimeCommand::Redraw => {}
+        command => deferred.push(command),
+      }
+    }
+    if handler.await_completion && config.lua.focused_ui_captures_input() {
+      run_pre_attach_input_until(
+        endpoint,
+        terminal,
+        config,
+        &mut dispatcher,
+        &mut deferred,
+        || !config.lua.focused_ui_captures_input(),
+      )?;
+    }
+    if needs_session_picker {
+      pick_session_before_attach(endpoint, terminal, config, &mut dispatcher, &mut deferred)?;
+      needs_session_picker = false;
+    }
+  }
+
+  let mut launch = config.lua.launch_state()?;
+  if launch.require_session && launch.session_name.is_none() {
+    pick_session_before_attach(endpoint, terminal, config, &mut dispatcher, &mut deferred)?;
+    launch = config.lua.launch_state()?;
+  }
+  Ok((launch, deferred))
+}
+
+fn pick_session_before_attach(
+  endpoint: &Endpoint,
+  terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+  config: &lua::AppConfig,
+  dispatcher: &mut KeyDispatcher,
+  deferred: &mut Vec<RuntimeCommand>,
+) -> Result<(), Box<dyn std::error::Error>> {
+  let sessions = list_sessions(endpoint)?;
+  let names: Vec<_> = sessions
+    .iter()
+    .map(|session| session.number.clone())
+    .collect();
+  if names.is_empty() {
+    return Ok(());
+  }
+  let (completion, commands) = config.lua.start_string_picker(&names)?;
+  process_pre_attach_commands(endpoint, config, commands, deferred)?;
+  run_pre_attach_input_until(endpoint, terminal, config, dispatcher, deferred, || {
+    completion.is_complete()
+  })?;
+  if let Some(session) = completion.selected() {
+    config.lua.set_launch_session(Some(&session))?;
+  }
+  Ok(())
+}
+
+fn draw_pre_attach_ui(
+  terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+  config: &lua::AppConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+  let options = config.lua.sync_options()?;
+  terminal.draw(|frame| {
+    let area = frame.area();
+    let top_height = options.top_bars.min(area.height);
+    let bottom_height = options
+      .bottom_bars
+      .min(area.height.saturating_sub(top_height));
+    let panel = Rect::new(
+      area.x,
+      area.y.saturating_add(top_height),
+      area.width,
+      area
+        .height
+        .saturating_sub(top_height)
+        .saturating_sub(bottom_height),
+    );
+    let top = Rect::new(area.x, area.y, area.width, top_height);
+    let bottom = Rect::new(
+      area.x,
+      area
+        .y
+        .saturating_add(area.height.saturating_sub(bottom_height)),
+      area.width,
+      bottom_height,
+    );
+    frame.render_widget(ratatui::widgets::Clear, area);
+    config.lua.render_ui_bars(top, bottom, frame.buffer_mut());
+    config.lua.render_ui_elements(panel, frame.buffer_mut());
+  })?;
+  Ok(())
+}
+
+fn run_pre_attach_input_until(
+  endpoint: &Endpoint,
+  terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+  config: &lua::AppConfig,
+  dispatcher: &mut KeyDispatcher,
+  deferred: &mut Vec<RuntimeCommand>,
+  mut done: impl FnMut() -> bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+  while !done() {
+    draw_pre_attach_ui(terminal, config)?;
     match event::read()? {
       Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-        match key.code {
-          KeyCode::Esc => return Ok(None),
-          KeyCode::Enter => {
-            if let Some(index) = visible.get(highlighted) {
-              return Ok(Some(*index));
+        let leader_input = dispatcher.is_leader() || dispatcher.is_prefix_key(key);
+        if !leader_input {
+          let stroke = KeyStroke::from_crossterm(key);
+          let binding = stroke.and_then(|stroke| {
+            config
+              .lua
+              .focused_ui_binding(stroke)
+              .or_else(|| config.lua.focused_ui_on_key())
+          });
+          if let Some((_, callback, handle)) = binding {
+            let commands = config.lua.invoke_ui_key_callback(&callback, handle, key)?;
+            process_pre_attach_commands(endpoint, config, commands, deferred)?;
+            continue;
+          }
+          if config.lua.focused_ui_captures_input() {
+            if key.code == KeyCode::Esc && config.lua.dismiss_focused_ui() {
+              continue;
             }
+            continue;
           }
-          KeyCode::Up if !visible.is_empty() => {
-            highlighted = if highlighted == 0 {
-              visible.len() - 1
-            } else {
-              highlighted - 1
-            };
-          }
-          KeyCode::Down if !visible.is_empty() => {
-            highlighted = (highlighted + 1) % visible.len();
-          }
-          KeyCode::Backspace => {
-            query.pop();
-            highlighted = 0;
-          }
-          KeyCode::Char(_) if key_notation::text_character(key).is_some() => {
-            query.push(key_notation::text_character(key).expect("text character matched"));
-            highlighted = 0;
-          }
-          _ => {}
+        }
+        if let KeyOutcome::Execute(callback) = dispatcher.handle_event(key, Instant::now()) {
+          let commands = config.lua.invoke_key_callback(&callback)?;
+          process_pre_attach_commands(endpoint, config, commands, deferred)?;
         }
       }
+      Event::Paste(text) => {
+        if dispatcher.is_leader() {
+          continue;
+        }
+        if let Some((_, callback, handle)) = config.lua.focused_ui_on_paste() {
+          let commands = config
+            .lua
+            .invoke_ui_paste_callback(&callback, handle, &text)?;
+          process_pre_attach_commands(endpoint, config, commands, deferred)?;
+        }
+      }
+      Event::Resize(_, _) => {}
       _ => {}
     }
+  }
+  Ok(())
+}
+
+fn process_pre_attach_commands(
+  endpoint: &Endpoint,
+  config: &lua::AppConfig,
+  commands: Vec<RuntimeCommand>,
+  deferred: &mut Vec<RuntimeCommand>,
+) -> Result<(), Box<dyn std::error::Error>> {
+  for command in commands {
+    match command {
+      RuntimeCommand::PreAttachServer(request) => {
+        run_pre_attach_server_request(endpoint, config, request)?;
+      }
+      RuntimeCommand::Redraw => {}
+      command => deferred.push(command),
+    }
+  }
+  Ok(())
+}
+
+fn run_pre_attach_server_request(
+  endpoint: &Endpoint,
+  config: &lua::AppConfig,
+  request: zmux::protocol::HeadlessRequest,
+) -> Result<(), Box<dyn std::error::Error>> {
+  let launch = config.lua.launch_state()?;
+  let updated_session = match &request {
+    zmux::protocol::HeadlessRequest::SessionRename { id: Some(id), name }
+      if launch.session_name.as_deref() == Some(id.as_str()) =>
+    {
+      Some(Some(name.clone()))
+    }
+    zmux::protocol::HeadlessRequest::SessionRemove { id: Some(id) }
+      if launch.session_name.as_deref() == Some(id.as_str()) =>
+    {
+      Some(None)
+    }
+    _ => None,
+  };
+  let mut stream = transport::connect(endpoint)?;
+  write_frame(
+    &mut stream,
+    &ClientMessage::HeadlessHello(zmux::protocol::HeadlessHello {
+      protocol_version: zmux::protocol::PROTOCOL_VERSION,
+      working_directory: launch.working_directory,
+      shell: current_shell(config.default_shell.as_deref()),
+      environment: std::env::vars().collect(),
+    }),
+  )?;
+  write_frame(&mut stream, &ClientMessage::HeadlessRequest { id: 1, request })?;
+  match read_frame::<_, ServerMessage>(&mut stream)? {
+    ServerMessage::HeadlessReply {
+      id: 1,
+      result: Ok(zmux::protocol::HeadlessResult::Accepted),
+    } => {
+      if let Some(session) = updated_session {
+        config.lua.set_launch_session(session.as_deref())?;
+      }
+      Ok(())
+    }
+    ServerMessage::HeadlessReply {
+      id: 1,
+      result: Err(error),
+    } => Err(error.into()),
+    other => Err(format!("unexpected PreAttach Server response: {other:?}").into()),
   }
 }
 
@@ -421,6 +516,7 @@ impl TerminalModeGuard {
     if let Err(error) = execute!(
       stdout,
       EnterAlternateScreen,
+      EnableBracketedPaste,
       cursor_shape.terminal_style(),
       PushKeyboardEnhancementFlags(
         KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
@@ -441,6 +537,7 @@ impl Drop for TerminalModeGuard {
     let _ = execute!(
       stdout,
       PopKeyboardEnhancementFlags,
+      DisableBracketedPaste,
       SetCursorStyle::DefaultUserShape,
       LeaveAlternateScreen,
       Show
@@ -624,28 +721,6 @@ enum WorkspaceModal {
   Directory(DirectoryPicker),
 }
 
-/// Local state for a picker requested by a Lua callback.
-struct LuaPickerState {
-  /// Identifier used to complete the picker in Lua.
-  id: u64,
-  /// Candidate labels supplied by Lua.
-  labels: Vec<String>,
-  /// Current fuzzy-search query.
-  query: String,
-  /// Index within the filtered results.
-  highlighted: usize,
-}
-
-/// Local state for the active-session switcher.
-struct SessionPickerState {
-  /// Sessions currently known to the server.
-  sessions: Vec<SessionSummary>,
-  /// Current fuzzy-search query.
-  query: String,
-  /// Index within the filtered results.
-  highlighted: usize,
-}
-
 /// Owned, render-ready representation of any client modal.
 struct ModalDisplay {
   /// Border title.
@@ -672,8 +747,6 @@ struct ClientSession {
   last_error: Option<String>,
   key_warning: Option<(String, Instant)>,
   workspace_modal: Option<WorkspaceModal>,
-  lua_picker: Option<LuaPickerState>,
-  session_picker: Option<SessionPickerState>,
   which_key_scroll: usize,
   which_key_options: crate::lua::WhichKeyOptions,
   pending_shutdown: Option<(KeyCode, Vec<RuntimeCommand>)>,
@@ -695,8 +768,6 @@ impl ClientSession {
       last_error: None,
       key_warning: None,
       workspace_modal: None,
-      lua_picker: None,
-      session_picker: None,
       which_key_scroll: 0,
       which_key_options: crate::lua::WhichKeyOptions::default(),
       pending_shutdown: None,
@@ -723,6 +794,13 @@ impl ClientSession {
 
   /// Returns the parsed terminal belonging to the active tab.
   fn active_terminal(&self) -> Option<&TerminalView> { self.terminals.get(&self.active_tab()?.id) }
+
+  /// Encodes pasted text using the active terminal's bracketed-paste mode.
+  fn encode_paste(&self, text: &str) -> Vec<u8> {
+    self
+      .active_terminal()
+      .map_or_else(|| text.as_bytes().to_vec(), |terminal| terminal.emulator.encode_paste(text))
+  }
 
   /// Updates server state and applies any terminal snapshots included with it.
   fn set_snapshot(&mut self, snapshot: SessionSnapshot, terminals: Vec<TerminalSnapshot>) {
@@ -849,46 +927,8 @@ impl ClientSession {
     Ok(())
   }
 
-  /// Converts the active picker or workspace modal into render data.
+  /// Converts the active workspace modal into render data.
   fn modal_display(&self) -> Option<ModalDisplay> {
-    if let Some(picker) = &self.session_picker {
-      let labels: Vec<String> = picker
-        .sessions
-        .iter()
-        .map(|session| {
-          format!(
-            "{}  ({} clients, {} workspaces, {} tabs)",
-            session.number, session.clients, session.workspaces, session.tabs
-          )
-        })
-        .collect();
-      let session_names: Vec<String> = picker
-        .sessions
-        .iter()
-        .map(|session| session.number.clone())
-        .collect();
-      let visible = zmux::picker::fuzzy_filter(&picker.query, &session_names);
-      return Some(ModalDisplay {
-        title: "Switch Session".to_owned(),
-        query: Some(picker.query.clone()),
-        rows: visible.iter().map(|index| labels[*index].clone()).collect(),
-        selected_row: (!visible.is_empty()).then_some(picker.highlighted),
-        footer: "Arrows: move  Enter: switch  Esc: cancel".to_owned(),
-      });
-    }
-    if let Some(picker) = &self.lua_picker {
-      let visible = zmux::picker::fuzzy_filter(&picker.query, &picker.labels);
-      return Some(ModalDisplay {
-        title: "Select an item".to_owned(),
-        query: Some(picker.query.clone()),
-        rows: visible
-          .iter()
-          .map(|index| picker.labels[*index].clone())
-          .collect(),
-        selected_row: (!visible.is_empty()).then_some(picker.highlighted),
-        footer: "Arrows: move  Enter: select  Esc: cancel".to_owned(),
-      });
-    }
     match self.workspace_modal.as_ref()? {
       WorkspaceModal::Form(form) => {
         let directory_name = form
@@ -1084,7 +1124,7 @@ fn client_ready_events() -> Vec<UiEvent> {
 
 fn last_error_changed_event() -> UiEvent {
   UiEvent {
-    name: "last_error_changed".to_owned(),
+    name: "LastErrorChanged".to_owned(),
     ..UiEvent::default()
   }
 }
@@ -1134,9 +1174,9 @@ enum ClientEvent {
 fn initial_session_events(session: &SessionSnapshot, created: bool) -> Vec<UiEvent> {
   let mut events = vec![UiEvent {
     name: if created {
-      "session_created"
+      "SessionCreated"
     } else {
-      "session_selected"
+      "SessionSelected"
     }
     .to_owned(),
     session_number: Some(session.number.clone()),
@@ -1156,7 +1196,7 @@ fn initial_session_events(session: &SessionSnapshot, created: bool) -> Vec<UiEve
     .map(|index| index + 1);
   if created {
     events.push(UiEvent {
-      name: "workspace_created".to_owned(),
+      name: "WorkspaceCreated".to_owned(),
       session_number: Some(session.number.clone()),
       workspace_id: Some(active_workspace.id),
       workspace_index,
@@ -1164,7 +1204,7 @@ fn initial_session_events(session: &SessionSnapshot, created: bool) -> Vec<UiEve
     });
     for (index, tab) in active_workspace.tabs.iter().enumerate() {
       events.push(UiEvent {
-        name: "tab_created".to_owned(),
+        name: "TabCreated".to_owned(),
         session_number: Some(session.number.clone()),
         workspace_id: Some(active_workspace.id),
         workspace_index,
@@ -1175,7 +1215,7 @@ fn initial_session_events(session: &SessionSnapshot, created: bool) -> Vec<UiEve
     }
   }
   events.push(UiEvent {
-    name: "workspace_selected".to_owned(),
+    name: "WorkspaceSelected".to_owned(),
     session_number: Some(session.number.clone()),
     workspace_id: Some(active_workspace.id),
     workspace_index,
@@ -1188,7 +1228,7 @@ fn initial_session_events(session: &SessionSnapshot, created: bool) -> Vec<UiEve
     .find(|(_, tab)| tab.id == active_workspace.active_tab_id)
   {
     events.push(UiEvent {
-      name: "tab_selected".to_owned(),
+      name: "TabSelected".to_owned(),
       session_number: Some(session.number.clone()),
       workspace_id: Some(active_workspace.id),
       workspace_index,
@@ -1361,7 +1401,7 @@ fn run_event_loop(
       outer_size = (size.width, size.height);
       ui_options = traced_lua(&trace, "lua.sync_options redraw", config.lua.sync_options())?;
       session.which_key_options = ui_options.which;
-      let pane = ui::pane_size(outer_size.0, outer_size.1, ui_options);
+      let pane = ui::pane_size(outer_size.0, outer_size.1, ui_options.clone());
       let new_viewport = Viewport {
         rows: pane.0.max(1),
         columns: pane.1.max(1),
@@ -1493,6 +1533,15 @@ fn run_event_loop(
         }
       }
       Ok(ClientEvent::Server(message)) => {
+        let session_names = match &message {
+          ServerMessage::SessionList { sessions } => Some(
+            sessions
+              .iter()
+              .map(|session| session.number.clone())
+              .collect::<Vec<_>>(),
+          ),
+          _ => None,
+        };
         let message_label = match &message {
           ServerMessage::StateChanged { .. } => "state-changed",
           ServerMessage::Reply { id, .. } => {
@@ -1508,6 +1557,20 @@ fn run_event_loop(
           startup_requests.remove(id);
         }
         let mut effects = handle_server_message(message, &mut session);
+        if let Some(session_names) = session_names {
+          let commands = config.lua.start_session_picker(&session_names)?;
+          let picker_effects = execute_runtime_commands(commands, &mut ClientContext {
+            session: &mut session,
+            outer_size: &mut outer_size,
+            viewport: &mut viewport,
+            dispatcher: &mut dispatcher,
+            sender: &sender,
+            next_request_id: &mut next_request_id,
+            lua: &config.lua,
+            trace: &trace,
+          })?;
+          effects.merge(picker_effects);
+        }
         for (tab_id, input) in &effects.inputs {
           let _ = tab_id;
           send_request(&sender, &mut next_request_id, ClientRequest::Input(input.clone()))?;
@@ -1584,7 +1647,7 @@ fn run_event_loop(
               trace.mark("lua-key-timeout-callback-complete");
               effects.redraw = true;
               effects.events.push(UiEvent {
-                name: "leader_mode_changed".to_owned(),
+                name: "LeaderModeChanged".to_owned(),
                 active: Some(false),
                 ..UiEvent::default()
               });
@@ -1609,7 +1672,7 @@ fn run_event_loop(
                 Effects {
                   redraw: true,
                   events: vec![UiEvent {
-                    name: "leader_mode_changed".to_owned(),
+                    name: "LeaderModeChanged".to_owned(),
                     active: Some(false),
                     ..UiEvent::default()
                   }],
@@ -1761,9 +1824,6 @@ fn handle_server_message(message: ServerMessage, session: &mut ClientSession) ->
       terminals,
     } => {
       let mut events = diff_session_state(&session.snapshot, &snapshot);
-      if session.session_picker.is_some() && session.snapshot.number != snapshot.number {
-        session.session_picker = None;
-      }
       session.set_snapshot(snapshot, terminals);
       if session.set_last_error(None) {
         events.push(last_error_changed_event());
@@ -1826,20 +1886,11 @@ fn handle_server_message(message: ServerMessage, session: &mut ClientSession) ->
       }
       effects
     }
-    ServerMessage::SessionList { sessions } => {
-      if let Some(picker) = &mut session.session_picker {
-        picker.sessions = sessions;
-        picker.highlighted = 0;
-      }
-      Effects {
-        redraw: true,
-        ..Effects::default()
-      }
-    }
+    ServerMessage::SessionList { .. } => Effects::default(),
     ServerMessage::SessionClosed => Effects {
       quit: true,
       events: vec![UiEvent {
-        name: "session_closed".to_owned(),
+        name: "SessionClosed".to_owned(),
         session_number: Some(session.snapshot.number.clone()),
         ..UiEvent::default()
       }],
@@ -1866,12 +1917,12 @@ fn diff_session_state(old: &SessionSnapshot, new: &SessionSnapshot) -> Vec<UiEve
   let mut events = Vec::new();
   if old.number != new.number {
     events.push(UiEvent {
-      name: "session_closed".to_owned(),
+      name: "SessionClosed".to_owned(),
       session_number: Some(old.number.clone()),
       ..UiEvent::default()
     });
     events.push(UiEvent {
-      name: "session_selected".to_owned(),
+      name: "SessionSelected".to_owned(),
       session_number: Some(new.number.clone()),
       ..UiEvent::default()
     });
@@ -1883,7 +1934,7 @@ fn diff_session_state(old: &SessionSnapshot, new: &SessionSnapshot) -> Vec<UiEve
       .any(|previous| previous.id == workspace.id)
     {
       events.push(UiEvent {
-        name: "workspace_created".to_owned(),
+        name: "WorkspaceCreated".to_owned(),
         session_number: Some(new.number.clone()),
         workspace_id: Some(workspace.id),
         workspace_index: Some(index + 1),
@@ -1898,7 +1949,7 @@ fn diff_session_state(old: &SessionSnapshot, new: &SessionSnapshot) -> Vec<UiEve
       .any(|current| current.id == workspace.id)
     {
       events.push(UiEvent {
-        name: "workspace_closed".to_owned(),
+        name: "WorkspaceClosed".to_owned(),
         session_number: Some(new.number.clone()),
         workspace_id: Some(workspace.id),
         workspace_index: Some(index + 1),
@@ -1916,7 +1967,7 @@ fn diff_session_state(old: &SessionSnapshot, new: &SessionSnapshot) -> Vec<UiEve
         .find(|previous| previous.id == tab.id);
       if previous.is_none() {
         events.push(UiEvent {
-          name: "tab_created".to_owned(),
+          name: "TabCreated".to_owned(),
           session_number: Some(new.number.clone()),
           workspace_id: Some(workspace.id),
           workspace_index: Some(workspace_index + 1),
@@ -1928,7 +1979,7 @@ fn diff_session_state(old: &SessionSnapshot, new: &SessionSnapshot) -> Vec<UiEve
       if let Some(previous) = previous {
         if previous.title != tab.title {
           events.push(UiEvent {
-            name: "terminal_title_changed".to_owned(),
+            name: "TerminalTitleChanged".to_owned(),
             session_number: Some(new.number.clone()),
             workspace_id: Some(workspace.id),
             tab_id: Some(tab.id),
@@ -1938,7 +1989,7 @@ fn diff_session_state(old: &SessionSnapshot, new: &SessionSnapshot) -> Vec<UiEve
         }
         if previous.exit_code.is_none() && tab.exit_code.is_some() {
           events.push(UiEvent {
-            name: "process_exited".to_owned(),
+            name: "ProcessExited".to_owned(),
             session_number: Some(new.number.clone()),
             workspace_id: Some(workspace.id),
             workspace_index: Some(workspace_index + 1),
@@ -1960,7 +2011,7 @@ fn diff_session_state(old: &SessionSnapshot, new: &SessionSnapshot) -> Vec<UiEve
         .any(|current| current.id == tab.id)
       {
         events.push(UiEvent {
-          name: "tab_closed".to_owned(),
+          name: "TabClosed".to_owned(),
           session_number: Some(new.number.clone()),
           workspace_id: Some(workspace.id),
           workspace_index: Some(workspace_index + 1),
@@ -1978,7 +2029,7 @@ fn diff_session_state(old: &SessionSnapshot, new: &SessionSnapshot) -> Vec<UiEve
       .iter()
       .find(|workspace| workspace.id == new.active_workspace_id);
     events.push(UiEvent {
-      name: "workspace_selected".to_owned(),
+      name: "WorkspaceSelected".to_owned(),
       session_number: Some(new.number.clone()),
       workspace_id: Some(new.active_workspace_id),
       workspace_index: workspace.and_then(|workspace| {
@@ -2026,7 +2077,7 @@ fn diff_session_state(old: &SessionSnapshot, new: &SessionSnapshot) -> Vec<UiEve
           .map(|index| index + 1)
       });
     events.push(UiEvent {
-      name: "tab_selected".to_owned(),
+      name: "TabSelected".to_owned(),
       session_number: Some(new.number.clone()),
       workspace_id: Some(new.active_workspace_id),
       tab_id: current_tab,
@@ -2071,32 +2122,25 @@ fn handle_input(
 
   let leader_input = matches!(&event, Event::Key(key) if context.dispatcher.is_leader()
         || context.dispatcher.is_prefix_key(*key));
-  if context.session.session_picker.is_some()
-    && !leader_input
-    && let Event::Key(key) = &event
-  {
-    return handle_session_picker_key(*key, context);
-  }
-  if context.session.lua_picker.is_some()
-    && !leader_input
-    && let Event::Key(key) = &event
-  {
-    return handle_lua_picker_key(*key, context);
-  }
   if context.session.workspace_modal.is_some()
     && !leader_input
     && let Event::Key(key) = &event
   {
     return handle_workspace_modal_key(*key, context);
   }
-  if context.lua.focused_ui_captures_input()
+  if !leader_input
+    && context.lua.focused_ui_captures_input()
     && let Event::Key(key) = &event
     && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
   {
     let stroke = KeyStroke::from_crossterm(*key);
-    if let Some((_, callback, handle)) =
-      stroke.and_then(|stroke| context.lua.focused_ui_binding(stroke))
-    {
+    let binding = stroke.and_then(|stroke| {
+      context
+        .lua
+        .focused_ui_binding(stroke)
+        .or_else(|| context.lua.focused_ui_on_key())
+    });
+    if let Some((_, callback, handle)) = binding {
       context
         .trace
         .mark(&format!("modal-ui-key-callback-start key={key:?}"));
@@ -2126,15 +2170,19 @@ fn handle_input(
     }
     return Ok(Effects::default());
   }
-  if !context.dispatcher.is_leader()
+  if !leader_input
     && let Event::Key(key) = &event
     && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
     && context.lua.focused_ui().is_some()
   {
     let stroke = KeyStroke::from_crossterm(*key);
-    if let Some((_, callback, handle)) =
-      stroke.and_then(|stroke| context.lua.focused_ui_binding(stroke))
-    {
+    let binding = stroke.and_then(|stroke| {
+      context
+        .lua
+        .focused_ui_binding(stroke)
+        .or_else(|| context.lua.focused_ui_on_key())
+    });
+    if let Some((_, callback, handle)) = binding {
       context
         .trace
         .mark(&format!("ui-key-callback-start key={key:?}"));
@@ -2221,7 +2269,7 @@ fn handle_input(
           context.session.which_key_scroll = 0;
           effects.redraw = true;
           effects.events.push(UiEvent {
-            name: "leader_mode_changed".to_owned(),
+            name: "LeaderModeChanged".to_owned(),
             active: Some(true),
             ..UiEvent::default()
           });
@@ -2229,7 +2277,7 @@ fn handle_input(
         KeyOutcome::PrefixCancelled => {
           effects.redraw = true;
           effects.events.push(UiEvent {
-            name: "leader_mode_changed".to_owned(),
+            name: "LeaderModeChanged".to_owned(),
             active: Some(false),
             ..UiEvent::default()
           });
@@ -2265,7 +2313,7 @@ fn handle_input(
           effects.redraw |= leader_changed;
           if leader_changed {
             effects.events.push(UiEvent {
-              name: "leader_mode_changed".to_owned(),
+              name: "LeaderModeChanged".to_owned(),
               active: Some(false),
               ..UiEvent::default()
             });
@@ -2287,7 +2335,7 @@ fn handle_input(
           effects.redraw = true;
           if leader_changed {
             effects.events.push(UiEvent {
-              name: "leader_mode_changed".to_owned(),
+              name: "LeaderModeChanged".to_owned(),
               active: Some(false),
               ..UiEvent::default()
             });
@@ -2296,6 +2344,37 @@ fn handle_input(
         KeyOutcome::Ignored => effects.redraw |= leader_changed || context.dispatcher.is_leader(),
       }
       Ok(effects)
+    }
+    Event::Paste(text) => {
+      if context.dispatcher.is_leader() {
+        return Ok(Effects::default());
+      }
+      if let Some((_, callback, handle)) = context.lua.focused_ui_on_paste() {
+        let commands = match context
+          .lua
+          .invoke_ui_paste_callback(&callback, handle, &text)
+        {
+          Ok(commands) => commands,
+          Err(error) => {
+            context.trace.error("lua.ui_paste_callback", &error);
+            context.session.key_warning = Some((
+              format!("UI paste callback: {error}"),
+              Instant::now() + Duration::from_secs(3),
+            ));
+            return Ok(Effects {
+              redraw: true,
+              ..Effects::default()
+            });
+          }
+        };
+        return execute_runtime_commands(commands, context);
+      }
+      if context.lua.focused_ui_captures_input() {
+        return Ok(Effects::default());
+      }
+      let bytes = context.session.encode_paste(&text);
+      send_request(context.sender, context.next_request_id, ClientRequest::Input(bytes))?;
+      Ok(Effects::default())
     }
     Event::Resize(width, height) => {
       *context.outer_size = (width, height);
@@ -2314,7 +2393,7 @@ fn handle_input(
       Ok(Effects {
         redraw: true,
         events: vec![UiEvent {
-          name: "terminal_resized".to_owned(),
+          name: "TerminalResized".to_owned(),
           rows: Some(height),
           columns: Some(width),
           ..UiEvent::default()
@@ -2323,185 +2402,6 @@ fn handle_input(
       })
     }
     _ => Ok(Effects::default()),
-  }
-}
-
-/// Handles navigation, filtering, cancellation, and selection in the session picker.
-fn handle_session_picker_key(
-  key: crossterm::event::KeyEvent,
-  context: &mut ClientContext<'_>,
-) -> Result<Effects, Box<dyn std::error::Error>> {
-  if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-    return Ok(Effects::default());
-  }
-  let Some(mut picker) = context.session.session_picker.take() else {
-    return Ok(Effects::default());
-  };
-  let session_names: Vec<String> = picker
-    .sessions
-    .iter()
-    .map(|session| session.number.clone())
-    .collect();
-  let visible = zmux::picker::fuzzy_filter(&picker.query, &session_names);
-  match key.code {
-    crossterm::event::KeyCode::Esc => Ok(Effects {
-      redraw: true,
-      ..Effects::default()
-    }),
-    crossterm::event::KeyCode::Enter => {
-      let Some(selected_index) = visible.get(picker.highlighted).copied() else {
-        context.session.session_picker = Some(picker);
-        return Ok(Effects::default());
-      };
-      let selected_session = picker.sessions[selected_index].number.clone();
-      if selected_session != context.session.snapshot.number {
-        send_request(
-          context.sender,
-          context.next_request_id,
-          ClientRequest::SwitchSession(selected_session),
-        )?;
-      }
-      Ok(Effects {
-        redraw: true,
-        ..Effects::default()
-      })
-    }
-    crossterm::event::KeyCode::Up => {
-      if !visible.is_empty() {
-        picker.highlighted = if picker.highlighted == 0 {
-          visible.len() - 1
-        } else {
-          picker.highlighted - 1
-        };
-      }
-      context.session.session_picker = Some(picker);
-      Ok(Effects {
-        redraw: true,
-        ..Effects::default()
-      })
-    }
-    crossterm::event::KeyCode::Down => {
-      if !visible.is_empty() {
-        picker.highlighted = (picker.highlighted + 1) % visible.len();
-      }
-      context.session.session_picker = Some(picker);
-      Ok(Effects {
-        redraw: true,
-        ..Effects::default()
-      })
-    }
-    crossterm::event::KeyCode::Backspace => {
-      picker.query.pop();
-      picker.highlighted = 0;
-      context.session.session_picker = Some(picker);
-      Ok(Effects {
-        redraw: true,
-        ..Effects::default()
-      })
-    }
-    crossterm::event::KeyCode::Char(_) if key_notation::text_character(key).is_some() => {
-      picker
-        .query
-        .push(key_notation::text_character(key).expect("text character matched"));
-      picker.highlighted = 0;
-      context.session.session_picker = Some(picker);
-      Ok(Effects {
-        redraw: true,
-        ..Effects::default()
-      })
-    }
-    _ => {
-      context.session.session_picker = Some(picker);
-      Ok(Effects::default())
-    }
-  }
-}
-
-/// Handles navigation, filtering, cancellation, and selection in a Lua picker.
-fn handle_lua_picker_key(
-  key: crossterm::event::KeyEvent,
-  context: &mut ClientContext<'_>,
-) -> Result<Effects, Box<dyn std::error::Error>> {
-  if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-    return Ok(Effects::default());
-  }
-  let Some(mut picker) = context.session.lua_picker.take() else {
-    return Ok(Effects::default());
-  };
-  match key.code {
-    crossterm::event::KeyCode::Esc => {
-      let commands = context.lua.complete_picker(picker.id, None)?;
-      let effects = execute_runtime_commands(commands, context)?;
-      Ok(Effects {
-        redraw: true,
-        ..effects
-      })
-    }
-    crossterm::event::KeyCode::Enter => {
-      let visible = zmux::picker::fuzzy_filter(&picker.query, &picker.labels);
-      let Some(selected_index) = visible.get(picker.highlighted).copied() else {
-        context.session.lua_picker = Some(picker);
-        return Ok(Effects::default());
-      };
-      let commands = context
-        .lua
-        .complete_picker(picker.id, Some(selected_index))?;
-      let effects = execute_runtime_commands(commands, context)?;
-      Ok(Effects {
-        redraw: true,
-        ..effects
-      })
-    }
-    crossterm::event::KeyCode::Up => {
-      let count = zmux::picker::fuzzy_filter(&picker.query, &picker.labels).len();
-      if count > 0 {
-        picker.highlighted = if picker.highlighted == 0 {
-          count - 1
-        } else {
-          picker.highlighted - 1
-        };
-      }
-      context.session.lua_picker = Some(picker);
-      Ok(Effects {
-        redraw: true,
-        ..Effects::default()
-      })
-    }
-    crossterm::event::KeyCode::Down => {
-      let count = zmux::picker::fuzzy_filter(&picker.query, &picker.labels).len();
-      if count > 0 {
-        picker.highlighted = (picker.highlighted + 1) % count;
-      }
-      context.session.lua_picker = Some(picker);
-      Ok(Effects {
-        redraw: true,
-        ..Effects::default()
-      })
-    }
-    crossterm::event::KeyCode::Backspace => {
-      picker.query.pop();
-      picker.highlighted = 0;
-      context.session.lua_picker = Some(picker);
-      Ok(Effects {
-        redraw: true,
-        ..Effects::default()
-      })
-    }
-    crossterm::event::KeyCode::Char(_) if key_notation::text_character(key).is_some() => {
-      picker
-        .query
-        .push(key_notation::text_character(key).expect("text character matched"));
-      picker.highlighted = 0;
-      context.session.lua_picker = Some(picker);
-      Ok(Effects {
-        redraw: true,
-        ..Effects::default()
-      })
-    }
-    _ => {
-      context.session.lua_picker = Some(picker);
-      Ok(Effects::default())
-    }
   }
 }
 
@@ -2831,33 +2731,8 @@ fn execute_runtime_commands(
         context.trace.mark("ui-redraw-requested");
         effects.redraw = true;
       }
-      RuntimeCommand::OpenPicker(id) => {
-        let Some(labels) = context.lua.picker_labels(id) else {
-          if context
-            .session
-            .set_last_error(Some("picker request expired".to_owned()))
-          {
-            effects.events.push(last_error_changed_event());
-          }
-          effects.redraw = true;
-          continue;
-        };
-        context.session.lua_picker = Some(LuaPickerState {
-          id,
-          labels,
-          query: String::new(),
-          highlighted: 0,
-        });
-        effects.redraw = true;
-      }
       RuntimeCommand::OpenSessionPicker => {
-        context.session.session_picker = Some(SessionPickerState {
-          sessions: Vec::new(),
-          query: String::new(),
-          highlighted: 0,
-        });
         send_tracked_request(context, &mut effects, ClientRequest::ListSessions)?;
-        effects.redraw = true;
       }
       RuntimeCommand::CreateWorkspace => {
         context.session.open_create_workspace()?;
@@ -2899,6 +2774,9 @@ fn execute_runtime_commands(
       RuntimeCommand::KillSession => {
         send_tracked_request(context, &mut effects, ClientRequest::KillSession)?
       }
+      RuntimeCommand::SwitchSession(name) => {
+        send_tracked_request(context, &mut effects, ClientRequest::SwitchSession(name))?
+      }
       RuntimeCommand::StopServer => {
         send_tracked_request(context, &mut effects, ClientRequest::StopServer)?;
         effects.quit = true;
@@ -2917,6 +2795,9 @@ fn execute_runtime_commands(
         send_tracked_request(context, &mut effects, ClientRequest::SelectTab(index))?
       }
       RuntimeCommand::ReloadConfig => context.lua.request_config_reload(),
+      RuntimeCommand::PreAttachServer(_) => {
+        return Err("PreAttach server commands cannot run after Client attachment".into());
+      }
     }
   }
   Ok(effects)
@@ -2958,7 +2839,7 @@ fn activate_reloaded_config(
   let mut events = Vec::new();
   if was_leader {
     events.push(UiEvent {
-      name: "leader_mode_changed".to_owned(),
+      name: "LeaderModeChanged".to_owned(),
       active: Some(false),
       ..UiEvent::default()
     });
@@ -2994,18 +2875,17 @@ fn traced_lua<T>(trace: &Trace, context: &str, result: mlua::Result<T>) -> mlua:
 
 #[cfg(test)]
 mod tests {
-  use zmux::{
-    protocol::{
-      ClientMessage,
-      ClientRequest,
-      ServerMessage,
-      SessionSnapshot,
-      TabSnapshot,
-      TerminalSnapshot,
-      Viewport,
-      WorkspaceSnapshot,
-    },
-    transport::Endpoint,
+  use std::time::Duration;
+
+  use zmux::protocol::{
+    ClientMessage,
+    ClientRequest,
+    ServerMessage,
+    SessionSnapshot,
+    TabSnapshot,
+    TerminalSnapshot,
+    Viewport,
+    WorkspaceSnapshot,
   };
 
   use super::{
@@ -3023,8 +2903,7 @@ mod tests {
     execute_runtime_commands,
     handle_input,
     handle_server_message,
-    run_pre_client,
-    run_pre_client_with_picker,
+    process_pre_attach_commands,
   };
   use crate::{
     input::{
@@ -3118,7 +2997,7 @@ mod tests {
         .iter()
         .map(|event| event.name.as_str())
         .collect::<Vec<_>>(),
-      vec!["last_error_changed"]
+      vec!["LastErrorChanged"]
     );
 
     let repeated = handle_server_message(
@@ -3143,16 +3022,16 @@ mod tests {
         .iter()
         .map(|event| event.name.as_str())
         .collect::<Vec<_>>(),
-      vec!["last_error_changed"]
+      vec!["LastErrorChanged"]
     );
   }
 
   // Developer approved: do not remove.
   #[test]
-  fn pre_client_runs_handlers_and_returns_commands_for_client_initialization() {
+  fn pre_attach_runs_handlers_and_returns_commands_for_client_initialization() {
     let config = lua::load_config_with_context(
       r#"
-            cmd.event.on("PreClient", function()
+            cmd.event.on("PreAttach", function()
                 assert(args[1] == "attach")
                 launch.session = "replacement"
                 cmd.tab.create()
@@ -3169,9 +3048,15 @@ mod tests {
       },
     )
     .expect("startup config");
-    let endpoint = Endpoint::new(Some("pre-client-test")).expect("test endpoint");
-
-    let (launch, commands) = run_pre_client(&endpoint, &config).expect("run PreClient");
+    let callback = config.lua.event_handlers("PreAttach").remove(0);
+    let commands = config
+      .lua
+      .invoke_event_handler(&callback, &lua::AppEvent {
+        name: "PreAttach".to_owned(),
+        ..lua::AppEvent::default()
+      })
+      .expect("invoke PreAttach hook");
+    let launch = config.lua.launch_state().expect("resolved launch state");
 
     assert_eq!(launch.session_name.as_deref(), Some("replacement"));
     assert_eq!(commands, vec![RuntimeCommand::NewTab]);
@@ -3179,15 +3064,13 @@ mod tests {
 
   // Developer approved: do not remove.
   #[test]
-  fn interrupt_picker_finishes_before_later_pre_client_handlers_run() {
+  fn pre_attach_handlers_run_in_registration_order() {
     let config = lua::load_config_with_context(
       r#"
-            cmd.event.on("PreClient", function()
-                cmd.ui.pick({"alpha"}, function(selected)
-                    launch.session = selected
-                end)
-            end, { interrupt = true })
-            cmd.event.on("PreClient", function()
+            cmd.event.on("PreAttach", function()
+                launch.session = "alpha"
+            end, { await = true })
+            cmd.event.on("PreAttach", function()
                 assert(launch.session == "alpha")
                 cmd.tab.create()
             end)
@@ -3202,20 +3085,27 @@ mod tests {
         working_directory: "/work".into(),
       },
     )
-    .expect("interrupt startup config");
-    let endpoint = Endpoint::new(Some("pre-client-interrupt-test")).expect("test endpoint");
-    let mut picker_calls = 0;
+    .expect("awaited startup config");
+    let callbacks = config.lua.event_handlers("PreAttach");
+    let first = config
+      .lua
+      .invoke_event_handler(&callbacks[0], &lua::AppEvent {
+        name: "PreAttach".to_owned(),
+        ..lua::AppEvent::default()
+      })
+      .expect("run first PreAttach hook");
+    let second = config
+      .lua
+      .invoke_event_handler(&callbacks[1], &lua::AppEvent {
+        name: "PreAttach".to_owned(),
+        ..lua::AppEvent::default()
+      })
+      .expect("run second PreAttach hook");
+    let launch = config.lua.launch_state().expect("resolved launch state");
 
-    let (launch, commands) = run_pre_client_with_picker(&endpoint, &config, |_, labels, _, _| {
-      picker_calls += 1;
-      assert_eq!(labels, &["alpha"]);
-      Ok(Some(0))
-    })
-    .expect("run interrupt handler");
-
-    assert_eq!(picker_calls, 1);
+    assert!(first.is_empty());
     assert_eq!(launch.session_name.as_deref(), Some("alpha"));
-    assert_eq!(commands, vec![RuntimeCommand::NewTab]);
+    assert_eq!(second, vec![RuntimeCommand::NewTab]);
   }
 
   // Developer approved: do not remove.
@@ -3223,7 +3113,7 @@ mod tests {
   fn lua_event_commands_wait_for_callback_completion() {
     let config = lua::load_config(
       r#"
-            cmd.event.on("tab_selected", function(event)
+            cmd.event.on("TabSelected", function(event)
                 cmd.tab.next()
                 if event.index == 1 then
                     error("expected callback failure")
@@ -3278,7 +3168,7 @@ mod tests {
     dispatch_ui_events(
       Effects {
         events: vec![lua::AppEvent {
-          name: "tab_selected".to_owned(),
+          name: "TabSelected".to_owned(),
           index: Some(2),
           ..lua::AppEvent::default()
         }],
@@ -3300,7 +3190,7 @@ mod tests {
     let error = match dispatch_ui_events(
       Effects {
         events: vec![lua::AppEvent {
-          name: "tab_selected".to_owned(),
+          name: "TabSelected".to_owned(),
           index: Some(1),
           ..lua::AppEvent::default()
         }],
@@ -3659,12 +3549,219 @@ mod tests {
       "modal keys must not reach global bindings or PTY"
     );
 
+    handle_input(
+      Event::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL)),
+      &mut context,
+    )
+    .expect("Leader bypasses the focused modal");
+    assert!(context.dispatcher.is_leader());
+    handle_input(Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)), &mut context)
+      .expect("Leader sequence bypasses the focused modal");
+    assert!(!context.dispatcher.is_leader());
+    assert!(matches!(
+      receiver.try_recv(),
+      Ok(ClientMessage::Request {
+        request: ClientRequest::NextTab,
+        ..
+      })
+    ));
+
     let escape =
       handle_input(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), &mut context)
         .expect("Escape dismisses modal");
     assert!(escape.redraw);
     assert!(context.lua.focused_ui().is_none());
     assert!(receiver.try_iter().next().is_none());
+  }
+
+  #[test]
+  fn pre_attach_server_commands_mutate_the_target_before_client_attachment() {
+    use std::thread;
+
+    use zmux::transport::Endpoint;
+
+    let endpoint = Endpoint::new(Some(&format!("pre-attach-server-test-{}", std::process::id())))
+      .expect("test endpoint");
+    let server_endpoint = endpoint.clone();
+    let server = thread::spawn(move || crate::server::run(server_endpoint).expect("server loop"));
+    let mut connected = false;
+    for _ in 0..100 {
+      if let Ok(stream) = zmux::transport::connect(&endpoint) {
+        drop(stream);
+        connected = true;
+        break;
+      }
+      thread::sleep(Duration::from_millis(10));
+    }
+    assert!(connected, "server listener becomes ready");
+
+    crate::headless::run(
+      endpoint.clone(),
+      crate::headless::ScriptInput::Source("cmd.session.create('project')".to_owned()),
+      &[],
+      std::env::current_dir().expect("current directory"),
+    )
+    .expect("create server Session before Client attachment");
+
+    let config = lua::load_config_with_context(
+      r#"
+        cmd.event.on("PreAttach", function()
+          cmd.pre_attach.workspace.create("/tmp", "review")
+          cmd.pre_attach.tab.create("project:review", "shell")
+        end)
+      "#,
+      &[],
+      LaunchState {
+        command: "attach".to_owned(),
+        session_name: Some("project".to_owned()),
+        create_if_missing: false,
+        fail_if_exists: false,
+        require_session: true,
+        working_directory: std::env::current_dir().expect("current directory"),
+      },
+    )
+    .expect("PreAttach server mutation config");
+    let callback = config.lua.event_handlers("PreAttach").remove(0);
+    let commands = config
+      .lua
+      .invoke_event_handler(&callback, &lua::AppEvent {
+        name: "PreAttach".to_owned(),
+        ..lua::AppEvent::default()
+      })
+      .expect("queue PreAttach requests");
+    let mut deferred = Vec::new();
+    process_pre_attach_commands(&endpoint, &config, commands, &mut deferred)
+      .expect("apply PreAttach server requests");
+    assert!(deferred.is_empty());
+
+    let workspaces = crate::headless::list_workspaces(&endpoint, "project".to_owned())
+      .expect("read pre-attached Workspaces");
+    assert!(
+      workspaces
+        .iter()
+        .any(|workspace| workspace.name == "review")
+    );
+    crate::headless::run(
+      endpoint.clone(),
+      crate::headless::ScriptInput::Source(
+        "cmd.tab.list('project:review', function(tabs) assert(#tabs == 2) end)".to_owned(),
+      ),
+      &[],
+      std::env::current_dir().expect("current directory"),
+    )
+    .expect("read pre-attached Tabs");
+    crate::headless::run(
+      endpoint,
+      crate::headless::ScriptInput::Source("cmd.server.stop()".to_owned()),
+      &[],
+      std::env::current_dir().expect("current directory"),
+    )
+    .expect("stop test Server");
+    server.join().expect("Server stops cleanly");
+  }
+
+  #[test]
+  fn paste_routes_to_focused_ui_or_pty_and_is_swallowed_during_leader_mode() {
+    use crossterm::event::{
+      Event,
+      KeyCode,
+      KeyEvent,
+      KeyModifiers,
+    };
+
+    let config = lua::load_config(
+      r#"
+        cmd.key.bind("a", function() cmd.tab.next() end)
+        local status = cmd.ui.text({ text = "Idle" })
+        local drawer = cmd.ui.create({
+          type = "drawer",
+          content = status,
+          on_paste = function(element, text)
+            status.set("text", text)
+            element.blur()
+          end,
+        })
+        drawer.focus()
+      "#,
+    )
+    .expect("config with paste callback");
+    let viewport = Viewport {
+      rows: 24,
+      columns: 80,
+    };
+    let snapshot = SessionSnapshot {
+      number: "1".to_owned(),
+      workspaces: vec![WorkspaceSnapshot {
+        id: 1,
+        name: "main".to_owned(),
+        explicit_name: None,
+        working_directory: std::path::PathBuf::from("."),
+        tabs: vec![TabSnapshot {
+          id: 1,
+          name: "1".to_owned(),
+          title: "shell".to_owned(),
+          exit_code: None,
+        }],
+        active_tab_id: 1,
+      }],
+      active_workspace_id: 1,
+    };
+    let terminal = TerminalSnapshot {
+      tab_id: 1,
+      rows: 24,
+      columns: 80,
+      bytes: Vec::new(),
+      title: "shell".to_owned(),
+      exit_code: None,
+    };
+    let mut session = ClientSession::new(snapshot, vec![terminal], viewport);
+    let mut outer_size = (80, 24);
+    let mut viewport = viewport;
+    let mut dispatcher =
+      KeyDispatcher::new(config.prefix_key, config.sequence_timeout, config.keymap.clone());
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let mut next_request_id = 1;
+    let trace = crate::trace::Trace::from_environment();
+    let mut context = ClientContext {
+      session: &mut session,
+      outer_size: &mut outer_size,
+      viewport: &mut viewport,
+      dispatcher: &mut dispatcher,
+      sender: &sender,
+      next_request_id: &mut next_request_id,
+      lua: &config.lua,
+      trace: &trace,
+    };
+
+    handle_input(Event::Paste("ui paste".to_owned()), &mut context)
+      .expect("route paste to focused UI");
+    assert!(context.lua.focused_ui().is_none());
+    handle_input(Event::Paste("pty paste".to_owned()), &mut context).expect("route paste to PTY");
+    assert!(matches!(
+      receiver.try_recv(),
+      Ok(ClientMessage::Request {
+        request: ClientRequest::Input(bytes),
+        ..
+      }) if bytes == b"pty paste"
+    ));
+
+    handle_input(
+      Event::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL)),
+      &mut context,
+    )
+    .expect("enter leader mode");
+    handle_input(Event::Paste("discard me".to_owned()), &mut context)
+      .expect("swallow paste during leader mode");
+    assert!(receiver.try_recv().is_err());
+    handle_input(Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)), &mut context)
+      .expect("dispatch the following leader key");
+    assert!(matches!(
+      receiver.try_recv(),
+      Ok(ClientMessage::Request {
+        request: ClientRequest::NextTab,
+        ..
+      })
+    ));
   }
 
   #[test]

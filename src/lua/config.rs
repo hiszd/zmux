@@ -32,7 +32,10 @@ use ratatui::style::{
   Modifier,
   Style,
 };
-use zmux::protocol::SessionSnapshot;
+use zmux::protocol::{
+  HeadlessRequest,
+  SessionSnapshot,
+};
 
 use crate::{
   input::{
@@ -50,6 +53,10 @@ use crate::{
     DrawerSide,
     HorizontalAlignment,
     LayoutAxis,
+    StyleAttribute,
+    StyleDefinition,
+    StyleRegistry,
+    StyleSource,
     ToastPosition,
     UiChild,
     UiElementOptions,
@@ -62,8 +69,9 @@ use crate::{
   },
 };
 
-pub const CONFIG_API_VERSION: u32 = 2;
+pub const CONFIG_API_VERSION: u32 = 3;
 pub const DEFAULT_CONFIG_SOURCE: &str = include_str!("../../defaults/zmux.lua");
+const DEFAULT_LUA_API_SOURCE: &str = include_str!("../../lua/defaults.lua");
 
 pub struct AppConfig {
   pub config_api_version: Option<u32>,
@@ -132,11 +140,11 @@ pub struct AppEvent {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeCommand {
-  OpenPicker(u64),
   OpenSessionPicker,
   Redraw,
   Detach,
   KillSession,
+  SwitchSession(String),
   StopServer,
   CreateWorkspace,
   EditWorkspace,
@@ -150,6 +158,7 @@ pub enum RuntimeCommand {
   PreviousTab,
   SelectTab(usize),
   ReloadConfig,
+  PreAttachServer(HeadlessRequest),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -185,13 +194,13 @@ impl Default for WhichKeyOptions {
   }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct PtyOptions {
   pub border: DrawerBorder,
-  pub border_style: Style,
+  pub border_style: StyleSource,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct UiOptions {
   pub top_bars: u16,
   pub bottom_bars: u16,
@@ -199,21 +208,26 @@ pub struct UiOptions {
   pub pty: PtyOptions,
 }
 
+pub struct StringPickerCompletion {
+  completed: Rc<Cell<bool>>,
+  selected: Rc<RefCell<Option<String>>>,
+}
+
+impl StringPickerCompletion {
+  pub fn is_complete(&self) -> bool { self.completed.get() }
+
+  pub fn selected(&self) -> Option<String> { self.selected.borrow().clone() }
+}
+
 pub struct LuaCallback {
   function: Function,
-  pub interrupt: bool,
+  pub await_completion: bool,
 }
 
 #[derive(Clone)]
 struct RegisteredCallback {
   function: Function,
-  interrupt: bool,
-}
-
-struct PendingPicker {
-  labels: Vec<String>,
-  values: Vec<Value>,
-  callback: Function,
+  await_completion: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -234,6 +248,12 @@ struct UiHandleLease {
 }
 
 impl UserData for UiHandleLease {
+}
+
+#[derive(Clone)]
+struct StyleGroupReference(String);
+
+impl UserData for StyleGroupReference {
 }
 
 impl Drop for UiHandleLease {
@@ -260,8 +280,8 @@ pub struct LuaConfig {
   commands: Rc<RefCell<VecDeque<RuntimeCommand>>>,
   in_event_callback: Rc<Cell<bool>>,
   reload_requested: Cell<bool>,
-  pending_pickers: Rc<RefCell<HashMap<u64, PendingPicker>>>,
   ui_tree: Rc<RefCell<UiTree>>,
+  styles: Rc<RefCell<StyleRegistry>>,
   ui_handles: Table,
   _ui_leases: Table,
   ui_releases: RefCell<Receiver<UiHandleRelease>>,
@@ -373,6 +393,7 @@ impl LuaConfig {
   }
 
   pub fn event_handlers(&self, name: &str) -> Vec<LuaCallback> {
+    let name = canonical_event_name(name).unwrap_or(name);
     self
       .handlers
       .borrow()
@@ -382,7 +403,7 @@ impl LuaConfig {
       .into_iter()
       .map(|handler| LuaCallback {
         function: handler.function,
-        interrupt: handler.interrupt,
+        await_completion: handler.await_completion,
       })
       .collect()
   }
@@ -392,13 +413,31 @@ impl LuaConfig {
     Ok(())
   }
 
+  pub fn set_prepared_launch_session(&self, session_name: &str) -> LuaResult<()> {
+    self.launch.set("session", session_name)?;
+    self.launch.set("create_if_missing", false)?;
+    self.launch.set("fail_if_exists", false)?;
+    Ok(())
+  }
+
   pub fn render_ui_elements(
     &self,
     area: ratatui::layout::Rect,
     buffer: &mut ratatui::buffer::Buffer,
   ) {
     self.reap_ui_releases();
-    self.ui_tree.borrow_mut().render(area, buffer);
+    self
+      .ui_tree
+      .borrow_mut()
+      .render(area, buffer, &self.styles.borrow());
+  }
+
+  pub(crate) fn style_registry(&self) -> std::cell::Ref<'_, StyleRegistry> { self.styles.borrow() }
+
+  pub(crate) fn resolve_style(&self, name: &str) -> Style { self.styles.borrow().resolve(name) }
+
+  pub(crate) fn resolve_style_source(&self, source: &StyleSource) -> Style {
+    self.styles.borrow().resolve_source(source)
   }
 
   pub fn focused_ui(&self) -> Option<u64> {
@@ -423,6 +462,28 @@ impl LuaConfig {
     let keys = handle.get::<Table>("__zmux_ui_keys").ok()?;
     let key_name = crate::input::key_notation::key_stroke_to_string(&key);
     let callback = keys.get::<Option<Function>>(key_name).ok().flatten()?;
+    Some((id, callback, handle))
+  }
+
+  pub fn focused_ui_on_key(&self) -> Option<(u64, Function, Table)> {
+    self.reap_ui_releases();
+    let id = self.ui_tree.borrow().focused_element()?;
+    let handle = self.ui_handles.get::<Option<Table>>(id).ok().flatten()?;
+    let callback = handle
+      .get::<Option<Function>>("__zmux_ui_on_key")
+      .ok()
+      .flatten()?;
+    Some((id, callback, handle))
+  }
+
+  pub fn focused_ui_on_paste(&self) -> Option<(u64, Function, Table)> {
+    self.reap_ui_releases();
+    let id = self.ui_tree.borrow().focused_element()?;
+    let handle = self.ui_handles.get::<Option<Table>>(id).ok().flatten()?;
+    let callback = handle
+      .get::<Option<Function>>("__zmux_ui_on_paste")
+      .ok()
+      .flatten()?;
     Some((id, callback, handle))
   }
 
@@ -468,6 +529,15 @@ impl LuaConfig {
     key_value.set("shift", key_stroke.shift)?;
     key_value.set("is_repeat", key.kind == crossterm::event::KeyEventKind::Repeat)?;
     self.invoke_callback(callback, (handle, key_value))
+  }
+
+  pub fn invoke_ui_paste_callback(
+    &self,
+    callback: &Function,
+    handle: Table,
+    text: &str,
+  ) -> LuaResult<Vec<RuntimeCommand>> {
+    self.invoke_callback(callback, (handle, text))
   }
 
   pub fn request_config_reload(&self) { self.reload_requested.set(true); }
@@ -520,39 +590,54 @@ impl LuaConfig {
     Ok(self.commands.borrow_mut().drain(..).collect())
   }
 
-  pub fn picker_labels(&self, picker_id: u64) -> Option<Vec<String>> {
-    self
-      .pending_pickers
-      .borrow()
-      .get(&picker_id)
-      .map(|picker| picker.labels.clone())
+  pub fn open_picker(
+    &self,
+    items: &[String],
+    callback: Function,
+  ) -> LuaResult<Vec<RuntimeCommand>> {
+    let command: Table = self.lua.globals().get("cmd")?;
+    let ui: Table = command.get("ui")?;
+    let picker: Function = ui.get("pick")?;
+    let values = self
+      .lua
+      .create_sequence_from(items.iter().map(String::as_str))?;
+    self.invoke_callback(&picker, (values, callback))
   }
 
-  pub fn complete_picker(
-    &self,
-    picker_id: u64,
-    selected_index: Option<usize>,
-  ) -> LuaResult<Vec<RuntimeCommand>> {
-    let picker = self
-      .pending_pickers
-      .borrow_mut()
-      .remove(&picker_id)
-      .ok_or_else(|| mlua::Error::external("picker is no longer pending"))?;
-    let value = selected_index
-      .and_then(|index| picker.values.get(index).cloned())
-      .unwrap_or(Value::Nil);
-    let result = self.invoke_callback(&picker.callback, value);
-    drop(picker);
-    let released = self.reap_ui_releases();
-    match result {
-      Ok(mut commands) => {
-        if released {
-          commands.push(RuntimeCommand::Redraw);
-        }
-        Ok(commands)
+  pub fn start_session_picker(&self, items: &[String]) -> LuaResult<Vec<RuntimeCommand>> {
+    let callback = self.lua.create_function(|lua, selected: Option<String>| {
+      if let Some(selected) = selected {
+        let command: Table = lua.globals().get("cmd")?;
+        let session: Table = command.get("session")?;
+        let select: Function = session.get("select")?;
+        select.call::<()>(selected)?;
       }
-      Err(error) => Err(error),
-    }
+      Ok(())
+    })?;
+    self.open_picker(items, callback)
+  }
+
+  pub fn start_string_picker(
+    &self,
+    items: &[String],
+  ) -> LuaResult<(StringPickerCompletion, Vec<RuntimeCommand>)> {
+    let completed = Rc::new(Cell::new(false));
+    let selected = Rc::new(RefCell::new(None));
+    let completed_callback = Rc::clone(&completed);
+    let selected_callback = Rc::clone(&selected);
+    let callback = self.lua.create_function(move |_, value: Option<String>| {
+      *selected_callback.borrow_mut() = value;
+      completed_callback.set(true);
+      Ok(())
+    })?;
+    let commands = self.open_picker(items, callback)?;
+    Ok((
+      StringPickerCompletion {
+        completed,
+        selected,
+      },
+      commands,
+    ))
   }
 
   pub fn sync_options(&self) -> LuaResult<UiOptions> {
@@ -582,12 +667,15 @@ impl LuaConfig {
     buffer: &mut ratatui::buffer::Buffer,
   ) {
     self.reap_ui_releases();
-    self.ui_tree.borrow_mut().render_bars(top, bottom, buffer);
+    self
+      .ui_tree
+      .borrow_mut()
+      .render_bars(top, bottom, buffer, &self.styles.borrow());
   }
 
   fn event_value(&self, event: &AppEvent) -> LuaResult<Table> {
     let value = self.lua.create_table()?;
-    value.set("name", event.name.as_str())?;
+    value.set("name", canonical_event_name(&event.name).unwrap_or(&event.name))?;
     value.set("session_number", event.session_number.clone())?;
     value.set("workspace_id", event.workspace_id)?;
     value.set("workspace_index", event.workspace_index)?;
@@ -615,7 +703,7 @@ impl Default for UiOptions {
       },
       pty: PtyOptions {
         border: DrawerBorder::Plain,
-        border_style: Style::default(),
+        border_style: StyleSource::Group("Pty.Border".to_owned()),
       },
     }
   }
@@ -624,7 +712,7 @@ impl Default for UiOptions {
 fn read_pty(pty: Option<&Table>) -> LuaResult<PtyOptions> {
   let defaults = PtyOptions {
     border: DrawerBorder::Plain,
-    border_style: Style::default(),
+    border_style: StyleSource::Group("Pty.Border".to_owned()),
   };
   let Some(pty) = pty else {
     return Ok(defaults);
@@ -635,7 +723,7 @@ fn read_pty(pty: Option<&Table>) -> LuaResult<PtyOptions> {
   };
   let border_style = pty
     .get::<Value>("border_style")
-    .and_then(parse_style)?
+    .and_then(parse_optional_style_source)?
     .unwrap_or(defaults.border_style);
   Ok(PtyOptions {
     border,
@@ -727,6 +815,62 @@ fn parse_style(value: Value) -> LuaResult<Option<Style>> {
     }
   }
   Ok(Some(style.add_modifier(modifiers).remove_modifier(removals)))
+}
+
+fn parse_style_definition(value: Value) -> LuaResult<StyleDefinition> {
+  let Value::Table(table) = value else {
+    return Err(mlua::Error::external("style group definitions must be tables"));
+  };
+  if !matches!(table.get::<Value>("remove")?, Value::Nil) {
+    return Err(mlua::Error::external(
+      "style group definitions use boolean modifiers instead of 'remove'",
+    ));
+  }
+  Ok(StyleDefinition {
+    fg: parse_color_attribute(table.get::<Value>("fg")?)?,
+    bg: parse_color_attribute(table.get::<Value>("bg")?)?,
+    bold: parse_bool_attribute(table.get::<Value>("bold")?)?,
+    italic: parse_bool_attribute(table.get::<Value>("italic")?)?,
+    underline: parse_bool_attribute(table.get::<Value>("underline")?)?,
+    reverse: parse_bool_attribute(table.get::<Value>("reverse")?)?,
+  })
+}
+
+fn parse_color_attribute(value: Value) -> LuaResult<Option<StyleAttribute<Color>>> {
+  match value {
+    Value::Nil => Ok(None),
+    Value::UserData(value) => {
+      Ok(Some(StyleAttribute::Reference(value.borrow::<StyleGroupReference>()?.0.clone())))
+    }
+    value => Ok(Some(StyleAttribute::Value(parse_color(value)?))),
+  }
+}
+
+fn parse_bool_attribute(value: Value) -> LuaResult<Option<StyleAttribute<bool>>> {
+  match value {
+    Value::Nil => Ok(None),
+    Value::Boolean(value) => Ok(Some(StyleAttribute::Value(value))),
+    Value::UserData(value) => {
+      Ok(Some(StyleAttribute::Reference(value.borrow::<StyleGroupReference>()?.0.clone())))
+    }
+    _ => {
+      Err(mlua::Error::external("style modifiers must be booleans or cmd.style.ref(group_name)"))
+    }
+  }
+}
+
+fn parse_theme_definitions(table: &Table) -> LuaResult<HashMap<String, StyleDefinition>> {
+  table
+    .clone()
+    .pairs::<Value, Value>()
+    .map(|entry| {
+      let (name, definition) = entry?;
+      let Value::String(name) = name else {
+        return Err(mlua::Error::external("theme group names must be strings"));
+      };
+      Ok((name.to_string_lossy(), parse_style_definition(definition)?))
+    })
+    .collect()
 }
 
 fn parse_color(value: Value) -> LuaResult<Color> {
@@ -906,12 +1050,11 @@ fn load_config_with_source_path(
   let handlers = Rc::new(RefCell::new(HashMap::<String, Vec<RegisteredCallback>>::new()));
   let commands = Rc::new(RefCell::new(VecDeque::<RuntimeCommand>::new()));
   let in_event_callback = Rc::new(Cell::new(false));
-  let pending_pickers = Rc::new(RefCell::new(HashMap::<u64, PendingPicker>::new()));
   let ui_tree = Rc::new(RefCell::new(UiTree::default()));
+  let styles = Rc::new(RefCell::new(StyleRegistry::default()));
   let ui_handles = create_weak_table(&lua, "v")?;
   let ui_leases = create_weak_table(&lua, "k")?;
   let (ui_release_sender, ui_releases) = std::sync::mpsc::channel();
-  let next_picker_id = Rc::new(Cell::new(1_u64));
   let config_loading = Rc::new(Cell::new(true));
   let globals = lua.create_table()?;
   lua.globals().set("g", globals.clone())?;
@@ -993,21 +1136,24 @@ fn load_config_with_source_path(
             return Err(mlua::Error::external(format!("unknown event: {name}")));
           }
         }
-        let interrupt = options
-          .map(|options| options.get::<Option<bool>>("interrupt"))
+        let await_completion = options
+          .map(|options| options.get::<Option<bool>>("await"))
           .transpose()?
           .flatten()
           .unwrap_or(false);
         let mut handlers = handlers.borrow_mut();
         let mut registered_names = Vec::new();
         for name in names {
+          let name = canonical_event_name(&name)
+            .expect("validated event name")
+            .to_owned();
           if registered_names.contains(&name) {
             continue;
           }
           registered_names.push(name.clone());
           handlers.entry(name).or_default().push(RegisteredCallback {
             function: callback.clone(),
-            interrupt,
+            await_completion,
           });
         }
         Ok(())
@@ -1020,58 +1166,26 @@ fn load_config_with_source_path(
   let event = lua.create_table()?;
   event.set("on", on)?;
   let ui = lua.create_table()?;
+  let style = lua.create_table()?;
   let config_api = lua.create_table()?;
   let client = lua.create_table()?;
   let server = lua.create_table()?;
   let session = lua.create_table()?;
   let workspace = lua.create_table()?;
   let tab = lua.create_table()?;
+  let pre_attach = lua.create_table()?;
   cmd.set("key", key)?;
   cmd.set("event", event)?;
   cmd.set("ui", ui.clone())?;
+  cmd.set("style", style.clone())?;
   cmd.set("config", config_api.clone())?;
   cmd.set("client", client.clone())?;
   cmd.set("server", server.clone())?;
   cmd.set("session", session.clone())?;
   cmd.set("workspace", workspace.clone())?;
   cmd.set("tab", tab.clone())?;
-  {
-    let pending_pickers = Rc::clone(&pending_pickers);
-    let next_picker_id = Rc::clone(&next_picker_id);
-    let commands = Rc::clone(&commands);
-    let in_event_callback = Rc::clone(&in_event_callback);
-    ui.set(
-      "pick",
-      lua.create_function(move |_, (items, callback): (Table, Function)| {
-        ensure_command_context(&in_event_callback)?;
-        let picker_id = next_picker_id.get();
-        next_picker_id.set(
-          picker_id
-            .checked_add(1)
-            .ok_or_else(|| mlua::Error::external("picker identifier space exhausted"))?,
-        );
-        let mut labels = Vec::new();
-        let mut values = Vec::new();
-        for item in items.sequence_values::<Value>() {
-          let item = item?;
-          let (label, value) = picker_item(item)?;
-          labels.push(label);
-          values.push(value);
-        }
-        pending_pickers
-          .borrow_mut()
-          .insert(picker_id, PendingPicker {
-            labels,
-            values,
-            callback,
-          });
-        commands
-          .borrow_mut()
-          .push_back(RuntimeCommand::OpenPicker(picker_id));
-        Ok(())
-      })?,
-    )?;
-  }
+  cmd.set("pre_attach", pre_attach.clone())?;
+  register_pre_attach_api(&lua, &pre_attach, &launch, &commands, &in_event_callback)?;
   let ui_api = UiApiContext {
     tree: Rc::clone(&ui_tree),
     handles: ui_handles.clone(),
@@ -1082,6 +1196,7 @@ fn load_config_with_source_path(
     in_callback: Rc::clone(&in_event_callback),
   };
   register_ui_api(&lua, &ui, &ui_api)?;
+  register_style_api(&lua, &style, &styles, &commands, &config_loading, &in_event_callback)?;
   register_command(
     &lua,
     &config_api,
@@ -1116,6 +1231,20 @@ fn load_config_with_source_path(
     "switch",
     RuntimeCommand::OpenSessionPicker,
   )?;
+  {
+    let commands = Rc::clone(&commands);
+    let in_event_callback = Rc::clone(&in_event_callback);
+    session.set(
+      "select",
+      lua.create_function(move |_, name: String| {
+        ensure_command_context(&in_event_callback)?;
+        commands
+          .borrow_mut()
+          .push_back(RuntimeCommand::SwitchSession(name));
+        Ok(())
+      })?,
+    )?;
+  }
   register_command(
     &lua,
     &workspace,
@@ -1216,6 +1345,10 @@ fn load_config_with_source_path(
   options.set("ui", ui)?;
   lua.globals().set("opt", options.clone())?;
   register_import_api(&lua, source_path)?;
+  lua
+    .load(DEFAULT_LUA_API_SOURCE)
+    .set_name("@embedded/lua/defaults.lua")
+    .exec()?;
   if let Some(path) = source_path {
     lua
       .load(source)
@@ -1269,8 +1402,8 @@ fn load_config_with_source_path(
       commands,
       in_event_callback,
       reload_requested: Cell::new(false),
-      pending_pickers,
       ui_tree,
+      styles,
       ui_handles,
       _ui_leases: ui_leases,
       ui_releases: RefCell::new(ui_releases),
@@ -1289,7 +1422,7 @@ fn register_ui_api(lua: &Lua, ui: &Table, context: &UiApiContext) -> LuaResult<(
         .ok_or_else(|| mlua::Error::external("Text nodes require a 'text' string"))?;
       let style = options
         .get::<Value>("style")
-        .and_then(parse_optional_style)?
+        .and_then(parse_optional_style_source)?
         .unwrap_or_default();
       let handle = make_text_handle(lua, &context, text, style)?;
       finish_ui_mutation(true, &context.config_loading, &context.commands);
@@ -1318,6 +1451,242 @@ fn register_ui_api(lua: &Lua, ui: &Table, context: &UiApiContext) -> LuaResult<(
   Ok(())
 }
 
+fn register_pre_attach_api(
+  lua: &Lua,
+  api: &Table,
+  launch: &Table,
+  commands: &Rc<RefCell<VecDeque<RuntimeCommand>>>,
+  in_callback: &Rc<Cell<bool>>,
+) -> LuaResult<()> {
+  let session = lua.create_table()?;
+  let workspace = lua.create_table()?;
+  let tab = lua.create_table()?;
+  api.set("session", session.clone())?;
+  api.set("workspace", workspace.clone())?;
+  api.set("tab", tab.clone())?;
+
+  {
+    let launch = launch.clone();
+    let commands = Rc::clone(commands);
+    let in_callback = Rc::clone(in_callback);
+    session.set(
+      "rename",
+      lua.create_function(move |_, name: String| {
+        let session_name = launch
+          .get::<Option<String>>("session")?
+          .ok_or_else(|| mlua::Error::external("PreAttach requires a resolved Session target"))?;
+        launch.set("session", name.as_str())?;
+        queue_pre_attach_request(&commands, &in_callback, HeadlessRequest::SessionRename {
+          id: Some(session_name),
+          name,
+        })
+      })?,
+    )?;
+  }
+  {
+    let launch = launch.clone();
+    let commands = Rc::clone(commands);
+    let in_callback = Rc::clone(in_callback);
+    session.set(
+      "remove",
+      lua.create_function(move |_, ()| {
+        let session_name = launch
+          .get::<Option<String>>("session")?
+          .ok_or_else(|| mlua::Error::external("PreAttach requires a resolved Session target"))?;
+        launch.set("session", Value::Nil)?;
+        queue_pre_attach_request(&commands, &in_callback, HeadlessRequest::SessionRemove {
+          id: Some(session_name),
+        })
+      })?,
+    )?;
+  }
+  {
+    let launch = launch.clone();
+    let commands = Rc::clone(commands);
+    let in_callback = Rc::clone(in_callback);
+    workspace.set(
+      "create",
+      lua.create_function(move |_, (directory, name): (String, Option<String>)| {
+        let session_id = launch
+          .get::<Option<String>>("session")?
+          .ok_or_else(|| mlua::Error::external("PreAttach requires a resolved Session target"))?;
+        queue_pre_attach_request(&commands, &in_callback, HeadlessRequest::WorkspaceCreate {
+          session_id: Some(session_id),
+          name,
+          working_directory: PathBuf::from(directory),
+        })
+      })?,
+    )?;
+  }
+  {
+    let commands = Rc::clone(commands);
+    let in_callback = Rc::clone(in_callback);
+    workspace.set(
+      "rename",
+      lua.create_function(move |_, (id, name): (String, String)| {
+        queue_pre_attach_request(&commands, &in_callback, HeadlessRequest::WorkspaceRename {
+          id: Some(id),
+          name,
+        })
+      })?,
+    )?;
+  }
+  {
+    let commands = Rc::clone(commands);
+    let in_callback = Rc::clone(in_callback);
+    workspace.set(
+      "setcwd",
+      lua.create_function(move |_, (id, directory): (String, String)| {
+        queue_pre_attach_request(&commands, &in_callback, HeadlessRequest::WorkspaceSetCwd {
+          id: Some(id),
+          working_directory: PathBuf::from(directory),
+        })
+      })?,
+    )?;
+  }
+  {
+    let commands = Rc::clone(commands);
+    let in_callback = Rc::clone(in_callback);
+    workspace.set(
+      "remove",
+      lua.create_function(move |_, id: String| {
+        queue_pre_attach_request(&commands, &in_callback, HeadlessRequest::WorkspaceRemove {
+          id: Some(id),
+        })
+      })?,
+    )?;
+  }
+  {
+    let commands = Rc::clone(commands);
+    let in_callback = Rc::clone(in_callback);
+    tab.set(
+      "create",
+      lua.create_function(move |_, (workspace_id, name): (String, Option<String>)| {
+        queue_pre_attach_request(&commands, &in_callback, HeadlessRequest::TabCreate {
+          workspace_id: Some(workspace_id),
+          name,
+        })
+      })?,
+    )?;
+  }
+  {
+    let commands = Rc::clone(commands);
+    let in_callback = Rc::clone(in_callback);
+    tab.set(
+      "rename",
+      lua.create_function(move |_, (id, name): (String, String)| {
+        queue_pre_attach_request(&commands, &in_callback, HeadlessRequest::TabRename {
+          id: Some(id),
+          name,
+        })
+      })?,
+    )?;
+  }
+  {
+    let commands = Rc::clone(commands);
+    let in_callback = Rc::clone(in_callback);
+    tab.set(
+      "remove",
+      lua.create_function(move |_, id: String| {
+        queue_pre_attach_request(&commands, &in_callback, HeadlessRequest::TabRemove {
+          id: Some(id),
+        })
+      })?,
+    )?;
+  }
+  Ok(())
+}
+
+fn queue_pre_attach_request(
+  commands: &RefCell<VecDeque<RuntimeCommand>>,
+  in_callback: &Cell<bool>,
+  request: HeadlessRequest,
+) -> LuaResult<()> {
+  ensure_command_context(in_callback)?;
+  commands
+    .borrow_mut()
+    .push_back(RuntimeCommand::PreAttachServer(request));
+  Ok(())
+}
+
+fn register_style_api(
+  lua: &Lua,
+  style: &Table,
+  styles: &Rc<RefCell<StyleRegistry>>,
+  commands: &Rc<RefCell<VecDeque<RuntimeCommand>>>,
+  config_loading: &Rc<Cell<bool>>,
+  in_callback: &Rc<Cell<bool>>,
+) -> LuaResult<()> {
+  style.set(
+    "ref",
+    lua.create_function(|lua, name: String| {
+      if name.trim().is_empty() {
+        return Err(mlua::Error::external("style group name must not be empty"));
+      }
+      lua.create_userdata(StyleGroupReference(name))
+    })?,
+  )?;
+  {
+    let styles = Rc::clone(styles);
+    let commands = Rc::clone(commands);
+    let config_loading = Rc::clone(config_loading);
+    let in_callback = Rc::clone(in_callback);
+    style.set(
+      "create",
+      lua.create_function(move |_, (name, value): (String, Value)| {
+        ensure_ui_mutation_context(&config_loading, &in_callback)?;
+        let definition = parse_style_definition(value)?;
+        let changed = styles
+          .borrow_mut()
+          .create_group(name, definition)
+          .map_err(mlua::Error::external)?;
+        finish_ui_mutation(changed, &config_loading, &commands);
+        Ok(())
+      })?,
+    )?;
+  }
+  {
+    let styles = Rc::clone(styles);
+    style.set(
+      "define_theme",
+      lua.create_function(move |_, (name, definitions): (String, Table)| {
+        let definitions = parse_theme_definitions(&definitions)?;
+        styles
+          .borrow_mut()
+          .define_theme(name, definitions)
+          .map_err(mlua::Error::external)
+      })?,
+    )?;
+  }
+  {
+    let styles = Rc::clone(styles);
+    let commands = Rc::clone(commands);
+    let config_loading = Rc::clone(config_loading);
+    let in_callback = Rc::clone(in_callback);
+    style.set(
+      "apply_theme",
+      lua.create_function(move |_, name: String| {
+        ensure_ui_mutation_context(&config_loading, &in_callback)?;
+        let changed = styles
+          .borrow_mut()
+          .apply_theme(&name)
+          .map_err(mlua::Error::external)?;
+        finish_ui_mutation(changed, &config_loading, &commands);
+        Ok(())
+      })?,
+    )?;
+  }
+  {
+    let styles = Rc::clone(styles);
+    style.set(
+      "themes",
+      lua
+        .create_function(move |lua, ()| lua.create_sequence_from(styles.borrow().theme_names()))?,
+    )?;
+  }
+  Ok(())
+}
+
 fn ensure_ui_mutation_context(
   config_loading: &Cell<bool>,
   in_callback: &Cell<bool>,
@@ -1339,7 +1708,16 @@ fn finish_ui_mutation(
   }
 }
 
-fn parse_optional_style(value: Value) -> LuaResult<Option<Style>> { parse_style(value) }
+fn parse_optional_style_source(value: Value) -> LuaResult<Option<StyleSource>> {
+  match value {
+    Value::Nil => Ok(None),
+    Value::UserData(value) => {
+      Ok(Some(StyleSource::Group(value.borrow::<StyleGroupReference>()?.0.clone())))
+    }
+    Value::Table(_) => Ok(parse_style(value)?.map(StyleSource::Inline)),
+    _ => Err(mlua::Error::external("style must be a style table or cmd.style.ref(group_name)")),
+  }
+}
 
 fn track_ui_handle(
   lua: &Lua,
@@ -1543,7 +1921,7 @@ fn make_text_handle(
   lua: &Lua,
   context: &UiApiContext,
   text: String,
-  style: Style,
+  style: StyleSource,
 ) -> LuaResult<Table> {
   let id = context
     .tree
@@ -1570,7 +1948,7 @@ fn make_text_handle(
             .map_err(mlua::Error::external)?
         }
         "style" => {
-          let style = parse_style(value)?.unwrap_or_default();
+          let style = parse_optional_style_source(value)?.unwrap_or_default();
           tree
             .borrow_mut()
             .set_text_style(id, style)
@@ -1820,11 +2198,11 @@ fn create_ui_element_handle(lua: &Lua, context: &UiApiContext, options: Table) -
   };
   let border_style = options
     .get::<Value>("border_style")
-    .and_then(parse_optional_style)?
+    .and_then(parse_optional_style_source)?
     .unwrap_or_default();
   let style = options
     .get::<Value>("style")
-    .and_then(parse_optional_style)?
+    .and_then(parse_optional_style_source)?
     .unwrap_or_default();
   let content = options
     .get::<Option<Table>>("content")?
@@ -1835,13 +2213,13 @@ fn create_ui_element_handle(lua: &Lua, context: &UiApiContext, options: Table) -
     .map(|keys| parse_ui_keys(&keys))
     .transpose()?
     .unwrap_or_default();
-  if matches!(element_type, UiElementType::Toast { .. } | UiElementType::Bar { .. })
-    && !keys.is_empty()
-  {
-    return Err(mlua::Error::external("Bar and Toast elements do not support key bindings"));
-  }
+  let on_key = options.get::<Option<Function>>("on_key")?;
+  let on_paste = options.get::<Option<Function>>("on_paste")?;
   let is_non_focusable =
     matches!(element_type, UiElementType::Toast { .. } | UiElementType::Bar { .. });
+  if is_non_focusable && (!keys.is_empty() || on_key.is_some() || on_paste.is_some()) {
+    return Err(mlua::Error::external("Bar and Toast elements do not support input callbacks"));
+  }
   let id = Rc::new(Cell::new(0_u64));
   let handle = make_ui_element_handle(lua, context, Rc::clone(&id), is_non_focusable)?;
   let element_id = context
@@ -1860,6 +2238,8 @@ fn create_ui_element_handle(lua: &Lua, context: &UiApiContext, options: Table) -
   id.set(element_id);
   handle.set("__zmux_ui_element", element_id)?;
   handle.set("__zmux_ui_keys", ui_keymap_table(lua, &keys)?)?;
+  handle.set("__zmux_ui_on_key", on_key)?;
+  handle.set("__zmux_ui_on_paste", on_paste)?;
   context.handles.set(element_id, handle.clone())?;
   track_ui_handle(
     lua,
@@ -1901,6 +2281,30 @@ fn make_ui_element_handle(
           .get::<Option<Table>>(id_for_keys.get())?
           .ok_or_else(|| mlua::Error::external("UI element handle is no longer reachable"))?;
         handle.set("__zmux_ui_keys", ui_keymap_table(lua, &keys)?)?;
+        return Ok(());
+      }
+      if property == "on_key" || property == "on_paste" {
+        if is_non_focusable {
+          return Err(mlua::Error::external(
+            "Bar and Toast elements do not support input callbacks",
+          ));
+        }
+        let callback = match value {
+          Value::Nil => None,
+          Value::Function(callback) => Some(callback),
+          _ => return Err(mlua::Error::external("UI input callback must be a function or nil")),
+        };
+        let handle = handles
+          .get::<Option<Table>>(id_for_keys.get())?
+          .ok_or_else(|| mlua::Error::external("UI element handle is no longer reachable"))?;
+        handle.set(
+          if property == "on_key" {
+            "__zmux_ui_on_key"
+          } else {
+            "__zmux_ui_on_paste"
+          },
+          callback,
+        )?;
         return Ok(());
       }
       if property == "content" {
@@ -1974,11 +2378,11 @@ fn make_ui_element_handle(
           (UiElementProperty::Border, UiElementValue::Border(parse_drawer_border(value)?))
         }
         "border_style" => {
-          let style = parse_style(value)?.unwrap_or_default();
+          let style = parse_optional_style_source(value)?.unwrap_or_default();
           (UiElementProperty::BorderStyle, UiElementValue::Style(style))
         }
         "style" => {
-          let style = parse_style(value)?.unwrap_or_default();
+          let style = parse_optional_style_source(value)?.unwrap_or_default();
           (UiElementProperty::Style, UiElementValue::Style(style))
         }
         _ => {
@@ -2022,53 +2426,30 @@ fn make_ui_element_handle(
   Ok(handle)
 }
 
-fn picker_item(value: Value) -> LuaResult<(String, Value)> {
-  match value {
-    Value::String(text) => Ok((text.to_string_lossy(), Value::String(text))),
-    Value::Table(table) => {
-      let label = table
-        .get::<Option<String>>("label")?
-        .or(table.get::<Option<String>>("text")?)
-        .ok_or_else(|| {
-          mlua::Error::external("picker table items require a string 'label' or 'text'")
-        })?;
-      let selected = table.get::<Value>("value")?;
-      let value = if matches!(selected, Value::Nil) {
-        Value::Table(table)
-      } else {
-        selected
-      };
-      Ok((label, value))
-    }
-    other => Err(mlua::Error::external(format!(
-      "picker items must be strings or tables, got {}",
-      other.type_name()
-    ))),
-  }
+fn canonical_event_name(name: &str) -> Option<&'static str> {
+  Some(match name {
+    "PreAttach" => "PreAttach",
+    "ClientLoaded" => "ClientLoaded",
+    "ConfigLoaded" => "ConfigLoaded",
+    "SessionCreated" => "SessionCreated",
+    "SessionSelected" => "SessionSelected",
+    "SessionClosed" => "SessionClosed",
+    "LastErrorChanged" => "LastErrorChanged",
+    "WorkspaceCreated" => "WorkspaceCreated",
+    "WorkspaceClosed" => "WorkspaceClosed",
+    "WorkspaceSelected" => "WorkspaceSelected",
+    "TabCreated" => "TabCreated",
+    "TabClosed" => "TabClosed",
+    "TabSelected" => "TabSelected",
+    "LeaderModeChanged" => "LeaderModeChanged",
+    "TerminalTitleChanged" => "TerminalTitleChanged",
+    "ProcessExited" => "ProcessExited",
+    "TerminalResized" => "TerminalResized",
+    _ => return None,
+  })
 }
 
-fn valid_event_name(name: &str) -> bool {
-  matches!(
-    name,
-    "PreClient"
-      | "ClientLoaded"
-      | "ConfigLoaded"
-      | "session_created"
-      | "session_selected"
-      | "session_closed"
-      | "last_error_changed"
-      | "workspace_created"
-      | "workspace_closed"
-      | "workspace_selected"
-      | "tab_created"
-      | "tab_closed"
-      | "tab_selected"
-      | "leader_mode_changed"
-      | "terminal_title_changed"
-      | "process_exited"
-      | "terminal_resized"
-  )
-}
+fn valid_event_name(name: &str) -> bool { canonical_event_name(name).is_some() }
 
 fn register_command(
   lua: &Lua,
@@ -2206,7 +2587,7 @@ mod tests {
   #[test]
   fn lua_exposes_program_and_config_api_versions() {
     load_config(
-      "assert(type(zmux.version) == 'string' and #zmux.version > 0)\nassert(zmux.config_api_version == 2)",
+      "assert(type(zmux.version) == 'string' and #zmux.version > 0)\nassert(zmux.config_api_version == 3)",
     )
     .expect("runtime version metadata");
   }
@@ -2227,7 +2608,7 @@ mod tests {
     std::fs::write(
       &root,
       format!(
-        "opt.config_version = 2\nlocal bars = require('{module_name}')\nassert(bars.value == 'from config directory')\nassert(import('{module_name}') == bars)"
+        "opt.config_version = 3\nlocal bars = require('{module_name}')\nassert(bars.value == 'from config directory')\nassert(import('{module_name}') == bars)"
       ),
     )
     .expect("write root configuration");
@@ -2263,7 +2644,7 @@ mod tests {
       &root,
       format!(
         r#"
-          opt.config_version = 2
+          opt.config_version = 3
           package.path = [=[{package_path}/?.lua;]=] .. package.path
           local bare = import("bare.main")
           assert(bare.value == "bare:nested" and bare.name == "bare.main")
@@ -2313,12 +2694,12 @@ mod tests {
 
   #[test]
   fn declared_config_api_version_must_be_supported() {
-    let error = match load_config("opt.config_version = 3") {
+    let error = match load_config("opt.config_version = 4") {
       Ok(_) => panic!("unsupported config API must be rejected"),
       Err(error) => error,
     };
-    assert!(error.to_string().contains("config API version 3"));
-    assert!(error.to_string().contains("supports version 2"));
+    assert!(error.to_string().contains("config API version 4"));
+    assert!(error.to_string().contains("supports version 3"));
   }
 
   #[test]
@@ -2343,21 +2724,21 @@ mod tests {
     assert!(
       error
         .to_string()
-        .contains("must declare opt.config_version = 2")
+        .contains("must declare opt.config_version = 3")
     );
 
-    std::fs::write(&path, "opt.config_version = 3\nerror('stale config must not execute')")
+    std::fs::write(&path, "opt.config_version = 4\nerror('stale config must not execute')")
       .expect("write unsupported config");
     let error = match load_file_with_context(&path, &[], LaunchState::default()) {
       Ok(_) => panic!("unsupported config files must be rejected"),
       Err(error) => error,
     };
-    assert!(error.to_string().contains("config API version 3"));
+    assert!(error.to_string().contains("config API version 4"));
     assert!(!error.to_string().contains("stale config must not execute"));
 
     std::fs::write(
       &path,
-      "--[[ config header\nmultiline comment ]]\nopt.config_version = 2 -- current API",
+      "--[[ config header\nmultiline comment ]]\nopt.config_version = 3 -- current API",
     )
     .expect("write versioned config");
     let config = load_file_with_context(&path, &[], LaunchState::default())
@@ -2398,7 +2779,7 @@ mod tests {
 
   // Developer approved: do not remove.
   #[test]
-  fn pre_client_handlers_receive_arguments_and_mutate_launch_state() {
+  fn pre_attach_handlers_receive_arguments_and_mutate_launch_state() {
     let launch = LaunchState {
       command: "list".to_owned(),
       session_name: None,
@@ -2411,13 +2792,13 @@ mod tests {
       r#"
             assert(args[1] == "list")
             assert(args[2] == "-a")
-            cmd.event.on("PreClient", function(event)
-                assert(event.name == "PreClient")
+            cmd.event.on("PreAttach", function(event)
+                assert(event.name == "PreAttach")
                 launch.session = "alpha"
                 launch.working_directory = "/workspace/alpha"
                 launch.create_if_missing = true
                 cmd.tab.create()
-            end, { interrupt = true })
+            end, { await = true })
             cmd.event.on("ClientLoaded", function(event)
                 assert(event.name == "ClientLoaded")
             end)
@@ -2427,17 +2808,17 @@ mod tests {
     )
     .expect("startup Lua configuration");
 
-    let handlers = config.lua.event_handlers("PreClient");
+    let handlers = config.lua.event_handlers("PreAttach");
     assert_eq!(handlers.len(), 1);
-    assert!(handlers[0].interrupt);
+    assert!(handlers[0].await_completion);
     assert_eq!(
       config
         .lua
         .invoke_event_handler(&handlers[0], &AppEvent {
-          name: "PreClient".to_owned(),
+          name: "PreAttach".to_owned(),
           ..AppEvent::default()
         })
-        .expect("run PreClient handler"),
+        .expect("run PreAttach handler"),
       vec![RuntimeCommand::NewTab]
     );
     let launch = config.lua.launch_state().expect("launch state");
@@ -2447,7 +2828,7 @@ mod tests {
 
     let handlers = config.lua.event_handlers("ClientLoaded");
     assert_eq!(handlers.len(), 1);
-    assert!(!handlers[0].interrupt);
+    assert!(!handlers[0].await_completion);
     config
       .lua
       .invoke_event_handler(&handlers[0], &AppEvent {
@@ -2455,6 +2836,52 @@ mod tests {
         ..AppEvent::default()
       })
       .expect("run ClientLoaded handler");
+  }
+
+  #[test]
+  fn pre_attach_server_mutations_are_queued_in_order_for_the_target_session() {
+    let config = load_config_with_context(
+      r#"
+        cmd.event.on("PreAttach", function()
+          cmd.pre_attach.session.rename("renamed")
+          cmd.pre_attach.workspace.create("/work/second", "second")
+          cmd.pre_attach.tab.create("renamed:second", "shell")
+        end)
+      "#,
+      &[],
+      LaunchState {
+        command: "attach".to_owned(),
+        session_name: Some("project".to_owned()),
+        create_if_missing: false,
+        fail_if_exists: false,
+        require_session: true,
+        working_directory: "/work".into(),
+      },
+    )
+    .expect("PreAttach server command config");
+    let callback = config.lua.event_handlers("PreAttach").remove(0);
+    let commands = config
+      .lua
+      .invoke_event_handler(&callback, &AppEvent {
+        name: "PreAttach".to_owned(),
+        ..AppEvent::default()
+      })
+      .expect("queue server mutations");
+    assert_eq!(commands, vec![
+      RuntimeCommand::PreAttachServer(HeadlessRequest::SessionRename {
+        id: Some("project".to_owned()),
+        name: "renamed".to_owned(),
+      }),
+      RuntimeCommand::PreAttachServer(HeadlessRequest::WorkspaceCreate {
+        session_id: Some("renamed".to_owned()),
+        name: Some("second".to_owned()),
+        working_directory: "/work/second".into(),
+      }),
+      RuntimeCommand::PreAttachServer(HeadlessRequest::TabCreate {
+        workspace_id: Some("renamed:second".to_owned()),
+        name: Some("shell".to_owned()),
+      }),
+    ]);
   }
 
   #[test]
@@ -2476,19 +2903,20 @@ mod tests {
 
   #[test]
   fn event_handlers_can_listen_to_multiple_events() {
+    assert!(load_config("cmd.event.on('tab_selected', function() end)").is_err());
     let config = load_config(
       r#"
-        cmd.event.on({"session_created", "session_closed"}, function(event)
-          assert(event.name == "session_created" or event.name == "session_closed")
-        end, { interrupt = true })
+        cmd.event.on({"SessionCreated", "SessionClosed"}, function(event)
+          assert(event.name == "SessionCreated" or event.name == "SessionClosed")
+        end, { await = true })
       "#,
     )
     .expect("multi-event handler config");
 
-    for name in ["session_created", "session_closed"] {
+    for name in ["SessionCreated", "SessionClosed"] {
       let handlers = config.lua.event_handlers(name);
       assert_eq!(handlers.len(), 1);
-      assert!(handlers[0].interrupt);
+      assert!(handlers[0].await_completion);
       config
         .lua
         .invoke_event_handler(&handlers[0], &AppEvent {
@@ -2543,11 +2971,11 @@ mod tests {
       .lua
       .sync_state(&state)
       .expect("sync changed bar state");
-    let error_changed = config.lua.event_handlers("last_error_changed").remove(0);
+    let error_changed = config.lua.event_handlers("LastErrorChanged").remove(0);
     config
       .lua
       .invoke_event_handler(&error_changed, &AppEvent {
-        name: "last_error_changed".to_owned(),
+        name: "LastErrorChanged".to_owned(),
         ..AppEvent::default()
       })
       .expect("update the status Bar after an error event");
@@ -2568,10 +2996,10 @@ mod tests {
   #[test]
   fn built_in_bar_nodes_subscribe_only_to_relevant_state_events() {
     let config = load_config(DEFAULT_CONFIG_SOURCE).expect("built-in Lua config");
-    assert_eq!(config.lua.event_handlers("leader_mode_changed").len(), 1);
-    assert_eq!(config.lua.event_handlers("terminal_resized").len(), 1);
-    assert_eq!(config.lua.event_handlers("tab_selected").len(), 2);
-    assert_eq!(config.lua.event_handlers("last_error_changed").len(), 1);
+    assert_eq!(config.lua.event_handlers("LeaderModeChanged").len(), 1);
+    assert_eq!(config.lua.event_handlers("TerminalResized").len(), 1);
+    assert_eq!(config.lua.event_handlers("TabSelected").len(), 2);
+    assert_eq!(config.lua.event_handlers("LastErrorChanged").len(), 1);
   }
 
   // Developer approved: do not remove.
@@ -2626,14 +3054,9 @@ mod tests {
     .expect("PTY border configuration");
     let options = config.lua.sync_options().expect("UI options");
     assert_eq!(options.pty.border, DrawerBorder::Rounded);
-    assert_eq!(options.pty.border_style.fg, Some(Color::Cyan));
-    assert!(
-      options
-        .pty
-        .border_style
-        .add_modifier
-        .contains(Modifier::BOLD)
-    );
+    let border_style = config.lua.resolve_style_source(&options.pty.border_style);
+    assert_eq!(border_style.fg, Some(Color::Cyan));
+    assert!(border_style.add_modifier.contains(Modifier::BOLD));
 
     let config = load_config("opt.ui.pty.border = 'none'").expect("borderless PTY config");
     let options = config.lua.sync_options().expect("UI options");
@@ -2643,62 +3066,252 @@ mod tests {
     assert!(config.lua.sync_options().is_err());
   }
 
-  // Developer approved: do not remove.
   #[test]
-  fn generic_picker_returns_selected_items_and_nil_on_escape_to_lua_callback() {
+  fn style_groups_resolve_references_and_themes_apply_only_when_requested() {
     let config = load_config(
       r#"
-            cmd.event.on("tab_selected", function()
-                cmd.ui.pick({"alpha", {label = "beta", value = 42}}, function(item)
-                    if item == nil then
-                        cmd.tab.previous()
-                    elseif item == 42 then
-                        cmd.tab.select(2)
-                    end
-                end)
-            end)
-            "#,
+        cmd.style.create("base", { fg = "red", bold = true })
+        cmd.style.create("derived", {
+          fg = cmd.style.ref("base"),
+          bold = cmd.style.ref("base"),
+          italic = false,
+        })
+        cmd.style.create("untouched", { fg = "blue" })
+        cmd.style.define_theme("spring", {
+          base = { fg = "green", bold = false },
+        })
+        assert(table.concat(cmd.style.themes(), ",") == "default,spring")
+
+        local text = cmd.ui.text({ text = "X", style = cmd.style.ref("derived") })
+        cmd.ui.create({
+          type = "bar",
+          content = text,
+          style = cmd.style.ref("Bar"),
+          visible = true,
+        })
+        cmd.event.on("ClientLoaded", function()
+          cmd.style.apply_theme("spring")
+        end)
+        cmd.event.on("TabSelected", function()
+          cmd.style.create("base", { fg = "yellow", bold = true })
+        end)
+      "#,
     )
-    .expect("picker callback config");
-    let callbacks = config.lua.event_handlers("tab_selected");
-    let commands = config
-      .lua
-      .invoke_event_handler(&callbacks[0], &AppEvent::default())
-      .expect("request picker");
-    let RuntimeCommand::OpenPicker(picker_id) = commands[0] else {
-      panic!("cmd.ui.pick should request a generic picker");
-    };
-    assert_eq!(config.lua.picker_labels(picker_id), Some(vec!["alpha".into(), "beta".into()]));
-    assert_eq!(
+    .expect("style groups and theme definitions");
+    let area = ratatui::layout::Rect::new(0, 0, 12, 1);
+    let bottom = ratatui::layout::Rect::new(0, 1, 12, 0);
+    let mut before = ratatui::buffer::Buffer::empty(area);
+    config.lua.render_ui_bars(area, bottom, &mut before);
+    assert_eq!(before[(0, 0)].style().fg, Some(Color::Red));
+    assert!(
       config
         .lua
-        .complete_picker(picker_id, Some(1))
-        .expect("complete selected item"),
-      vec![RuntimeCommand::SelectTab(2)]
+        .resolve_style("derived")
+        .add_modifier
+        .contains(Modifier::BOLD)
+    );
+    assert!(
+      config
+        .lua
+        .resolve_style("derived")
+        .sub_modifier
+        .contains(Modifier::ITALIC)
     );
 
-    let callbacks = config.lua.event_handlers("tab_selected");
+    let callbacks = config.lua.event_handlers("ClientLoaded");
     let commands = config
       .lua
       .invoke_event_handler(&callbacks[0], &AppEvent::default())
-      .expect("request second picker");
-    let RuntimeCommand::OpenPicker(picker_id) = commands[0] else {
-      panic!("cmd.ui.pick should request a generic picker");
-    };
-    assert_eq!(
+      .expect("apply style theme from callback");
+    assert_eq!(commands, vec![RuntimeCommand::Redraw]);
+
+    let mut after = ratatui::buffer::Buffer::empty(area);
+    config.lua.render_ui_bars(area, bottom, &mut after);
+    assert_eq!(after[(0, 0)].style().fg, Some(Color::Green));
+    assert!(!after[(0, 0)].style().add_modifier.contains(Modifier::BOLD));
+    assert!(
+      !config
+        .lua
+        .resolve_style("derived")
+        .add_modifier
+        .contains(Modifier::BOLD)
+    );
+    assert_eq!(config.lua.resolve_style("untouched").fg, Some(Color::Blue));
+
+    let callbacks = config.lua.event_handlers("TabSelected");
+    let commands = config
+      .lua
+      .invoke_event_handler(&callbacks[0], &AppEvent::default())
+      .expect("update a group in the active theme");
+    assert_eq!(commands, vec![RuntimeCommand::Redraw]);
+    assert_eq!(config.lua.resolve_style("derived").fg, Some(Color::Yellow));
+    assert!(
       config
         .lua
-        .complete_picker(picker_id, None)
-        .expect("cancel picker"),
-      vec![RuntimeCommand::PreviousTab]
+        .resolve_style("derived")
+        .add_modifier
+        .contains(Modifier::BOLD)
     );
   }
 
   // Developer approved: do not remove.
   #[test]
+  fn embedded_lua_picker_returns_selected_items_and_nil_on_escape() {
+    use crossterm::event::{
+      KeyCode,
+      KeyEvent,
+      KeyModifiers,
+    };
+
+    let config = load_config(
+      r#"
+        selected_item = "unset"
+        cmd.event.on("TabSelected", function()
+          cmd.ui.pick({"alpha", {label = "beta", value = 42}}, function(item)
+            selected_item = item
+          end)
+        end)
+      "#,
+    )
+    .expect("picker callback config");
+    let callback = config.lua.event_handlers("TabSelected").remove(0);
+    config
+      .lua
+      .invoke_event_handler(&callback, &AppEvent::default())
+      .expect("open picker");
+    assert!(config.lua.focused_ui_captures_input());
+
+    let (_, key_callback, handle) = config.lua.focused_ui_on_key().expect("picker key callback");
+    config
+      .lua
+      .invoke_ui_key_callback(
+        &key_callback,
+        handle,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+      )
+      .expect("move to beta");
+    let (_, key_callback, handle) = config.lua.focused_ui_on_key().expect("picker key callback");
+    config
+      .lua
+      .invoke_ui_key_callback(
+        &key_callback,
+        handle,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+      )
+      .expect("select beta");
+    assert_eq!(
+      config
+        .lua
+        .lua
+        .globals()
+        .get::<i64>("selected_item")
+        .expect("selected value"),
+      42
+    );
+
+    config
+      .lua
+      .invoke_event_handler(&callback, &AppEvent::default())
+      .expect("open second picker");
+    let (_, key_callback, handle) = config.lua.focused_ui_on_key().expect("picker key callback");
+    config
+      .lua
+      .invoke_ui_key_callback(
+        &key_callback,
+        handle,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+      )
+      .expect("cancel picker");
+    assert!(matches!(
+      config
+        .lua
+        .lua
+        .globals()
+        .get::<Value>("selected_item")
+        .expect("cancelled value"),
+      Value::Nil,
+    ));
+  }
+
+  // Developer approved: do not remove.
+  #[test]
+  fn user_config_can_overload_the_embedded_picker_default() {
+    let config = load_config(
+      r#"
+        selected = nil
+        local default_pick = cmd.ui.pick
+        cmd.ui.pick = function(items, callback)
+          assert(default_pick ~= nil)
+          custom_picker_called = true
+          callback(items[1])
+        end
+        cmd.event.on("TabSelected", function()
+          cmd.ui.pick({"custom"}, function(item) selected = item end)
+        end)
+      "#,
+    )
+    .expect("config overriding cmd.ui.pick");
+    let callback = config.lua.event_handlers("TabSelected").remove(0);
+    config
+      .lua
+      .invoke_event_handler(&callback, &AppEvent {
+        name: "TabSelected".to_owned(),
+        ..AppEvent::default()
+      })
+      .expect("invoke custom picker call");
+    assert_eq!(
+      config
+        .lua
+        .lua
+        .globals()
+        .get::<String>("selected")
+        .expect("selected value"),
+      "custom"
+    );
+    assert!(
+      config
+        .lua
+        .lua
+        .globals()
+        .get::<bool>("custom_picker_called")
+        .expect("custom picker was called")
+    );
+    assert!(config.lua.focused_ui().is_none());
+  }
+
+  #[test]
+  fn built_in_session_switch_uses_the_overloadable_lua_picker() {
+    let config = load_config(
+      r#"
+        picker_called = false
+        cmd.ui.pick = function(items, callback)
+          picker_called = true
+          callback(items[2])
+        end
+      "#,
+    )
+    .expect("custom picker config");
+    assert_eq!(
+      config
+        .lua
+        .start_session_picker(&["one".to_owned(), "two".to_owned()])
+        .expect("invoke custom Session picker"),
+      vec![RuntimeCommand::SwitchSession("two".to_owned())]
+    );
+    assert!(
+      config
+        .lua
+        .lua
+        .globals()
+        .get::<bool>("picker_called")
+        .expect("picker called")
+    );
+  }
+
+  #[test]
   fn lua_receives_server_authoritative_session_and_workspace_state() {
     let config = load_config(
-            "cmd.event.on('tab_selected', function()\n  assert(g.session.number == '9')\n  assert(g.active_workspace.name == 'project')\n  assert(g.active_workspace.tabs[1].selected)\n  assert(g.active_workspace.tabs[1].name == '2')\n  cmd.tab.next()\nend)",
+            "cmd.event.on('TabSelected', function()\n  assert(g.session.number == '9')\n  assert(g.active_workspace.name == 'project')\n  assert(g.active_workspace.tabs[1].selected)\n  assert(g.active_workspace.tabs[1].name == '2')\n  cmd.tab.next()\nend)",
         )
         .expect("session-aware callback config");
     let mut state = snapshot();
@@ -2720,7 +3333,7 @@ mod tests {
       }],
     });
     config.lua.sync_state(&state).expect("sync Session state");
-    let callbacks = config.lua.event_handlers("tab_selected");
+    let callbacks = config.lua.event_handlers("TabSelected");
     let commands = config
       .lua
       .invoke_event_handler(&callbacks[0], &AppEvent::default())
@@ -2867,7 +3480,7 @@ mod tests {
     let config = load_config(
       r#"
         local dialog
-        cmd.event.on("tab_selected", function()
+        cmd.event.on("TabSelected", function()
           if dialog then
             collectgarbage("collect")
             collectgarbage("collect")
@@ -2882,7 +3495,7 @@ mod tests {
       "#,
     )
     .expect("config with runtime UI callback");
-    let callback = config.lua.event_handlers("tab_selected").remove(0);
+    let callback = config.lua.event_handlers("TabSelected").remove(0);
     let commands = config
       .lua
       .invoke_event_handler(&callback, &AppEvent::default())
@@ -2918,7 +3531,7 @@ mod tests {
         local saved_text
         local collection_requested = false
         local reused_dialog
-        cmd.event.on("tab_selected", function()
+        cmd.event.on("TabSelected", function()
           if saved_text == nil then
             saved_text = cmd.ui.text({ text = "Kept" })
             local content = cmd.ui.column({ saved_text })
@@ -2935,7 +3548,7 @@ mod tests {
       "#,
     )
     .expect("config with transient runtime UI");
-    let callback = config.lua.event_handlers("tab_selected").remove(0);
+    let callback = config.lua.event_handlers("TabSelected").remove(0);
     config
       .lua
       .invoke_event_handler(&callback, &AppEvent::default())
@@ -3261,6 +3874,100 @@ mod tests {
   }
 
   #[test]
+  fn focused_ui_fallback_key_and_paste_callbacks_are_mutable() {
+    use crossterm::event::{
+      KeyCode,
+      KeyEvent,
+      KeyModifiers,
+    };
+
+    let config = load_config(
+      r#"
+        local text = cmd.ui.text({ text = "Idle" })
+        direct_key_called = false
+        fallback_key_called = false
+        local drawer = cmd.ui.create({
+          type = "drawer",
+          content = text,
+          keys = {
+            x = function() direct_key_called = true end,
+          },
+          on_key = function(_, key)
+            fallback_key_called = true
+            text.set("text", "Key " .. key.key)
+          end,
+          on_paste = function(_, pasted)
+            text.set("text", "Paste " .. pasted)
+          end,
+        })
+        drawer.focus()
+        cmd.event.on("ClientLoaded", function() drawer.set("on_key", nil) end)
+      "#,
+    )
+    .expect("config with focused input callbacks");
+    let key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+    let stroke = KeyStroke::from_crossterm(key).expect("convert key");
+    let (_, direct_callback, handle) = config
+      .lua
+      .focused_ui_binding(stroke)
+      .expect("direct key binding");
+    config
+      .lua
+      .invoke_ui_key_callback(&direct_callback, handle, key)
+      .expect("invoke direct key binding");
+    assert!(
+      config
+        .lua
+        .lua
+        .globals()
+        .get::<bool>("direct_key_called")
+        .expect("direct key")
+    );
+    assert!(
+      !config
+        .lua
+        .lua
+        .globals()
+        .get::<bool>("fallback_key_called")
+        .expect("fallback key")
+    );
+
+    let fallback_key = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
+    let (_, key_callback, handle) = config
+      .lua
+      .focused_ui_on_key()
+      .expect("fallback key callback");
+    config
+      .lua
+      .invoke_ui_key_callback(&key_callback, handle, fallback_key)
+      .expect("invoke fallback key callback");
+    assert!(
+      config
+        .lua
+        .lua
+        .globals()
+        .get::<bool>("fallback_key_called")
+        .expect("fallback key")
+    );
+
+    let (_, paste_callback, handle) = config.lua.focused_ui_on_paste().expect("paste callback");
+    assert_eq!(
+      config
+        .lua
+        .invoke_ui_paste_callback(&paste_callback, handle, "hello")
+        .expect("invoke paste callback"),
+      vec![RuntimeCommand::Redraw]
+    );
+
+    let callback = config.lua.event_handlers("ClientLoaded").remove(0);
+    config
+      .lua
+      .invoke_event_handler(&callback, &AppEvent::default())
+      .expect("clear fallback key callback from event");
+    assert!(config.lua.focused_ui_on_key().is_none());
+  }
+
+  #[test]
   fn bars_accept_nested_slices_alignment_and_mutable_content() {
     let config = load_config(
       r#"
@@ -3399,7 +4106,7 @@ mod tests {
           }))
         end)
         assert(not content_ok)
-        cmd.event.on("tab_selected", function() saved_bar.hide() end)
+        cmd.event.on("TabSelected", function() saved_bar.hide() end)
       "#,
     )
     .expect("invalid mutations should be rejected without damaging the Bar");
@@ -3412,7 +4119,7 @@ mod tests {
       .render_ui_bars(area, Rect::new(0, 1, 8, 0), &mut buffer);
     assert_eq!(buffer[(0, 0)].symbol(), "O");
 
-    let callback = config.lua.event_handlers("tab_selected").remove(0);
+    let callback = config.lua.event_handlers("TabSelected").remove(0);
     let commands = config
       .lua
       .invoke_event_handler(&callback, &AppEvent::default())

@@ -1,6 +1,6 @@
 -- Built-in configuration. LuaLS types come from lua/zmux.lua.
 --
-opt.config_version = 2
+opt.config_version = 3
 -- The cursor shape used while the PTY is focused: "block", "underline", or
 -- "bar".
 opt.cursor_shape = "block"
@@ -29,10 +29,11 @@ opt.ui.which.maxheight = "60%"
 -- Bars are ordinary retained UI Elements. Their rows reserve space only while
 -- visible, and their child Layouts can be changed in event callbacks.
 local ui = cmd.ui
+local style = cmd.style
 local tabs = ui.row({})
 local leader_text = ui.text({
 	text = "",
-	style = { fg = "black", bg = "yellow", bold = true },
+	style = style.ref("Bar.LeaderIndicator"),
 })
 local top_content = ui.slices({
 	slices = 3,
@@ -56,14 +57,14 @@ local bars = {
 		type = "bar",
 		position = "top",
 		content = top_content,
-		style = { fg = "gray", bg = "black" },
+		style = style.ref("Bar"),
 		visible = true,
 	}),
 	bottom = cmd.ui.create({
 		type = "bar",
 		position = "bottom",
 		content = bottom_content,
-		style = { fg = "gray", bg = "black" },
+		style = style.ref("Bar.Status"),
 		visible = true,
 	}),
 }
@@ -82,7 +83,7 @@ local function update_tabs()
 		table.insert(tab_items, node)
 		active_tabs[tab.id] = true
 		node.set("text", string.format(" %d %s ", tab.index, tab.title))
-		node.set("style", tab.selected and { fg = "black", bg = "cyan", bold = true } or { fg = "gray" })
+		node.set("style", style.ref(tab.selected and "Bar.TabActive" or "Bar.Tab"))
 	end
 	for id in pairs(tab_nodes) do
 		if not active_tabs[id] then
@@ -93,17 +94,17 @@ local function update_tabs()
 end
 cmd.event.on({
 	"ClientLoaded",
-	"session_created", "session_selected", "session_closed",
-	"workspace_created", "workspace_closed", "workspace_selected",
-	"tab_created", "tab_closed", "tab_selected", "terminal_title_changed",
+	"SessionCreated", "SessionSelected", "SessionClosed",
+	"WorkspaceCreated", "WorkspaceClosed", "WorkspaceSelected",
+	"TabCreated", "TabClosed", "TabSelected", "TerminalTitleChanged",
 }, update_tabs)
 
 -- The leader indicator and top Bar background depend only on leader mode.
 local function update_leader()
 	leader_text.set("text", g.leader_mode and " LEADER " or "")
-	bars.top.set("style", { fg = "gray", bg = g.leader_mode and "blue" or "black" })
+	bars.top.set("style", style.ref(g.leader_mode and "Bar.Leader" or "Bar"))
 end
-cmd.event.on({ "ClientLoaded", "leader_mode_changed" }, update_leader)
+cmd.event.on({ "ClientLoaded", "LeaderModeChanged" }, update_leader)
 
 -- Update the active-Tab line when its selection, title, process, or error changes.
 local function update_status()
@@ -115,13 +116,13 @@ local function update_status()
 		local status = g.active_tab.running and "running" or "exited"
 		status_text.set("text", string.format(" %s · %s ", g.active_tab.title, status))
 	end
-	bars.bottom.set("style", { fg = g.last_error and "red" or "gray", bg = "black" })
+	bars.bottom.set("style", style.ref(g.last_error and "Bar.Error" or "Bar.Status"))
 end
 cmd.event.on({
 	"ClientLoaded",
-	"last_error_changed", "session_created", "session_selected", "session_closed",
-	"workspace_selected", "tab_created", "tab_closed", "tab_selected",
-	"terminal_title_changed", "process_exited",
+	"LastErrorChanged", "SessionCreated", "SessionSelected", "SessionClosed",
+	"WorkspaceSelected", "TabCreated", "TabClosed", "TabSelected",
+	"TerminalTitleChanged", "ProcessExited",
 }, update_status)
 
 -- Session labels change on session selection; dimensions change on terminal resize.
@@ -130,15 +131,15 @@ local function update_session_info()
 	session_label.set("text", string.format(" Session %s · %dx%d ", session, g.terminal.columns, g.terminal.rows))
 end
 cmd.event.on({
-	"ClientLoaded", "session_created", "session_selected", "session_closed", "terminal_resized",
+	"ClientLoaded", "SessionCreated", "SessionSelected", "SessionClosed", "TerminalResized",
 }, update_session_info)
 
--- Startup hooks run before the Client is connected. `args` contains the raw
--- command-line arguments (excluding the executable), and `launch` holds the
--- mutable launch settings. Interrupt handlers wait for built-in interactions.
+-- PreAttach hooks run after the TUI is initialized and before the Client attaches.
+-- `args` contains raw command-line arguments (excluding the executable), and
+-- `launch` holds the resolved startup target and settings.
 --
--- Example: let `zmux new` choose an existing Session before connecting.
--- cmd.event.on("PreClient", function()
+-- Example: let `zmux new` choose an existing Session before attaching.
+-- cmd.event.on("PreAttach", function()
 -- 	if args[1] ~= "new" or launch.session ~= nil then
 -- 		return
 -- 	end
@@ -148,14 +149,14 @@ cmd.event.on({
 -- 			launch.create_if_missing = false
 -- 		end
 -- 	end)
--- end, { interrupt = true })
+-- end, { await = true })
 --
--- Example: use the built-in Session picker for `zmux list -a`.
--- cmd.event.on("PreClient", function()
+-- Example: use the Session picker for `zmux list -a`.
+-- cmd.event.on("PreAttach", function()
 -- 	if args[1] == "list" then
 -- 		cmd.session.switch()
 -- 	end
--- end, { interrupt = true })
+-- end, { await = true })
 --
 -- ClientLoaded runs after queued startup commands have settled and before the
 -- first normal frame. Commands here are applied before that frame is drawn.
@@ -214,6 +215,13 @@ end, { desc = "Detach from the current session" })
 cmd.key.bind("sw", function()
 	cmd.session.switch()
 end, { desc = "Switch active session" })
+cmd.key.bind("th", function()
+	cmd.ui.pick(cmd.style.themes(), function(theme)
+		if theme then
+			cmd.style.apply_theme(theme)
+		end
+	end)
+end, { desc = "Choose a style theme" })
 
 cmd.key.bind("<C-x>", function()
 	cmd.server.stop()

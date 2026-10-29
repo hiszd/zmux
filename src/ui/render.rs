@@ -75,6 +75,7 @@ use crate::{
     UiOptions,
   },
   trace::Trace,
+  ui::StyleRegistry,
 };
 
 /// The shape used by the terminal's cursor while a PTY is focused.
@@ -292,7 +293,7 @@ pub fn pane_size(width: u16, height: u16, options: UiOptions) -> (u16, u16) {
 pub fn draw(frame: &mut Frame<'_>, view: &UiRender<'_>) -> mlua::Result<()> {
   let frame_started = Instant::now();
   let area = frame.area();
-  let layout = layout(area, view.options);
+  let layout = layout(area, view.options.clone());
   let rect_detail = |rect: Option<Rect>| {
     rect.map_or_else(
       || "none".to_owned(),
@@ -309,7 +310,7 @@ pub fn draw(frame: &mut Frame<'_>, view: &UiRender<'_>) -> mlua::Result<()> {
     rect_detail(Some(layout.pane)),
   ));
   let which_key_area = if view.modal.is_none() && view.leader_mode {
-    view.which_key.layout(area).map(|layout| layout.outer)
+    view.which_key.popup_area(area)
   } else {
     None
   };
@@ -344,20 +345,22 @@ pub fn draw(frame: &mut Frame<'_>, view: &UiRender<'_>) -> mlua::Result<()> {
         y,
         x,
         &text,
-        Style::default()
-          .fg(Color::Yellow)
-          .add_modifier(Modifier::BOLD),
+        view.lua.resolve_style("Warning.Key"),
       );
     }
     Block::default()
       .borders(view.options.pty.border.borders())
       .border_type(view.options.pty.border.ratatui_type())
-      .border_style(view.options.pty.border_style)
+      .border_style(
+        view
+          .lua
+          .resolve_style_source(&view.options.pty.border_style),
+      )
       .render(layout.pty, buffer);
     render_screen(buffer, layout.pane, screen);
     view.lua.render_ui_elements(layout.panel, buffer);
     if let Some(modal) = &view.modal {
-      modal.render(layout.panel, buffer);
+      modal.render(layout.panel, buffer, &view.lua.style_registry());
     }
   }
   let buffer_duration = buffer_started.elapsed();
@@ -368,10 +371,12 @@ pub fn draw(frame: &mut Frame<'_>, view: &UiRender<'_>) -> mlua::Result<()> {
   );
   let cursor = cursor_state(screen, view.cursor_visible, layout.pane.width, layout.pane.height);
   if which_key_visible {
-    (&view.which_key).render(area, frame.buffer_mut());
+    view
+      .which_key
+      .render(area, frame.buffer_mut(), &view.lua.style_registry());
   }
   if let Some(warning) = view.reload_warning {
-    render_reload_warning(area, warning, frame.buffer_mut());
+    render_reload_warning(area, warning, frame.buffer_mut(), &view.lua.style_registry());
   }
   if view.modal.is_none()
     && let Some((true, row, column)) = cursor
@@ -393,7 +398,12 @@ pub fn draw(frame: &mut Frame<'_>, view: &UiRender<'_>) -> mlua::Result<()> {
   Ok(())
 }
 
-fn render_reload_warning(area: Rect, warning: &str, buffer: &mut ratatui::buffer::Buffer) {
+fn render_reload_warning(
+  area: Rect,
+  warning: &str,
+  buffer: &mut ratatui::buffer::Buffer,
+  styles: &StyleRegistry,
+) {
   if area.is_empty() {
     return;
   }
@@ -412,19 +422,15 @@ fn render_reload_warning(area: Rect, warning: &str, buffer: &mut ratatui::buffer
       Block::default()
         .title("Config reload failed")
         .borders(Borders::ALL)
-        .border_style(
-          Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-        ),
+        .border_style(styles.resolve("Warning.Reload")),
     )
     .render(popup, buffer);
 }
 
-impl Widget for &ModalOverlay<'_> {
+impl ModalOverlay<'_> {
   /// Sizes the modal to its content, centers it, and scrolls rows around the
   /// selected entry when the available height is too small.
-  fn render(self, area: Rect, buffer: &mut ratatui::buffer::Buffer) {
+  pub fn render(&self, area: Rect, buffer: &mut ratatui::buffer::Buffer, styles: &StyleRegistry) {
     let modal = self;
     if area.is_empty() {
       return;
@@ -460,7 +466,8 @@ impl Widget for &ModalOverlay<'_> {
     let block = Block::default()
       .borders(Borders::ALL)
       .title(modal.title)
-      .style(Style::default().fg(Color::Gray).bg(Color::Black));
+      .border_style(styles.resolve("Modal.Border"))
+      .style(styles.resolve("Modal.Background"));
     let inner = block.inner(modal_area);
     block.render(modal_area, buffer);
 
@@ -474,7 +481,7 @@ impl Widget for &ModalOverlay<'_> {
         y,
         inner.x,
         &format!("> {query}"),
-        Style::default().fg(Color::Yellow).bg(Color::Black),
+        styles.resolve("Modal.Query"),
       );
       y += 1;
     }
@@ -497,12 +504,9 @@ impl Widget for &ModalOverlay<'_> {
       .take(rows_available)
     {
       let style = if modal.selected_row == Some(index) {
-        Style::default()
-          .fg(Color::Black)
-          .bg(Color::Cyan)
-          .add_modifier(Modifier::BOLD)
+        styles.resolve("Modal.Selected")
       } else {
-        Style::default().fg(Color::White).bg(Color::Black)
+        styles.resolve("Modal.Item")
       };
       draw_styled_text(buffer, inner, y, inner.x, text, style);
       y += 1;
@@ -514,7 +518,7 @@ impl Widget for &ModalOverlay<'_> {
         bottom - 1,
         inner.x,
         modal.footer,
-        Style::default().fg(Color::Gray).bg(Color::Black),
+        styles.resolve("Modal.Footer"),
       );
     }
   }
@@ -606,6 +610,7 @@ mod tests {
   };
 
   use super::{
+    StyleRegistry,
     UiOptions,
     layout,
     pane_size,
@@ -640,8 +645,9 @@ mod tests {
   fn reload_warnings_render_as_a_bordered_popup() {
     let area = Rect::new(0, 0, 40, 8);
     let mut buffer = Buffer::empty(area);
+    let styles = StyleRegistry::default();
 
-    render_reload_warning(area, "invalid Lua config", &mut buffer);
+    render_reload_warning(area, "invalid Lua config", &mut buffer, &styles);
 
     let rendered = buffer
       .content()
@@ -661,7 +667,7 @@ mod tests {
       },
       ..UiOptions::default()
     };
-    let parts = layout(Rect::new(0, 0, 80, 24), options);
+    let parts = layout(Rect::new(0, 0, 80, 24), options.clone());
     assert_eq!((parts.pane.width, parts.pane.height), (80, 24));
     assert_eq!(pane_size(80, 24, options), (24, 80));
   }

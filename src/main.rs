@@ -36,6 +36,7 @@ use zmux::{
     AdminResponse,
     ClientMessage,
     ServerMessage,
+    Viewport,
     read_frame,
     write_frame,
   },
@@ -607,6 +608,9 @@ fn run_admin_command(
       println!("{} ({} sessions)", if running { "running" } else { "stopped" }, sessions);
     }
     AdminResponse::Success => println!("ok"),
+    AdminResponse::SessionReady { .. } => {
+      return Err("server returned a session-preparation response to an admin command".into());
+    }
   }
   Ok(())
 }
@@ -669,13 +673,61 @@ fn launch_client(
   let loaded = configuration_with_source(arguments, launch.clone())?;
   let config = loaded.config;
   let watch_path = loaded.watch_path;
-  let (launch, startup_commands) = client::run_pre_client(endpoint, &config)?;
-  if launch.require_session && launch.session_name.is_none() {
-    println!("no active sessions");
-    return Ok(());
-  }
+  let mut launch = config.lua.launch_state()?;
   ensure_server(endpoint)?;
-  client::run(endpoint.clone(), launch, startup_commands, config, watch_path, arguments.to_vec())
+  let created_session = prepare_client_session(endpoint, &mut launch, &config)?;
+  if let Some(session_name) = launch.session_name.as_deref() {
+    config.lua.set_prepared_launch_session(session_name)?;
+  }
+  client::run(endpoint.clone(), created_session, Vec::new(), config, watch_path, arguments.to_vec())
+}
+
+fn prepare_client_session(
+  endpoint: &Endpoint,
+  launch: &mut lua::LaunchState,
+  config: &lua::AppConfig,
+) -> Result<bool, Box<dyn std::error::Error>> {
+  if !launch.create_if_missing && launch.session_name.is_none() {
+    return Ok(false);
+  }
+  let (columns, rows) = crossterm::terminal::size()?;
+  let shell = config.default_shell.clone().unwrap_or_else(|| {
+    #[cfg(windows)]
+    {
+      std::env::var_os("COMSPEC")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("cmd.exe"))
+    }
+    #[cfg(not(windows))]
+    {
+      std::env::var_os("SHELL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/bin/sh"))
+    }
+  });
+  let mut stream = transport::connect(endpoint)?;
+  write_frame(
+    &mut stream,
+    &ClientMessage::Admin(AdminRequest::PrepareSession {
+      session_name: launch.session_name.clone(),
+      create_if_missing: launch.create_if_missing,
+      fail_if_exists: launch.fail_if_exists,
+      working_directory: launch.working_directory.clone(),
+      shell,
+      environment: std::env::vars().collect(),
+      viewport: Viewport { rows, columns },
+    }),
+  )?;
+  let ServerMessage::AdminResult { result } = read_frame(&mut stream)? else {
+    return Err("server returned an unexpected session-preparation response".into());
+  };
+  let AdminResponse::SessionReady { name, created } = result? else {
+    return Err("server returned an unexpected session-preparation result".into());
+  };
+  launch.session_name = Some(name.clone());
+  launch.create_if_missing = false;
+  launch.fail_if_exists = false;
+  Ok(created)
 }
 
 #[derive(serde::Serialize)]
@@ -857,7 +909,7 @@ fn initialize_config_files(
   }
 
   install_file_if_missing(directory, ".luarc.json", LUA_LS_CONFIG.as_bytes())?;
-  install_file_if_missing(directory, "zmux.lua.example", CONFIG_EXAMPLE.as_bytes())?;
+  install_or_update_example(directory)?;
   Ok(())
 }
 
@@ -899,6 +951,29 @@ fn replace_definitions(directory: &Path, path: &Path, current_contents: &[u8]) -
     return Err(error);
   }
   set_read_only(path, true)
+}
+
+fn install_or_update_example(directory: &Path) -> io::Result<()> {
+  let path = directory.join("zmux.lua.example");
+  match fs::read(&path) {
+    Ok(contents) if contents == CONFIG_EXAMPLE.as_bytes() => {
+      println!("Example config is up to date: {}", path.display());
+      return Ok(());
+    }
+    Ok(_) => {}
+    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+      return install_file_if_missing(directory, "zmux.lua.example", CONFIG_EXAMPLE.as_bytes());
+    }
+    Err(error) => return Err(error),
+  }
+
+  let staged = stage_file(&path, CONFIG_EXAMPLE.as_bytes())?;
+  if let Err(error) = replace_staged_file(&staged, &path) {
+    let _ = fs::remove_file(&staged);
+    return Err(error);
+  }
+  println!("Updated example config: {}", path.display());
+  Ok(())
 }
 
 fn install_file_if_missing(directory: &Path, name: &str, contents: &[u8]) -> io::Result<()> {

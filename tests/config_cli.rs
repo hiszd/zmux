@@ -120,7 +120,7 @@ fn config_init_installs_embedded_assets_and_marks_definitions_read_only() {
 }
 
 #[test]
-fn config_init_preserves_existing_luals_settings_and_example() {
+fn config_init_preserves_custom_luals_settings_and_refreshes_example() {
   let config_home = TempDirectory::new();
   let first = run_init(config_home.path(), false);
   assert!(first.status.success(), "{}", String::from_utf8_lossy(&first.stderr));
@@ -129,12 +129,15 @@ fn config_init_preserves_existing_luals_settings_and_example() {
   let settings = config_directory.join(".luarc.json");
   let example = config_directory.join("zmux.lua.example");
   fs::write(&settings, b"custom LuaLS settings").expect("customize LuaLS settings");
-  fs::write(&example, b"custom example").expect("customize example");
+  fs::write(&example, b"outdated example").expect("seed outdated example");
 
   let second = run_init(config_home.path(), false);
   assert!(second.status.success(), "{}", String::from_utf8_lossy(&second.stderr));
   assert_eq!(fs::read(settings).expect("preserved settings"), b"custom LuaLS settings");
-  assert_eq!(fs::read(example).expect("preserved example"), b"custom example");
+  assert_eq!(
+    fs::read(example).expect("refreshed example"),
+    include_bytes!("../assets/zmux.lua.example"),
+  );
 }
 
 #[test]
@@ -184,7 +187,7 @@ fn config_init_requires_confirmation_before_replacing_and_keeps_one_backup() {
 fn config_check_validates_explicit_config_without_starting_the_server() {
   let directory = TempDirectory::new();
   let config = directory.path().join("user.lua");
-  fs::write(&config, "opt.config_version = 2\nopt.prefix_key = '<C-x>'\n")
+  fs::write(&config, "opt.config_version = 3\nopt.prefix_key = '<C-x>'\n")
     .expect("write valid config");
 
   let output = zmux()

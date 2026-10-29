@@ -159,6 +159,22 @@ impl TerminalEmulator {
       .mode()
       .contains(alacritty_terminal::term::TermMode::SHOW_CURSOR)
   }
+
+  pub fn encode_paste(&self, text: &str) -> Vec<u8> {
+    if self
+      .term
+      .mode()
+      .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE)
+    {
+      let mut bytes = Vec::with_capacity(text.len() + 12);
+      bytes.extend_from_slice(b"\x1b[200~");
+      bytes.extend_from_slice(text.as_bytes());
+      bytes.extend_from_slice(b"\x1b[201~");
+      bytes
+    } else {
+      text.as_bytes().to_vec()
+    }
+  }
 }
 
 #[cfg(test)]
@@ -220,6 +236,22 @@ mod tests {
   }
 
   // Developer approved: do not remove.
+  #[test]
+  fn paste_is_wrapped_only_when_the_application_enabled_bracketed_paste() {
+    let mut terminal = TerminalEmulator::new(24, 80);
+    assert_eq!(terminal.encode_paste("hello"), b"hello");
+
+    terminal
+      .process(b"\x1b[?2004h", &mut Vec::new())
+      .expect("enable bracketed paste mode");
+    assert_eq!(terminal.encode_paste("hello"), b"\x1b[200~hello\x1b[201~");
+
+    terminal
+      .process(b"\x1b[?2004l", &mut Vec::new())
+      .expect("disable bracketed paste mode");
+    assert_eq!(terminal.encode_paste("hello"), b"hello");
+  }
+
   #[test]
   fn title_events_are_reported() {
     let mut terminal = TerminalEmulator::new(2, 10);

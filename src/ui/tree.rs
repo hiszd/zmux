@@ -18,6 +18,11 @@ use ratatui::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+use super::{
+  StyleRegistry,
+  StyleSource,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ChildSize {
   Auto,
@@ -207,7 +212,7 @@ pub(crate) struct UiChild {
 pub(crate) enum UiNodeKind {
   Text {
     text: String,
-    style: Style,
+    style: StyleSource,
   },
   Layout {
     axis: LayoutAxis,
@@ -235,8 +240,8 @@ pub(crate) struct UiElementOptions {
   pub element_type: UiElementType,
   pub title: String,
   pub border: DrawerBorder,
-  pub border_style: Style,
-  pub style: Style,
+  pub border_style: StyleSource,
+  pub style: StyleSource,
   pub content_id: u64,
   pub visible: bool,
 }
@@ -247,8 +252,8 @@ pub(crate) struct UiElement {
   pub element_type: UiElementType,
   pub title: String,
   pub border: DrawerBorder,
-  pub border_style: Style,
-  pub style: Style,
+  pub border_style: StyleSource,
+  pub style: StyleSource,
   pub content_id: u64,
   pub visible: bool,
   previous_focus: Option<u64>,
@@ -314,7 +319,7 @@ impl UiTree {
     Ok(id)
   }
 
-  pub(crate) fn create_text(&mut self, text: String, style: Style) -> Result<u64, String> {
+  pub(crate) fn create_text(&mut self, text: String, style: StyleSource) -> Result<u64, String> {
     let id = self.next_id()?;
     self.nodes.insert(id, UiNode {
       kind: UiNodeKind::Text { text, style },
@@ -620,7 +625,7 @@ impl UiTree {
     Ok(true)
   }
 
-  pub(crate) fn set_text_style(&mut self, id: u64, style: Style) -> Result<bool, String> {
+  pub(crate) fn set_text_style(&mut self, id: u64, style: StyleSource) -> Result<bool, String> {
     let node = self
       .nodes
       .get_mut(&id)
@@ -1349,7 +1354,13 @@ impl UiTree {
     Ok(size)
   }
 
-  pub(crate) fn render_bars(&mut self, top: Rect, bottom: Rect, buffer: &mut Buffer) {
+  pub(crate) fn render_bars(
+    &mut self,
+    top: Rect,
+    bottom: Rect,
+    buffer: &mut Buffer,
+    styles: &StyleRegistry,
+  ) {
     let bars: Vec<_> = self
       .elements
       .iter()
@@ -1361,12 +1372,13 @@ impl UiTree {
           UiElementType::Bar { position } => position,
           _ => return None,
         };
-        Some((element.id, position, element.content_id, element.style))
+        Some((element.id, position, element.content_id, element.style.clone()))
       })
       .collect();
     let mut top_index = 0_u16;
     let mut bottom_index = 0_u16;
-    for (id, position, content_id, style) in bars {
+    for (id, position, content_id, style_source) in bars {
+      let style = styles.resolve_source(&style_source);
       let area = match position {
         BarPosition::Top => {
           let y = top.y.saturating_add(top_index);
@@ -1398,11 +1410,11 @@ impl UiTree {
           buffer[(x, y)].set_symbol(" ").set_style(style);
         }
       }
-      self.render_node(content_id, area, style, buffer);
+      self.render_node(content_id, area, style, styles, buffer);
     }
   }
 
-  pub(crate) fn render(&mut self, area: Rect, buffer: &mut Buffer) {
+  pub(crate) fn render(&mut self, area: Rect, buffer: &mut Buffer, styles: &StyleRegistry) {
     if self.layout_dirty || self.layout_area != Some(area) {
       self.rebuild_layout(area);
     }
@@ -1430,7 +1442,7 @@ impl UiTree {
       let block = Block::default()
         .borders(element.border.borders())
         .border_type(element.border.ratatui_type())
-        .border_style(element.border_style)
+        .border_style(styles.resolve_source(&element.border_style))
         .title(element.title.as_str());
       let content_area = self
         .node_rects
@@ -1438,7 +1450,7 @@ impl UiTree {
         .copied()
         .unwrap_or_else(|| block.inner(element_area));
       block.render(element_area, buffer);
-      self.render_node(element.content_id, content_area, Style::default(), buffer);
+      self.render_node(element.content_id, content_area, Style::default(), styles, buffer);
     }
   }
 
@@ -1634,7 +1646,14 @@ impl UiTree {
     }
   }
 
-  fn render_node(&self, id: u64, area: Rect, inherited_style: Style, buffer: &mut Buffer) {
+  fn render_node(
+    &self,
+    id: u64,
+    area: Rect,
+    inherited_style: Style,
+    styles: &StyleRegistry,
+    buffer: &mut Buffer,
+  ) {
     if area.is_empty() {
       return;
     }
@@ -1643,25 +1662,25 @@ impl UiTree {
     };
     match &node.kind {
       UiNodeKind::Text { text, style } => {
-        draw_text(buffer, area, text, inherited_style.patch(*style))
+        draw_text(buffer, area, text, inherited_style.patch(styles.resolve_source(style)))
       }
       UiNodeKind::Layout { children, .. } => {
         for child in children {
           if let Some(child_area) = self.node_rects.get(&child.node_id).copied() {
-            self.render_node(child.node_id, child_area, inherited_style, buffer);
+            self.render_node(child.node_id, child_area, inherited_style, styles, buffer);
           }
         }
       }
       UiNodeKind::Slices { items, .. } => {
         for item in items {
           if let Some(child_area) = self.node_rects.get(&item.node_id).copied() {
-            self.render_node(item.node_id, child_area, inherited_style, buffer);
+            self.render_node(item.node_id, child_area, inherited_style, styles, buffer);
           }
         }
       }
       UiNodeKind::Align { child_id, .. } => {
         if let Some(child_area) = self.node_rects.get(child_id).copied() {
-          self.render_node(*child_id, child_area, inherited_style, buffer);
+          self.render_node(*child_id, child_area, inherited_style, styles, buffer);
         }
       }
     }
@@ -1677,7 +1696,7 @@ pub(crate) enum UiElementValue {
   Duration(std::time::Duration),
   Title(String),
   Border(DrawerBorder),
-  Style(Style),
+  Style(StyleSource),
 }
 
 fn resolve_size(size: UiSize, intrinsic: u16, available: u16) -> u16 {

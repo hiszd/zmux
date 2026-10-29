@@ -1,10 +1,5 @@
 use ratatui::{
   layout::Rect,
-  style::{
-    Color,
-    Modifier,
-    Style,
-  },
   text::{
     Line,
     Span,
@@ -25,7 +20,10 @@ use super::key_notation::{
   KeySeq,
   KeyStroke,
 };
-use crate::lua::WhichKeyOptions;
+use crate::{
+  lua::WhichKeyOptions,
+  ui::StyleRegistry,
+};
 const HEADER_ROWS: u16 = 1;
 const FOOTER_ROWS: u16 = 1;
 const BORDER_ROWS: u16 = 2;
@@ -108,8 +106,13 @@ impl WhichKeyPopup {
   pub fn can_scroll(&self, viewport: Rect) -> bool { self.max_scroll(viewport) > 0 }
 }
 
-impl Widget for &WhichKeyPopup {
-  fn render(self, viewport: Rect, buffer: &mut ratatui::buffer::Buffer) {
+impl WhichKeyPopup {
+  pub fn render(
+    &self,
+    viewport: Rect,
+    buffer: &mut ratatui::buffer::Buffer,
+    styles: &StyleRegistry,
+  ) {
     let Some(layout) = self.layout(viewport) else {
       return;
     };
@@ -117,23 +120,21 @@ impl Widget for &WhichKeyPopup {
     let block = Block::default()
       .borders(Borders::ALL)
       .title(" Which Key ")
-      .border_style(Style::default().fg(Color::Cyan))
-      .style(Style::default().bg(Color::Black));
+      .border_style(styles.resolve("WhichKey.Border"))
+      .style(styles.resolve("WhichKey.Background"));
     block.render(layout.outer, buffer);
 
     let header = Paragraph::new(Line::from(vec![
-      Span::styled("Keys after ", Style::default().fg(Color::Gray)),
+      Span::styled("Keys after ", styles.resolve("WhichKey.Header")),
       Span::styled(
         key_notation::key_seq_to_string(&self.prefix),
-        Style::default()
-          .fg(Color::Cyan)
-          .add_modifier(Modifier::BOLD),
+        styles.resolve("WhichKey.Prefix"),
       ),
     ]));
     header
       .render(Rect::new(layout.inner.x, layout.inner.y, layout.inner.width, HEADER_ROWS), buffer);
 
-    let lines = completion_lines(layout.list.width, &self.completions, layout.columns);
+    let lines = completion_lines(layout.list.width, &self.completions, layout.columns, styles);
     let line_count = lines.len();
     let max_scroll = line_count.saturating_sub(usize::from(layout.list.height));
     let scroll_offset = self.scroll_offset.min(max_scroll) as u16;
@@ -149,7 +150,7 @@ impl Widget for &WhichKeyPopup {
           (self.scroll_offset.min(max_scroll) + usize::from(layout.list.height)).min(line_count),
           line_count,
         ),
-        Style::default().fg(Color::Gray),
+        styles.resolve("WhichKey.Footer"),
       )]))
       .render(footer, buffer);
     }
@@ -162,6 +163,7 @@ fn completion_lines(
   width: u16,
   completions: &[(KeyStroke, Option<String>, bool)],
   columns: usize,
+  styles: &StyleRegistry,
 ) -> Vec<Line<'static>> {
   let columns = columns.max(1).min(completions.len().max(1));
   let rows = completion_row_count(completions.len(), columns);
@@ -178,7 +180,13 @@ fn completion_lines(
         spans.push(Span::raw(" ".repeat(spacing)));
       }
       if let Some((key, description, has_children)) = completions.get(index) {
-        spans.extend(completion_spans(key, description.as_deref(), *has_children, column_width));
+        spans.extend(completion_spans(
+          key,
+          description.as_deref(),
+          *has_children,
+          column_width,
+          styles,
+        ));
       } else {
         spans.push(Span::raw(" ".repeat(column_width)));
       }
@@ -193,6 +201,7 @@ fn completion_spans(
   description: Option<&str>,
   has_children: bool,
   column_width: usize,
+  styles: &StyleRegistry,
 ) -> Vec<Span<'static>> {
   let key_column_width = column_width.min(usize::from(KEY_COLUMN_WIDTH));
   let key_text = format!(" {} ", key_notation::key_stroke_to_string(key));
@@ -217,13 +226,11 @@ fn completion_spans(
   vec![
     Span::styled(
       format!("{key_text}{}", " ".repeat(key_column_width.saturating_sub(key_width))),
-      Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD),
+      styles.resolve("WhichKey.Key"),
     ),
     Span::styled(
       format!("{description}{}", " ".repeat(padding)),
-      Style::default().fg(Color::White),
+      styles.resolve("WhichKey.Description"),
     ),
   ]
 }

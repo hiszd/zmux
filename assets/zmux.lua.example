@@ -1,7 +1,7 @@
 -- User configuration for zmux.
 -- `opt.config_version` must be the first executable statement.
 -- Run `zmux config init` to install LuaLS definitions as `defs.lua`.
-opt.config_version = 2
+opt.config_version = 3
 
 -- Uncomment to customize the prefix key, sequence timeout, or default shell.
 -- opt.prefix_key = "<C-Space>"
@@ -13,12 +13,34 @@ opt.config_version = 2
 -- Bars are retained UI Elements. Slices divide each row into tab/status and
 -- right-aligned indicator areas; Align positions content within its slice.
 local ui = cmd.ui
+local style = cmd.style
+
+-- A custom group can derive each attribute from the matching property of a
+-- built-in group. These references stay live when Bar.TabActive changes.
+style.create("Example.TabActive", {
+    fg = style.ref("Bar.TabActive"),
+    bg = style.ref("Bar.TabActive"),
+    bold = style.ref("Bar.TabActive"),
+})
+
+-- Defining a theme registers its patch; it does not activate the theme.
+-- Groups not listed here retain their current definitions when it is applied.
+style.define_theme("ocean", {
+    Bar = { fg = "#d8e6f3", bg = "#10283f" },
+    ["Bar.Tab"] = { fg = "#8fb3cf" },
+    ["Bar.TabActive"] = { fg = "#10283f", bg = "#6dd6c7", bold = true },
+    ["Bar.Leader"] = { fg = "#d8e6f3", bg = "#23577a" },
+    ["Bar.LeaderIndicator"] = { fg = "#10283f", bg = "#6dd6c7", bold = true },
+    ["Bar.Status"] = { fg = "#d8e6f3", bg = "#10283f" },
+    ["Bar.Error"] = { fg = "#ff8f8f", bg = "#10283f" },
+})
+
 -- Tab labels are arranged horizontally in the left-hand part of the top Bar.
 local tabs = ui.row({})
 -- Reuse a Text handle per Tab ID so state refreshes mutate rather than rebuild it.
 local tab_nodes = {}
--- This indicator is empty outside leader mode; when shown it is bold black on yellow.
-local leader = ui.text({ text = "", style = { fg = "black", bg = "yellow", bold = true } })
+-- This indicator is empty outside leader mode; its appearance follows the active theme.
+local leader = ui.text({ text = "", style = style.ref("Bar.LeaderIndicator") })
 -- Three equal slices: tabs span the first two; the leader indicator uses the
 -- rightmost slice and Align places it against that slice's right edge.
 local top_content = ui.slices({
@@ -47,14 +69,14 @@ local top_bar = cmd.ui.create({
     type = "bar",
     position = "top",
     content = top_content,
-    style = { fg = "gray", bg = "black" },
+    style = style.ref("Bar"),
     visible = true,
 })
 local bottom_bar = cmd.ui.create({
     type = "bar",
     position = "bottom",
     content = bottom_content,
-    style = { fg = "gray", bg = "black" },
+    style = style.ref("Bar.Status"),
     visible = true,
 })
 
@@ -71,8 +93,8 @@ local function update_tabs()
         table.insert(children, node)
         active_tabs[tab.id] = true
         node.set("text", string.format(" %d %s ", tab.index, tab.title))
-        -- The selected Tab is emphasized; other labels inherit the Bar style.
-        node.set("style", tab.selected and { fg = "black", bg = "cyan", bold = true } or { fg = "gray" })
+        -- The selected Tab uses our derived group; other labels use the shared Bar group.
+        node.set("style", style.ref(tab.selected and "Example.TabActive" or "Bar.Tab"))
     end
     for id in pairs(tab_nodes) do
         if not active_tabs[id] then
@@ -83,17 +105,17 @@ local function update_tabs()
 end
 cmd.event.on({
     "ClientLoaded",
-    "session_created", "session_selected", "session_closed",
-    "workspace_created", "workspace_closed", "workspace_selected",
-    "tab_created", "tab_closed", "tab_selected", "terminal_title_changed",
+    "SessionCreated", "SessionSelected", "SessionClosed",
+    "WorkspaceCreated", "WorkspaceClosed", "WorkspaceSelected",
+    "TabCreated", "TabClosed", "TabSelected", "TerminalTitleChanged",
 }, update_tabs)
 
 -- The leader label and top Bar background depend only on leader mode.
 local function update_leader()
     leader.set("text", g.leader_mode and " LEADER " or "")
-    top_bar.set("style", { fg = "gray", bg = g.leader_mode and "blue" or "black" })
+    top_bar.set("style", style.ref(g.leader_mode and "Bar.Leader" or "Bar"))
 end
-cmd.event.on({ "ClientLoaded", "leader_mode_changed" }, update_leader)
+cmd.event.on({ "ClientLoaded", "LeaderModeChanged" }, update_leader)
 
 -- Update the active-Tab line only when session/workspace/tab status or errors change.
 local function update_status()
@@ -105,13 +127,13 @@ local function update_status()
         local state = g.active_tab.running and "running" or "exited"
         status.set("text", string.format(" %s · %s ", g.active_tab.title, state))
     end
-    bottom_bar.set("style", { fg = g.last_error and "red" or "gray", bg = "black" })
+    bottom_bar.set("style", style.ref(g.last_error and "Bar.Error" or "Bar.Status"))
 end
 cmd.event.on({
     "ClientLoaded",
-    "last_error_changed", "session_created", "session_selected", "session_closed",
-    "workspace_selected", "tab_created", "tab_closed", "tab_selected",
-    "terminal_title_changed", "process_exited",
+    "LastErrorChanged", "SessionCreated", "SessionSelected", "SessionClosed",
+    "WorkspaceSelected", "TabCreated", "TabClosed", "TabSelected",
+    "TerminalTitleChanged", "ProcessExited",
 }, update_status)
 
 -- Session number changes on session events; terminal dimensions change on resize.
@@ -120,7 +142,7 @@ local function update_session_info()
     session_info.set("text", string.format(" Session %s · %dx%d ", session, g.terminal.columns, g.terminal.rows))
 end
 cmd.event.on({
-    "ClientLoaded", "session_created", "session_selected", "session_closed", "terminal_resized",
+    "ClientLoaded", "SessionCreated", "SessionSelected", "SessionClosed", "TerminalResized",
 }, update_session_info)
 
 -- Add bindings after the configured prefix. LuaLS completions are available
@@ -131,3 +153,9 @@ cmd.event.on({
 -- cmd.key.bind("r", function()
 --     cmd.config.reload()
 -- end, { desc = "Reload config" })
+-- The picker includes the built-in "default" theme and themes defined above.
+cmd.key.bind("th", function()
+    cmd.ui.pick(cmd.style.themes(), function(theme)
+        if theme then cmd.style.apply_theme(theme) end
+    end)
+end, { desc = "Choose a style theme" })

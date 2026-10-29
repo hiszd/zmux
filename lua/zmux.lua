@@ -2,14 +2,16 @@
 
 ---@alias ZmuxColor string|integer
 
+---@class ZmuxStyleGroupReference
+
 ---@class ZmuxStyle
----@field fg? ZmuxColor Foreground color name, palette index, or RGB hex string.
----@field bg? ZmuxColor Background color name, palette index, or RGB hex string.
----@field bold? boolean
----@field italic? boolean
----@field underline? boolean
----@field reverse? boolean
----@field remove? ZmuxStyleModifier[] Modifiers to remove from inherited styles.
+---@field fg? ZmuxColor|ZmuxStyleGroupReference Foreground color or reference to another group's foreground.
+---@field bg? ZmuxColor|ZmuxStyleGroupReference Background color or reference to another group's background.
+---@field bold? boolean|ZmuxStyleGroupReference
+---@field italic? boolean|ZmuxStyleGroupReference
+---@field underline? boolean|ZmuxStyleGroupReference
+---@field reverse? boolean|ZmuxStyleGroupReference
+---@field remove? ZmuxStyleModifier[] Modifiers to remove from inherited inline styles.
 
 ---@alias ZmuxStyleModifier "bold"|"italic"|"underline"|"reverse"
 
@@ -52,23 +54,23 @@
 ---@field terminal ZmuxTerminalState Current outer terminal dimensions.
 
 ---@alias ZmuxEventName
----| "PreClient"
+---| "PreAttach"
 ---| "ClientLoaded"
 ---| "ConfigLoaded"
----| "session_created"
----| "session_selected"
----| "session_closed"
----| "last_error_changed"
----| "workspace_created"
----| "workspace_closed"
----| "workspace_selected"
----| "tab_created"
----| "tab_closed"
----| "tab_selected"
----| "leader_mode_changed"
----| "terminal_title_changed"
----| "process_exited"
----| "terminal_resized"
+---| "SessionCreated"
+---| "SessionSelected"
+---| "SessionClosed"
+---| "LastErrorChanged"
+---| "WorkspaceCreated"
+---| "WorkspaceClosed"
+---| "WorkspaceSelected"
+---| "TabCreated"
+---| "TabClosed"
+---| "TabSelected"
+---| "LeaderModeChanged"
+---| "TerminalTitleChanged"
+---| "ProcessExited"
+---| "TerminalResized"
 
 ---@class ZmuxEvent
 ---@field name ZmuxEventName Event name.
@@ -89,7 +91,7 @@
 ---@field desc? string Short description shown in the key-sequence popup.
 
 ---@class ZmuxEventOptions
----@field interrupt? boolean For PreClient, wait for built-in interactive work requested by this handler before continuing startup.
+---@field await? boolean For PreAttach, wait for interactive work requested by this handler before attaching the Client.
 
 ---@class ZmuxEventApi
 ---@field on fun(name: ZmuxEventName|ZmuxEventName[], callback: fun(event: ZmuxEvent), opts?: ZmuxEventOptions) Register a callback for one or more application events.
@@ -107,8 +109,9 @@
 ---@alias ZmuxToastPosition "top_right"|"top_center"|"bottom_right"|"bottom_center"
 ---@alias ZmuxBarPosition "top"|"bottom"
 ---@alias ZmuxHorizontalAlignment "left"|"center"|"right"
----@alias ZmuxUiElementProperty "side"|"width"|"height"|"x"|"y"|"position"|"duration"|"title"|"border"|"border_style"|"style"|"visible"|"content"|"keys"
----@alias ZmuxUiElementPropertyValue ZmuxDrawerSide|ZmuxElementSize|integer|string|boolean|ZmuxDrawerBorder|ZmuxStyle|ZmuxUiNodeHandle|table<string, fun(element: ZmuxUiElementHandle, key: ZmuxUiKey)>
+---@alias ZmuxUiElementProperty "side"|"width"|"height"|"x"|"y"|"position"|"duration"|"title"|"border"|"border_style"|"style"|"visible"|"content"|"keys"|"on_key"|"on_paste"
+---@alias ZmuxStyleSource ZmuxStyle|ZmuxStyleGroupReference
+---@alias ZmuxUiElementPropertyValue ZmuxDrawerSide|ZmuxElementSize|integer|string|boolean|ZmuxDrawerBorder|ZmuxStyleSource|ZmuxUiNodeHandle|table<string, fun(element: ZmuxUiElementHandle, key: ZmuxUiKey)>|fun(element: ZmuxUiElementHandle, key: ZmuxUiKey)|fun(element: ZmuxUiElementHandle, text: string)
 ---@alias ZmuxDrawerProperty ZmuxUiElementProperty
 ---@alias ZmuxDrawerPropertyValue ZmuxUiElementPropertyValue
 ---@alias ZmuxTextProperty "text"|"style"
@@ -124,14 +127,14 @@
 ---@field is_repeat boolean Whether this is a repeated key event.
 
 ---@class ZmuxUiNodeHandle Lua keeps detached nodes alive while this handle is reachable; a parent Layout or Element owns attached nodes.
----@field set fun(property: ZmuxTextProperty|ZmuxLayoutProperty|ZmuxSlicesProperty|ZmuxAlignProperty, value: string|ZmuxStyle|ZmuxLayoutChild[]|ZmuxSlicesItems|integer|ZmuxUiNodeHandle|ZmuxHorizontalAlignment) Set a typed property; mutations automatically schedule a redraw.
+---@field set fun(property: ZmuxTextProperty|ZmuxLayoutProperty|ZmuxSlicesProperty|ZmuxAlignProperty, value: string|ZmuxStyleSource|ZmuxLayoutChild[]|ZmuxSlicesItems|integer|ZmuxUiNodeHandle|ZmuxHorizontalAlignment) Set a typed property; mutations automatically schedule a redraw.
 
 ---@class ZmuxTextOptions
 ---@field text string Initial text; newlines create additional unwrapped lines.
----@field style? ZmuxStyle Initial text style.
+---@field style? ZmuxStyleSource Initial text style or named style group.
 
 ---@class ZmuxTextHandle: ZmuxUiNodeHandle
----@field set fun(property: ZmuxTextProperty, value: string|ZmuxStyle) Set text or its style.
+---@field set fun(property: ZmuxTextProperty, value: string|ZmuxStyleSource) Set text or its style.
 
 ---@alias ZmuxLayoutChild ZmuxUiNodeHandle|{node: ZmuxUiNodeHandle, size?: ZmuxUiSize}
 
@@ -163,7 +166,7 @@
 ---@field type "bar"
 ---@field position? ZmuxBarPosition Top or bottom edge. Defaults to "top".
 ---@field content ZmuxUiNodeHandle One-row UI tree; taller content is an error.
----@field style? ZmuxStyle Base style applied across the full row and inherited by descendants.
+---@field style? ZmuxStyleSource Base style group or style table applied across the full row and inherited by descendants.
 ---@field visible? boolean Initial visibility. Defaults to false.
 
 ---@class ZmuxDrawerOptions
@@ -172,9 +175,11 @@
 ---@field width? ZmuxDrawerWidth Fixed cell width or content-sized "auto". Defaults to "auto".
 ---@field title? string Optional border title.
 ---@field border? ZmuxDrawerBorder Ratatui border preset. Defaults to "plain".
----@field border_style? ZmuxStyle Border color and modifiers.
+---@field border_style? ZmuxStyleSource Border style group or style table.
 ---@field content ZmuxUiNodeHandle Nested content tree.
 ---@field keys? table<string, fun(element: ZmuxUiElementHandle, key: ZmuxUiKey)> Direct bindings active while this element is focused.
+---@field on_key? fun(element: ZmuxUiElementHandle, key: ZmuxUiKey) Fallback for focused key events without a direct binding.
+---@field on_paste? fun(element: ZmuxUiElementHandle, text: string) Handle a whole pasted text payload while focused.
 ---@field visible? boolean Initial visibility. Defaults to false.
 
 ---@class ZmuxModalOptions
@@ -183,9 +188,11 @@
 ---@field height? ZmuxElementSize Height in cells or "auto"; defaults to content height.
 ---@field title? string Optional border title.
 ---@field border? ZmuxDrawerBorder Ratatui border preset. Defaults to "plain".
----@field border_style? ZmuxStyle Border color and modifiers.
+---@field border_style? ZmuxStyleSource Border style group or style table.
 ---@field content ZmuxUiNodeHandle Nested content tree.
----@field keys? table<string, fun(element: ZmuxUiElementHandle, key: ZmuxUiKey)> Direct bindings; modal input is captured until Escape or hide().
+---@field keys? table<string, fun(element: ZmuxUiElementHandle, key: ZmuxUiKey)> Direct bindings; modal input is captured, and unhandled Escape dismisses it by default.
+---@field on_key? fun(element: ZmuxUiElementHandle, key: ZmuxUiKey) Fallback for focused key events without a direct binding.
+---@field on_paste? fun(element: ZmuxUiElementHandle, text: string) Handle a whole pasted text payload while focused.
 ---@field visible? boolean Initial visibility. Defaults to false.
 
 ---@class ZmuxPopoverOptions
@@ -196,9 +203,11 @@
 ---@field height? ZmuxElementSize Height in cells or "auto"; defaults to content height.
 ---@field title? string Optional border title.
 ---@field border? ZmuxDrawerBorder Ratatui border preset. Defaults to "plain".
----@field border_style? ZmuxStyle Border color and modifiers.
+---@field border_style? ZmuxStyleSource Border style group or style table.
 ---@field content ZmuxUiNodeHandle Nested content tree.
----@field keys? table<string, fun(element: ZmuxUiElementHandle, key: ZmuxUiKey)> Direct bindings; popover input is captured until Escape or hide().
+---@field keys? table<string, fun(element: ZmuxUiElementHandle, key: ZmuxUiKey)> Direct bindings; popover input is captured, and unhandled Escape dismisses it by default.
+---@field on_key? fun(element: ZmuxUiElementHandle, key: ZmuxUiKey) Fallback for focused key events without a direct binding.
+---@field on_paste? fun(element: ZmuxUiElementHandle, text: string) Handle a whole pasted text payload while focused.
 ---@field visible? boolean Initial visibility. Defaults to false.
 
 ---@class ZmuxBottomPanelOptions
@@ -206,9 +215,11 @@
 ---@field height? ZmuxElementSize Height in cells or "auto"; defaults to content height.
 ---@field title? string Optional border title.
 ---@field border? ZmuxDrawerBorder Ratatui border preset. Defaults to "plain".
----@field border_style? ZmuxStyle Border color and modifiers.
+---@field border_style? ZmuxStyleSource Border style group or style table.
 ---@field content ZmuxUiNodeHandle Nested content tree.
 ---@field keys? table<string, fun(element: ZmuxUiElementHandle, key: ZmuxUiKey)> Direct bindings while focused.
+---@field on_key? fun(element: ZmuxUiElementHandle, key: ZmuxUiKey) Fallback for focused key events without a direct binding.
+---@field on_paste? fun(element: ZmuxUiElementHandle, text: string) Handle a whole pasted text payload while focused.
 ---@field visible? boolean Initial visibility. Defaults to false.
 
 ---@class ZmuxToastOptions
@@ -217,14 +228,14 @@
 ---@field duration? integer Visible duration in milliseconds; defaults to 3000.
 ---@field title? string Optional border title.
 ---@field border? ZmuxDrawerBorder Ratatui border preset. Defaults to "plain".
----@field border_style? ZmuxStyle Border color and modifiers.
+---@field border_style? ZmuxStyleSource Border style group or style table.
 ---@field content ZmuxUiNodeHandle Nested content tree.
 ---@field visible? boolean Initial visibility. Defaults to false.
 
 ---@alias ZmuxUiElementOptions ZmuxBarOptions|ZmuxDrawerOptions|ZmuxModalOptions|ZmuxPopoverOptions|ZmuxBottomPanelOptions|ZmuxToastOptions
 
 ---@class ZmuxUiElementHandle This UI Element is disposed after its handle becomes unreachable and Lua collects it; hiding it does not release it.
----@field set fun(property: ZmuxUiElementProperty, value: ZmuxUiElementPropertyValue) Set a typed property; visual changes automatically schedule a redraw.
+---@field set fun(property: ZmuxUiElementProperty, value: ZmuxUiElementPropertyValue|nil) Set a typed property or clear an input callback; visual changes automatically schedule a redraw.
 ---@field show fun() Show this element; Modal and Popover are focused automatically.
 ---@field hide fun() Hide this element and release its focus if needed.
 ---@field toggle fun() Toggle visibility; showing Modal and Popover focuses them.
@@ -232,6 +243,13 @@
 ---@field blur fun() Return keyboard focus to the terminal; Modal and Popover elements must be hidden instead.
 
 ---@alias ZmuxDrawerHandle ZmuxUiElementHandle
+
+---@class ZmuxStyleApi
+---@field ref fun(name: string): ZmuxStyleGroupReference Create a reference to a group or to the same property in that group.
+---@field create fun(name: string, definition: ZmuxStyle) Create or update an active group; existing UI references update immediately.
+---@field define_theme fun(name: string, definitions: table<string, ZmuxStyle>) Register a theme group patch without applying it.
+---@field apply_theme fun(name: string) Atomically apply a registered theme; groups it omits remain unchanged.
+---@field themes fun(): string[] Return registered theme names in sorted order.
 
 ---@class ZmuxUiApi Constructors are available during config loading and mutation-safe callbacks.
 ---@field pick fun(items: ZmuxPickerItem[], callback: fun(item: any|nil)) Open a generic fuzzy picker from a key or event callback and later call back with the chosen item or nil on Escape.
@@ -255,6 +273,7 @@
 ---@class ZmuxSessionApi
 ---@field kill fun() Kill the current Session.
 ---@field switch fun() Open the Session picker.
+---@field select fun(name: string) Switch to an existing Session by name.
 
 ---@class ZmuxWorkspaceApi
 ---@field create fun() Open the Workspace creation dialog.
@@ -271,9 +290,29 @@
 ---@field previous fun() Request selection of the previous Tab.
 ---@field select fun(index: integer) Request selection of a one-based Tab index.
 
+---@class ZmuxPreAttachSessionApi
+---@field rename fun(name: string) Rename the Session selected for this Client.
+---@field remove fun() Remove the Session selected for this Client.
+
+---@class ZmuxPreAttachWorkspaceApi
+---@field create fun(working_directory: string, name?: string) Create a Workspace in the selected Session before Client attachment.
+---@field rename fun(id: string, name: string) Rename a Workspace using a qualified `session:workspace` ID.
+---@field setcwd fun(id: string, working_directory: string) Change a Workspace directory using a qualified ID.
+---@field remove fun(id: string) Remove a Workspace using a qualified ID.
+
+---@class ZmuxPreAttachTabApi
+---@field create fun(workspace_id: string, name?: string) Create a Tab using a qualified `session:workspace` ID.
+---@field rename fun(id: string, name: string) Rename a Tab using a qualified `session:workspace:tab` ID.
+---@field remove fun(id: string) Remove a Tab using a qualified ID.
+
+---@class ZmuxPreAttachApi
+---@field session ZmuxPreAttachSessionApi
+---@field workspace ZmuxPreAttachWorkspaceApi
+---@field tab ZmuxPreAttachTabApi
+
 ---@class ZmuxLaunchState
 ---@field command string Original CLI subcommand (informational; changing it does not change dispatch).
----@field session? string Session selected for the Client; set this during PreClient to change the target.
+---@field session? string Session selected for the Client; resolve this before the PreAttach hook.
 ---@field create_if_missing boolean Whether a missing named Session should be created.
 ---@field fail_if_exists boolean Whether startup should fail when the named Session already exists.
 ---@field require_session boolean Whether startup requires an existing selected Session.
@@ -283,12 +322,14 @@
 ---@field key ZmuxKeyApi
 ---@field event ZmuxEventApi
 ---@field ui ZmuxUiApi
+---@field style ZmuxStyleApi
 ---@field config ZmuxConfigApi
 ---@field client ZmuxClientApi
 ---@field server ZmuxServerApi
 ---@field session ZmuxSessionApi
 ---@field workspace ZmuxWorkspaceApi
 ---@field tab ZmuxTabApi
+---@field pre_attach ZmuxPreAttachApi Server-owned changes applied during `PreAttach` before Client attachment.
 
 ---@class ZmuxWhichOptions
 ---@field maxcolumns? integer Maximum number of which-key columns. Defaults to 7.
@@ -296,7 +337,7 @@
 
 ---@class ZmuxPtyOptions
 ---@field border? ZmuxDrawerBorder Border preset around the PTY; defaults to "plain". Use "none" to disable it.
----@field border_style? ZmuxStyle Border color and modifiers.
+---@field border_style? ZmuxStyleSource Border style group or style table.
 
 ---@class ZmuxUIOptions
 ---@field which? ZmuxWhichOptions
