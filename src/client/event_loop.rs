@@ -3566,6 +3566,10 @@ mod tests {
       trace: &trace,
     };
 
+    config
+      .lua
+      .sync_state(&context.session.snapshot_for_lua(false, 80, 24))
+      .expect("sync initial state");
     handle_input(Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)), &mut context)
       .expect("modal captures global binding key");
     assert!(!context.dispatcher.is_leader());
@@ -3586,7 +3590,7 @@ mod tests {
     assert!(matches!(
       receiver.try_recv(),
       Ok(ClientMessage::Request {
-        request: ClientRequest::NextTab,
+        request: ClientRequest::SelectTab(2),
         ..
       })
     ));
@@ -3722,12 +3726,20 @@ mod tests {
         name: "main".to_owned(),
         explicit_name: None,
         working_directory: std::path::PathBuf::from("."),
-        tabs: vec![TabSnapshot {
-          id: 1,
-          name: "1".to_owned(),
-          title: "shell".to_owned(),
-          exit_code: None,
-        }],
+        tabs: vec![
+          TabSnapshot {
+            id: 1,
+            name: "1".to_owned(),
+            title: "shell".to_owned(),
+            exit_code: None,
+          },
+          TabSnapshot {
+            id: 2,
+            name: "2".to_owned(),
+            title: "shell-two".to_owned(),
+            exit_code: None,
+          },
+        ],
         active_tab_id: 1,
       }],
       active_workspace_id: 1,
@@ -3759,6 +3771,10 @@ mod tests {
       trace: &trace,
     };
 
+    config
+      .lua
+      .sync_state(&context.session.snapshot_for_lua(false, 80, 24))
+      .expect("sync initial state");
     handle_input(Event::Paste("ui paste".to_owned()), &mut context)
       .expect("route paste to focused UI");
     assert!(context.lua.focused_ui().is_none());
@@ -3784,7 +3800,7 @@ mod tests {
     assert!(matches!(
       receiver.try_recv(),
       Ok(ClientMessage::Request {
-        request: ClientRequest::NextTab,
+        request: ClientRequest::SelectTab(2),
         ..
       })
     ));
